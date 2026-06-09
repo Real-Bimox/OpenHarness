@@ -2250,6 +2250,12 @@ def main(
         help="Output format with --print: text (default), json, or stream-json",
         rich_help_panel="Output",
     ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="Run the local JSONL headless control protocol over stdin/stdout",
+        rich_help_panel="Output",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
@@ -2394,7 +2400,7 @@ def main(
         settings.theme = theme
         save_settings(settings)
 
-    from openharness.ui.app import run_print_mode, run_repl, run_task_worker
+    from openharness.ui.app import run_headless_control, run_print_mode, run_repl, run_task_worker
 
     if dry_run and (continue_session or resume is not None):
         print("Error: --dry-run does not support --continue/--resume yet.", file=sys.stderr)
@@ -2431,6 +2437,89 @@ def main(
                 file=sys.stderr,
             )
             raise typer.Exit(1)
+        return
+
+    if headless:
+        if print_mode is not None:
+            print("Error: --headless cannot be combined with -p/--print.", file=sys.stderr)
+            raise typer.Exit(1)
+        if continue_session or resume is not None:
+            print(
+                "Error: --headless accepts resume and continue as JSONL requests, not CLI picker flags.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        asyncio.run(
+            run_headless_control(
+                cwd=cwd,
+                model=model,
+                max_turns=max_turns,
+                base_url=base_url,
+                system_prompt=system_prompt,
+                api_key=api_key,
+                api_format=api_format,
+                permission_mode=permission_mode,
+                effort=effort,
+            )
+        )
+        return
+
+    if print_mode is not None:
+        prompt = print_mode.strip()
+        if not prompt:
+            print("Error: -p/--print requires a prompt value, e.g. -p 'your prompt'", file=sys.stderr)
+            raise typer.Exit(1)
+        if output_format is not None and output_format not in {"text", "json", "stream-json"}:
+            print(
+                "Error: --output-format only supports text, json, or stream-json",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+
+        session_data = None
+        if continue_session or resume is not None:
+            from openharness.services.session_storage import (
+                load_session_by_id,
+                load_session_snapshot,
+            )
+
+            if continue_session:
+                session_data = load_session_snapshot(cwd)
+                if session_data is None:
+                    print("No previous session found in this directory.", file=sys.stderr)
+                    raise typer.Exit(1)
+            elif resume == "":
+                print(
+                    "Error: -p/--print with --resume requires a session ID. "
+                    "Use --continue for the latest session.",
+                    file=sys.stderr,
+                )
+                raise typer.Exit(1)
+            else:
+                session_data = load_session_by_id(cwd, resume)
+                if session_data is None:
+                    print(f"Session not found: {resume}", file=sys.stderr)
+                    raise typer.Exit(1)
+
+        asyncio.run(
+            run_print_mode(
+                prompt=prompt,
+                output_format=output_format or "text",
+                cwd=cwd,
+                model=(session_data.get("model") if session_data else None) or model,
+                base_url=base_url,
+                system_prompt=system_prompt,
+                append_system_prompt=append_system_prompt,
+                api_key=api_key,
+                api_format=api_format,
+                permission_mode=permission_mode,
+                max_turns=max_turns,
+                effort=effort,
+                restore_messages=session_data.get("messages") if session_data else None,
+                restore_tool_metadata=session_data.get("tool_metadata") if session_data else None,
+                session_id=session_data.get("session_id") if session_data else None,
+            )
+        )
         return
 
     # Handle --continue and --resume flags
@@ -2490,29 +2579,6 @@ def main(
                 restore_tool_metadata=session_data.get("tool_metadata"),
                 permission_mode=permission_mode,
                 api_format=api_format,
-                effort=effort,
-            )
-        )
-        return
-
-    if print_mode is not None:
-        prompt = print_mode.strip()
-        if not prompt:
-            print("Error: -p/--print requires a prompt value, e.g. -p 'your prompt'", file=sys.stderr)
-            raise typer.Exit(1)
-        asyncio.run(
-            run_print_mode(
-                prompt=prompt,
-                output_format=output_format or "text",
-                cwd=cwd,
-                model=model,
-                base_url=base_url,
-                system_prompt=system_prompt,
-                append_system_prompt=append_system_prompt,
-                api_key=api_key,
-                api_format=api_format,
-                permission_mode=permission_mode,
-                max_turns=max_turns,
                 effort=effort,
             )
         )

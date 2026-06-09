@@ -9,9 +9,12 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 import openharness.cli as cli
+from openharness.api.usage import UsageSnapshot
 from openharness.config import load_settings
 from openharness.config.settings import Settings
+from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.mcp.types import McpStdioServerConfig
+from openharness.services.session_storage import save_session_snapshot
 
 
 app = cli.app
@@ -29,6 +32,39 @@ def test_cli_help():
     assert "Oh my Harness!" in plain_output
     assert "setup" in plain_output
     assert "--dry-run" in plain_output
+
+
+def test_print_mode_resume_dispatches_to_headless_print(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(
+        cwd=project,
+        model="saved-model",
+        system_prompt="system",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="earlier")])],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        session_id="saved123",
+    )
+    captured = {}
+
+    async def fake_run_print_mode(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("openharness.ui.app.run_print_mode", fake_run_print_mode)
+
+    result = runner.invoke(
+        app,
+        ["--cwd", str(project), "-p", "continue", "--resume", "saved123"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["prompt"] == "continue"
+    assert captured["model"] == "saved-model"
+    assert captured["session_id"] == "saved123"
+    assert captured["restore_messages"][0]["role"] == "user"
 
 
 def test_setup_flow_selects_profile_and_model(tmp_path: Path, monkeypatch):

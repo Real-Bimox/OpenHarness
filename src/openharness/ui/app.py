@@ -5,15 +5,28 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from typing import Any, TextIO
 
 from openharness.coordinator.coordinator_mode import is_coordinator_mode
 
 from openharness.api.client import SupportsStreamingMessages
-from openharness.engine.stream_events import StreamEvent
+from openharness.engine.stream_events import (
+    AssistantTextDelta,
+    AssistantTurnComplete,
+    CompactProgressEvent,
+    ErrorEvent,
+    StatusEvent,
+    StreamEvent,
+    ToolExecutionCompleted,
+    ToolExecutionStarted,
+)
 from openharness.ui.backend_host import run_backend_host
 from openharness.ui.coordinator_drain import drain_coordinator_async_agents
 from openharness.ui.react_launcher import launch_react_tui
 from openharness.ui.runtime import build_runtime, close_runtime, handle_line, start_runtime
+
+
+_VALID_PRINT_OUTPUT_FORMATS = {"text", "json", "stream-json"}
 
 
 def _decode_task_worker_line(raw: str) -> str:
@@ -35,6 +48,62 @@ def _decode_task_worker_line(raw: str) -> str:
         if isinstance(text, str):
             return text.strip()
     return stripped
+
+
+def _attach_session(payload: dict[str, Any], session_id: str | None) -> dict[str, Any]:
+    if session_id:
+        return {**payload, "session_id": session_id}
+    return payload
+
+
+def _stream_event_payload(event: StreamEvent, *, session_id: str | None = None) -> dict[str, Any] | None:
+    """Convert engine stream events into stable JSONL event objects."""
+    if isinstance(event, AssistantTextDelta):
+        return _attach_session({"type": "assistant_delta", "text": event.text}, session_id)
+    if isinstance(event, AssistantTurnComplete):
+        return _attach_session({"type": "assistant_complete", "text": event.message.text.strip()}, session_id)
+    if isinstance(event, ToolExecutionStarted):
+        return _attach_session(
+            {"type": "tool_started", "tool_name": event.tool_name, "tool_input": event.tool_input},
+            session_id,
+        )
+    if isinstance(event, ToolExecutionCompleted):
+        return _attach_session(
+            {
+                "type": "tool_completed",
+                "tool_name": event.tool_name,
+                "output": event.output,
+                "is_error": event.is_error,
+            },
+            session_id,
+        )
+    if isinstance(event, ErrorEvent):
+        return _attach_session(
+            {"type": "error", "message": event.message, "recoverable": event.recoverable},
+            session_id,
+        )
+    if isinstance(event, CompactProgressEvent):
+        return _attach_session(
+            {
+                "type": "compact_progress",
+                "phase": event.phase,
+                "trigger": event.trigger,
+                "attempt": event.attempt,
+                "message": event.message,
+            },
+            session_id,
+        )
+    if isinstance(event, StatusEvent):
+        return _attach_session({"type": "status", "message": event.message}, session_id)
+    return None
+
+
+def _write_jsonl(stream: TextIO, payload: dict[str, Any]) -> None:
+    print(json.dumps(payload), file=stream, flush=True)
+
+
+def _headless_permission_allowed(permission_mode: str | None) -> bool:
+    return permission_mode == "full_auto"
 
 
 async def run_repl(
@@ -109,8 +178,15 @@ async def run_task_worker(
     can run without a controlling TTY.
     """
 
-    async def _noop_permission(_tool_name: str, _reason: str) -> bool:
-        return True
+    async def _noninteractive_permission(tool_name: str, reason: str) -> bool:
+        if _headless_permission_allowed(permission_mode):
+            return True
+        print(
+            f"Permission denied for {tool_name}: {reason}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
 
     async def _noop_ask(_question: str) -> str:
         return ""
@@ -119,8 +195,6 @@ async def run_task_worker(
         print(message, flush=True)
 
     async def _render_event(event: StreamEvent) -> None:
-        from openharness.engine.stream_events import AssistantTextDelta, AssistantTurnComplete, ErrorEvent, StatusEvent
-
         if isinstance(event, AssistantTextDelta):
             sys.stdout.write(event.text)
             sys.stdout.flush()
@@ -145,7 +219,7 @@ async def run_task_worker(
         api_key=api_key,
         api_format=api_format,
         api_client=api_client,
-        permission_prompt=_noop_permission,
+        permission_prompt=_noninteractive_permission,
         ask_user_prompt=_noop_ask,
         enforce_max_turns=max_turns is not None,
         permission_mode=permission_mode,
@@ -189,20 +263,35 @@ async def run_print_mode(
     api_client: SupportsStreamingMessages | None = None,
     permission_mode: str | None = None,
     max_turns: int | None = None,
+    restore_messages: list[dict] | None = None,
+    restore_tool_metadata: dict[str, object] | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Non-interactive mode: submit prompt, stream output, exit."""
-    from openharness.engine.stream_events import (
-        AssistantTextDelta,
-        AssistantTurnComplete,
-        CompactProgressEvent,
-        ErrorEvent,
-        StatusEvent,
-        ToolExecutionCompleted,
-        ToolExecutionStarted,
-    )
+    if output_format not in _VALID_PRINT_OUTPUT_FORMATS:
+        raise ValueError("output_format must be text, json, or stream-json")
 
-    async def _noop_permission(tool_name: str, reason: str) -> bool:
-        return True
+    collected_text = ""
+    events_list: list[dict] = []
+    session_ref = {"session_id": session_id or ""}
+
+    async def _noninteractive_permission(tool_name: str, reason: str) -> bool:
+        if _headless_permission_allowed(permission_mode):
+            return True
+        obj = _attach_session(
+            {"type": "permission_denied", "tool_name": tool_name, "reason": reason},
+            session_ref["session_id"],
+        )
+        if output_format == "stream-json":
+            _write_jsonl(sys.stdout, obj)
+            events_list.append(obj)
+        elif output_format == "text":
+            print(
+                f"Permission denied for {tool_name}: {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+        return False
 
     async def _noop_ask(question: str) -> str:
         return ""
@@ -219,22 +308,23 @@ async def run_print_mode(
         api_format=api_format,
         enforce_max_turns=True,
         api_client=api_client,
-        permission_prompt=_noop_permission,
+        permission_prompt=_noninteractive_permission,
         ask_user_prompt=_noop_ask,
+        restore_messages=restore_messages,
+        restore_tool_metadata=restore_tool_metadata,
+        session_id=session_id,
+        permission_mode=permission_mode,
     )
+    session_ref["session_id"] = bundle.session_id
     await start_runtime(bundle)
-
-    collected_text = ""
-    events_list: list[dict] = []
 
     try:
         async def _print_system(message: str) -> None:
-            nonlocal collected_text
             if output_format == "text":
                 print(message, file=sys.stderr)
             elif output_format == "stream-json":
-                obj = {"type": "system", "message": message}
-                print(json.dumps(obj), flush=True)
+                obj = _attach_session({"type": "system", "message": message}, bundle.session_id)
+                _write_jsonl(sys.stdout, obj)
                 events_list.append(obj)
 
         async def _render_event(event: StreamEvent) -> None:
@@ -245,53 +335,56 @@ async def run_print_mode(
                     sys.stdout.write(event.text)
                     sys.stdout.flush()
                 elif output_format == "stream-json":
-                    obj = {"type": "assistant_delta", "text": event.text}
-                    print(json.dumps(obj), flush=True)
+                    obj = _stream_event_payload(event, session_id=bundle.session_id)
+                    assert obj is not None
+                    _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
             elif isinstance(event, AssistantTurnComplete):
+                if not collected_text and event.message.text:
+                    collected_text = event.message.text
                 if output_format == "text":
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                 elif output_format == "stream-json":
-                    obj = {"type": "assistant_complete", "text": event.message.text.strip()}
-                    print(json.dumps(obj), flush=True)
+                    obj = _stream_event_payload(event, session_id=bundle.session_id)
+                    assert obj is not None
+                    _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
             elif isinstance(event, ToolExecutionStarted):
                 if output_format == "stream-json":
-                    obj = {"type": "tool_started", "tool_name": event.tool_name, "tool_input": event.tool_input}
-                    print(json.dumps(obj), flush=True)
+                    obj = _stream_event_payload(event, session_id=bundle.session_id)
+                    assert obj is not None
+                    _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
             elif isinstance(event, ToolExecutionCompleted):
                 if output_format == "stream-json":
-                    obj = {"type": "tool_completed", "tool_name": event.tool_name, "output": event.output, "is_error": event.is_error}
-                    print(json.dumps(obj), flush=True)
+                    obj = _stream_event_payload(event, session_id=bundle.session_id)
+                    assert obj is not None
+                    _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
             elif isinstance(event, ErrorEvent):
                 if output_format == "text":
                     print(event.message, file=sys.stderr)
                 elif output_format == "stream-json":
-                    obj = {"type": "error", "message": event.message, "recoverable": event.recoverable}
-                    print(json.dumps(obj), flush=True)
+                    obj = _stream_event_payload(event, session_id=bundle.session_id)
+                    assert obj is not None
+                    _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
             elif isinstance(event, CompactProgressEvent):
                 if output_format == "text" and event.message:
                     print(event.message, file=sys.stderr)
                 elif output_format == "stream-json":
-                    obj = {
-                        "type": "compact_progress",
-                        "phase": event.phase,
-                        "trigger": event.trigger,
-                        "attempt": event.attempt,
-                        "message": event.message,
-                    }
-                    print(json.dumps(obj), flush=True)
+                    obj = _stream_event_payload(event, session_id=bundle.session_id)
+                    assert obj is not None
+                    _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
             elif isinstance(event, StatusEvent):
                 if output_format == "text":
                     print(event.message, file=sys.stderr)
                 elif output_format == "stream-json":
-                    obj = {"type": "status", "message": event.message}
-                    print(json.dumps(obj), flush=True)
+                    obj = _stream_event_payload(event, session_id=bundle.session_id)
+                    assert obj is not None
+                    _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
 
         async def _clear_output() -> None:
@@ -313,8 +406,226 @@ async def run_print_mode(
                 announce_waiting=output_format == "text",
             )
 
+        if output_format == "stream-json":
+            obj = {"type": "line_complete", "session_id": bundle.session_id}
+            _write_jsonl(sys.stdout, obj)
+            events_list.append(obj)
         if output_format == "json":
-            result = {"type": "result", "text": collected_text.strip()}
+            result = {"type": "result", "session_id": bundle.session_id, "text": collected_text.strip()}
             print(json.dumps(result))
     finally:
         await close_runtime(bundle)
+
+
+async def run_headless_control(
+    *,
+    cwd: str | None = None,
+    model: str | None = None,
+    max_turns: int | None = None,
+    effort: str | None = None,
+    base_url: str | None = None,
+    system_prompt: str | None = None,
+    api_key: str | None = None,
+    api_format: str | None = None,
+    api_client: SupportsStreamingMessages | None = None,
+    permission_mode: str | None = None,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
+) -> None:
+    """Run the local JSONL headless control protocol over stdin/stdout."""
+    from openharness.services.session_storage import load_session_by_id, load_session_snapshot
+
+    input_stream = input_stream or sys.stdin
+    output_stream = output_stream or sys.stdout
+    bundle = None
+    current_request_id: str | None = None
+
+    def _request_id(payload: dict[str, Any]) -> str | None:
+        request_id = payload.get("request_id", payload.get("id"))
+        return request_id if isinstance(request_id, str) and request_id else None
+
+    def _emit(payload: dict[str, Any], *, request_id: str | None = None) -> None:
+        if request_id:
+            payload = {**payload, "request_id": request_id}
+        _write_jsonl(output_stream, payload)
+
+    def _error(message: str, *, request_id: str | None = None, recoverable: bool = True) -> None:
+        _emit({"type": "error", "message": message, "recoverable": recoverable}, request_id=request_id)
+
+    async def _permission(tool_name: str, reason: str) -> bool:
+        if _headless_permission_allowed(permission_mode):
+            return True
+        payload = {"type": "permission_denied", "tool_name": tool_name, "reason": reason}
+        if bundle is not None:
+            payload["session_id"] = bundle.session_id
+        _emit(payload, request_id=current_request_id)
+        return False
+
+    async def _ask_user(question: str) -> str:
+        payload = {
+            "type": "error",
+            "message": "ask_user is unavailable in headless mode",
+            "recoverable": True,
+            "question": question,
+        }
+        if bundle is not None:
+            payload["session_id"] = bundle.session_id
+        _emit(payload, request_id=current_request_id)
+        return ""
+
+    async def _start_bundle(
+        snapshot: dict[str, Any] | None = None,
+        *,
+        request_id: str | None = None,
+    ) -> None:
+        nonlocal bundle
+        if bundle is not None:
+            await close_runtime(bundle)
+        session_id = None
+        restore_messages = None
+        restore_tool_metadata = None
+        resolved_model = model
+        if snapshot is not None:
+            session_id = snapshot.get("session_id")
+            restore_messages = snapshot.get("messages")
+            restore_tool_metadata = snapshot.get("tool_metadata")
+            resolved_model = snapshot.get("model") or model
+        bundle = await build_runtime(
+            cwd=cwd,
+            model=resolved_model,
+            max_turns=max_turns,
+            effort=effort,
+            base_url=base_url,
+            system_prompt=system_prompt,
+            api_key=api_key,
+            api_format=api_format,
+            api_client=api_client,
+            permission_prompt=_permission,
+            ask_user_prompt=_ask_user,
+            restore_messages=restore_messages,
+            restore_tool_metadata=restore_tool_metadata,
+            session_id=session_id if isinstance(session_id, str) and session_id else None,
+            enforce_max_turns=max_turns is not None,
+            permission_mode=permission_mode,
+        )
+        await start_runtime(bundle)
+        payload = {"type": "ready", "session_id": bundle.session_id}
+        if snapshot is not None:
+            payload["resumed"] = True
+        _emit(payload, request_id=request_id)
+
+    async def _print_system(message: str) -> None:
+        payload = {"type": "system", "message": message}
+        if bundle is not None:
+            payload["session_id"] = bundle.session_id
+        _emit(payload, request_id=current_request_id)
+
+    async def _render_event(event: StreamEvent) -> None:
+        payload = _stream_event_payload(event, session_id=bundle.session_id if bundle is not None else None)
+        if payload is not None:
+            _emit(payload, request_id=current_request_id)
+
+    async def _clear_output() -> None:
+        payload = {"type": "clear_transcript"}
+        if bundle is not None:
+            payload["session_id"] = bundle.session_id
+        _emit(payload, request_id=current_request_id)
+
+    def _request_text(payload: dict[str, Any]) -> str:
+        for key in ("prompt", "line", "text"):
+            value = payload.get(key)
+            if isinstance(value, str):
+                return value.strip()
+        return ""
+
+    async def _submit(line: str, *, request_id: str | None) -> bool:
+        if bundle is None:
+            _error("Headless runtime is not ready", request_id=request_id)
+            return True
+        should_continue = await handle_line(
+            bundle,
+            line,
+            print_system=_print_system,
+            render_event=_render_event,
+            clear_output=_clear_output,
+        )
+        _emit({"type": "line_complete", "session_id": bundle.session_id}, request_id=request_id)
+        if not should_continue:
+            _emit({"type": "shutdown", "session_id": bundle.session_id}, request_id=request_id)
+        return should_continue
+
+    await _start_bundle()
+    try:
+        while True:
+            raw = await asyncio.to_thread(input_stream.readline)
+            if raw == "":
+                break
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                _error(f"Invalid JSON request: {exc.msg}", recoverable=True)
+                continue
+            if not isinstance(payload, dict):
+                _error("Headless requests must be JSON objects", recoverable=True)
+                continue
+
+            request_id = _request_id(payload)
+            current_request_id = request_id
+            request_type = payload.get("type")
+            if request_type in {"submit", "submit_line"}:
+                line = _request_text(payload)
+                if not line:
+                    _error("submit requires a non-empty prompt or line", request_id=request_id)
+                    current_request_id = None
+                    continue
+                if not await _submit(line, request_id=request_id):
+                    break
+            elif request_type == "resume":
+                session_id = payload.get("session_id")
+                if not isinstance(session_id, str) or not session_id.strip():
+                    _error("resume requires a non-empty session_id", request_id=request_id)
+                    current_request_id = None
+                    continue
+                snapshot = load_session_by_id(bundle.cwd if bundle is not None else (cwd or "."), session_id.strip())
+                if snapshot is None:
+                    _error(f"Session not found: {session_id}", request_id=request_id)
+                    current_request_id = None
+                    continue
+                await _start_bundle(snapshot, request_id=request_id)
+                line = _request_text(payload)
+                if line and not await _submit(line, request_id=request_id):
+                    break
+            elif request_type == "continue":
+                session_id = payload.get("session_id")
+                if isinstance(session_id, str) and session_id.strip():
+                    snapshot = load_session_by_id(bundle.cwd if bundle is not None else (cwd or "."), session_id.strip())
+                else:
+                    snapshot = load_session_snapshot(bundle.cwd if bundle is not None else (cwd or "."))
+                if snapshot is None:
+                    _error("No previous session found in this directory.", request_id=request_id)
+                    current_request_id = None
+                    continue
+                await _start_bundle(snapshot, request_id=request_id)
+                line = _request_text(payload)
+                if line and not await _submit(line, request_id=request_id):
+                    break
+            elif request_type == "permission_response":
+                _error(
+                    "permission_response is not used by this deterministic headless mode",
+                    request_id=request_id,
+                )
+            elif request_type == "shutdown":
+                _emit(
+                    {"type": "shutdown", "session_id": bundle.session_id if bundle is not None else ""},
+                    request_id=request_id,
+                )
+                break
+            else:
+                _error(f"Unsupported headless request type: {request_type}", request_id=request_id)
+            current_request_id = None
+    finally:
+        if bundle is not None:
+            await close_runtime(bundle)

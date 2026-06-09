@@ -289,6 +289,7 @@ async def build_runtime(
     edit_approval_prompt: EditApprovalPrompt | None = None,
     restore_messages: list[dict] | None = None,
     restore_tool_metadata: dict[str, object] | None = None,
+    session_id: str | None = None,
     enforce_max_turns: bool = True,
     session_backend: SessionBackend | None = None,
     permission_mode: str | None = None,
@@ -374,7 +375,7 @@ async def build_runtime(
     )
     from uuid import uuid4
 
-    session_id = uuid4().hex[:12]
+    session_id = session_id or uuid4().hex[:12]
 
     restored_metadata = {
         "permission_mode": settings.permission.mode.value,
