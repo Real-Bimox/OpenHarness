@@ -39,14 +39,29 @@ class TelegramConfig(BaseChannelConfig):
     bot_name: str = "ohmo"
 
 
+class DirectMessageConfig(_CompatModel):
+    enabled: bool = True
+    policy: str = "open"
+    allow_from: list[str] = Field(default_factory=list)
+
+
 class SlackConfig(BaseChannelConfig):
     bot_token: str = ""
     app_token: str = ""
     signing_secret: str = ""
+    mode: str = "socket"
+    reply_in_thread: bool = True
+    react_emoji: str = "eyes"
+    dm: DirectMessageConfig = Field(default_factory=DirectMessageConfig)
+    group_policy: str = "mention"
+    group_allow_from: list[str] = Field(default_factory=list)
 
 
 class DiscordConfig(BaseChannelConfig):
     token: str = ""
+    gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+    intents: int = 513
+    group_policy: str = "mention"
 
 
 class FeishuConfig(BaseChannelConfig):
@@ -69,29 +84,53 @@ class DingTalkConfig(BaseChannelConfig):
 
 
 class EmailConfig(BaseChannelConfig):
+    consent_granted: bool = False
+    poll_interval_seconds: int = 30
+    auto_reply_enabled: bool = True
     smtp_host: str = ""
     smtp_port: int = 587
     smtp_username: str = ""
     smtp_password: str = ""
     from_address: str = ""
+    smtp_use_ssl: bool = False
+    smtp_use_tls: bool = True
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_username: str = ""
+    imap_password: str = ""
+    imap_use_ssl: bool = True
+    imap_mailbox: str = "INBOX"
+    mark_seen: bool = True
+    max_body_chars: int = 20_000
+    subject_prefix: str = "Re: "
 
 
 class QQConfig(BaseChannelConfig):
     token: str = ""
     app_id: str = ""
     app_secret: str = ""
+    secret: str = ""
 
 
 class MatrixConfig(BaseChannelConfig):
     homeserver: str = ""
     access_token: str = ""
     user_id: str = ""
+    device_id: str = ""
+    e2ee_enabled: bool = False
+    sync_stop_grace_seconds: int = 10
+    max_media_bytes: int = 20 * 1024 * 1024
+    allow_room_mentions: bool = True
+    group_policy: str = "mention"
+    group_allow_from: list[str] = Field(default_factory=list)
 
 
 class WhatsAppConfig(BaseChannelConfig):
     access_token: str = ""
     phone_number_id: str = ""
     verify_token: str = ""
+    bridge_url: str = ""
+    bridge_token: str = ""
 
 
 class MochatConfig(BaseChannelConfig):

@@ -14,8 +14,6 @@ from __future__ import annotations
 import logging
 from typing import AsyncIterator
 
-from openai import AsyncOpenAI
-
 from openharness.api.client import (
     ApiMessageRequest,
     ApiStreamEvent,
@@ -91,17 +89,11 @@ class CopilotClient:
             "User-Agent": f"openharness/{_VERSION}",
             "Openai-Intent": "conversation-edits",
         }
-        raw_openai = AsyncOpenAI(
+        self._inner = OpenAICompatibleClient(
             api_key=token,
             base_url=base_url,
             default_headers=default_headers,
         )
-        self._inner = OpenAICompatibleClient(
-            api_key=token,
-            base_url=base_url,
-        )
-        # Swap the underlying SDK client so Copilot headers are used.
-        self._inner._client = raw_openai  # noqa: SLF001
 
         log.info(
             "CopilotClient initialised (api_base=%s, enterprise=%s)",

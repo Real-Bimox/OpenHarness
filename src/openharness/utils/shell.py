@@ -13,6 +13,8 @@ from openharness.config import Settings, load_settings
 from openharness.platforms import PlatformName, get_platform
 from openharness.sandbox import wrap_command_for_sandbox
 
+_CLEANUP_TASKS: set[asyncio.Task[None]] = set()
+
 
 def resolve_shell_command(
     command: str,
@@ -101,7 +103,9 @@ async def create_shell_subprocess(
         raise
 
     if cleanup_path is not None:
-        asyncio.create_task(_cleanup_after_exit(process, cleanup_path))
+        cleanup_task = asyncio.create_task(_cleanup_after_exit(process, cleanup_path))
+        _CLEANUP_TASKS.add(cleanup_task)
+        cleanup_task.add_done_callback(_CLEANUP_TASKS.discard)
     return process
 
 

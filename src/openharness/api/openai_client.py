@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 from typing import Any, AsyncIterator
 from urllib.parse import urlsplit, urlunsplit
@@ -264,10 +265,20 @@ class OpenAICompatibleClient:
     so it can be used as a drop-in replacement in the agent loop.
     """
 
-    def __init__(self, api_key: str, *, base_url: str | None = None, timeout: float | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        default_headers: dict[str, str] | None = None,
+    ) -> None:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        if default_headers:
+            headers.update(default_headers)
         kwargs: dict[str, Any] = {
             "api_key": api_key,
-            "default_headers": {"Authorization": f"Bearer {api_key}"},
+            "default_headers": headers,
         }
         normalized_base_url = _normalize_openai_base_url(base_url)
         if normalized_base_url:
@@ -296,7 +307,7 @@ class OpenAICompatibleClient:
                 if attempt >= MAX_RETRIES or not self._is_retryable(exc):
                     raise self._translate_error(exc) from exc
 
-                delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+                delay = self._get_retry_delay(attempt, exc)
                 log.warning(
                     "OpenAI API request failed (attempt %d/%d), retrying in %.1fs: %s",
                     attempt + 1, MAX_RETRIES + 1, delay, exc,
@@ -436,11 +447,24 @@ class OpenAICompatibleClient:
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
         status = getattr(exc, "status_code", None)
-        if status and status in {429, 500, 502, 503}:
+        if status and status in {429, 500, 502, 503, 504}:
             return True
         if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
             return True
         return False
+
+    @staticmethod
+    def _get_retry_delay(attempt: int, exc: Exception) -> float:
+        headers = getattr(exc, "headers", None)
+        if headers is not None and hasattr(headers, "get"):
+            retry_after = headers.get("retry-after") or headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return min(float(retry_after), MAX_DELAY)
+                except (TypeError, ValueError):
+                    pass
+        delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+        return delay + random.uniform(0, delay * 0.25)
 
     @staticmethod
     def _translate_error(exc: Exception) -> OpenHarnessApiError:

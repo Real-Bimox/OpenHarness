@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.tools._file_ops import atomic_write_utf8, file_signature, lock_for_path
 
 
 class FileEditToolInput(BaseModel):
@@ -42,29 +43,39 @@ class FileEditTool(BaseTool):
             if not allowed:
                 return ToolResult(output=f"Sandbox: {reason}", is_error=True)
 
-        if not path.exists():
-            return ToolResult(output=f"File not found: {path}", is_error=True)
+        if not arguments.old_str:
+            return ToolResult(output="old_str must not be empty", is_error=True)
 
-        original = path.read_text(encoding="utf-8")
-        if arguments.old_str not in original:
-            return ToolResult(output="old_str was not found in the file", is_error=True)
+        async with lock_for_path(path):
+            if not path.exists():
+                return ToolResult(output=f"File not found: {path}", is_error=True)
 
-        if arguments.replace_all:
-            updated = original.replace(arguments.old_str, arguments.new_str)
-        else:
-            updated = original.replace(arguments.old_str, arguments.new_str, 1)
+            before_signature = file_signature(path)
+            original = path.read_text(encoding="utf-8")
+            if arguments.old_str not in original:
+                return ToolResult(output="old_str was not found in the file", is_error=True)
 
-        approval_prompt = context.metadata.get("edit_approval_prompt") if context.metadata else None
-        if approval_prompt is not None:
-            diff_text, added, removed = _compute_diff(str(path), original, updated)
-            reply = await approval_prompt(str(path), diff_text, added, removed)
-            if reply == "reject":
-                return ToolResult(output=f"Edit rejected by user: {path}", is_error=True)
-            path.write_text(updated, encoding="utf-8")
-            stats = f"  ({_ANSI_GREEN}+{added}{_ANSI_RESET} {_ANSI_RED}-{removed}{_ANSI_RESET})"
-            return ToolResult(output=f"Updated {path}{stats}")
+            if arguments.replace_all:
+                updated = original.replace(arguments.old_str, arguments.new_str)
+            else:
+                updated = original.replace(arguments.old_str, arguments.new_str, 1)
 
-        path.write_text(updated, encoding="utf-8")
+            approval_prompt = context.metadata.get("edit_approval_prompt") if context.metadata else None
+            if approval_prompt is not None:
+                diff_text, added, removed = _compute_diff(str(path), original, updated)
+                reply = await approval_prompt(str(path), diff_text, added, removed)
+                if reply == "reject":
+                    return ToolResult(output=f"Edit rejected by user: {path}", is_error=True)
+                if file_signature(path) != before_signature:
+                    return ToolResult(
+                        output=f"File changed while awaiting approval: {path}",
+                        is_error=True,
+                    )
+                atomic_write_utf8(path, updated)
+                stats = f"  ({_ANSI_GREEN}+{added}{_ANSI_RESET} {_ANSI_RED}-{removed}{_ANSI_RESET})"
+                return ToolResult(output=f"Updated {path}{stats}")
+
+            atomic_write_utf8(path, updated)
         return ToolResult(output=f"Updated {path}")
 
 

@@ -32,6 +32,7 @@ from openharness.api.provider import auth_status, detect_provider
 from openharness.config.settings import Settings, display_model_setting, load_settings, save_settings
 from openharness.engine.messages import ConversationMessage, sanitize_conversation_messages
 from openharness.engine.query_engine import QueryEngine
+from openharness.utils.fs import atomic_write_text
 from openharness.memory import (
     add_memory_entry,
     get_memory_entrypoint,
@@ -232,7 +233,7 @@ def _copy_to_clipboard(text: str) -> tuple[bool, str]:
             except Exception:
                 continue
     fallback = get_data_dir() / "last_copy.txt"
-    fallback.write_text(text, encoding="utf-8")
+    atomic_write_text(fallback, text, encoding="utf-8", mode=0o600)
     return False, str(fallback)
 
 
@@ -260,6 +261,30 @@ def _rewind_turns(messages: list[ConversationMessage], turns: int) -> list[Conve
             if popped.role == "user" and popped.text.strip():
                 break
     return updated
+
+
+def _bounded_files_listing(
+    root: Path,
+    *,
+    max_items: int,
+    want_dirs: bool,
+    needle: str = "",
+) -> tuple[list[str], bool]:
+    lines: list[str] = []
+    for path in root.rglob("*"):
+        if ".git" in path.parts or ".venv" in path.parts or "node_modules" in path.parts:
+            continue
+        if want_dirs and not path.is_dir():
+            continue
+        if not want_dirs and not path.is_file():
+            continue
+        relative = str(path.relative_to(root))
+        if needle and needle not in relative.lower():
+            continue
+        if len(lines) >= max_items:
+            return lines, True
+        lines.append(relative)
+    return lines, False
 
 
 
@@ -932,29 +957,22 @@ def create_default_command_registry(
         max_items = 30
         tokens = raw.split(maxsplit=1)
         if tokens and tokens[0] == "dirs":
-            dirs = [
-                path
-                for path in sorted(root.rglob("*"))
-                if path.is_dir() and ".git" not in path.parts and ".venv" not in path.parts
-            ]
-            lines = [str(path.relative_to(root)) for path in dirs[:max_items]]
-            if len(dirs) > max_items:
-                lines.append(f"... {len(dirs) - max_items} more")
+            lines, overflow = _bounded_files_listing(root, max_items=max_items, want_dirs=True)
+            if overflow:
+                lines.append("... more")
             return CommandResult(message="\n".join(lines) if lines else "(no directories)")
         if tokens and tokens[0].isdigit():
             max_items = max(1, min(int(tokens[0]), 200))
             raw = tokens[1] if len(tokens) == 2 else ""
         needle = raw.lower()
-        files = [
-            path
-            for path in sorted(root.rglob("*"))
-            if path.is_file() and ".git" not in path.parts and ".venv" not in path.parts
-        ]
-        if needle:
-            files = [path for path in files if needle in str(path.relative_to(root)).lower()]
-        lines = [str(path.relative_to(root)) for path in files[:max_items]]
-        if len(files) > max_items:
-            lines.append(f"... {len(files) - max_items} more")
+        lines, overflow = _bounded_files_listing(
+            root,
+            max_items=max_items,
+            want_dirs=False,
+            needle=needle,
+        )
+        if overflow:
+            lines.append("... more")
         return CommandResult(
             message="\n".join(lines) if lines else "(no matching files)"
         )

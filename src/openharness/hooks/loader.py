@@ -12,10 +12,12 @@ class HookRegistry:
 
     def __init__(self) -> None:
         self._hooks: dict[HookEvent, list[HookDefinition]] = defaultdict(list)
+        self._sorted_hooks: dict[HookEvent, list[HookDefinition]] = {}
 
     def register(self, event: HookEvent, hook: HookDefinition) -> None:
         """Register one hook."""
         self._hooks[event].append(hook)
+        self._sorted_hooks.pop(event, None)
 
     def get(self, event: HookEvent) -> list[HookDefinition]:
         """Return hooks registered for an event, ordered by priority.
@@ -24,7 +26,11 @@ class HookRegistry:
         hooks sharing the same priority keep their registration order.
         """
         hooks = self._hooks.get(event, [])
-        return sorted(hooks, key=lambda hook: -getattr(hook, "priority", 0))
+        sorted_hooks = self._sorted_hooks.get(event)
+        if sorted_hooks is None:
+            sorted_hooks = sorted(hooks, key=lambda hook: -getattr(hook, "priority", 0))
+            self._sorted_hooks[event] = sorted_hooks
+        return list(sorted_hooks)
 
     def summary(self) -> str:
         """Return a human-readable hook summary."""

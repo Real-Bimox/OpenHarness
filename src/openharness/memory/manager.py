@@ -164,11 +164,12 @@ def _next_memory_path(memory_dir: Path, slug: str) -> Path:
     if not path.exists():
         return path
     index = 2
-    while True:
+    while index <= 10_000:
         candidate = memory_dir / f"{slug}_{index}.md"
         if not candidate.exists():
             return candidate
         index += 1
+    raise RuntimeError(f"Could not allocate a memory filename for slug: {slug}")
 
 
 def _effective_signature(path: Path, existing_signature: str) -> str:

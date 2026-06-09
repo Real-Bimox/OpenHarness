@@ -4,6 +4,9 @@ import asyncio
 
 from openharness.channels.bus.events import InboundMessage, OutboundMessage
 
+DEFAULT_QUEUE_MAXSIZE = 1000
+QUEUE_PUT_TIMEOUT_SECONDS = 5.0
+
 
 class MessageBus:
     """
@@ -13,13 +16,16 @@ class MessageBus:
     them and pushes responses to the outbound queue.
     """
 
-    def __init__(self):
-        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
-        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+    def __init__(self, *, maxsize: int = DEFAULT_QUEUE_MAXSIZE):
+        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(maxsize=maxsize)
+        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue(maxsize=maxsize)
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""
-        await self.inbound.put(msg)
+        try:
+            await asyncio.wait_for(self.inbound.put(msg), timeout=QUEUE_PUT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Inbound channel queue is full") from exc
 
     async def consume_inbound(self) -> InboundMessage:
         """Consume the next inbound message (blocks until available)."""
@@ -27,7 +33,10 @@ class MessageBus:
 
     async def publish_outbound(self, msg: OutboundMessage) -> None:
         """Publish a response from the agent to channels."""
-        await self.outbound.put(msg)
+        try:
+            await asyncio.wait_for(self.outbound.put(msg), timeout=QUEUE_PUT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError("Outbound channel queue is full") from exc
 
     async def consume_outbound(self) -> OutboundMessage:
         """Consume the next outbound message (blocks until available)."""

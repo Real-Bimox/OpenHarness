@@ -31,12 +31,20 @@ class SymbolLocation:
     docstring: str = ""
 
 
+@dataclass(frozen=True)
+class _PythonFileCacheEntry:
+    mtime_ns: int
+    size: int
+    lines: tuple[str, ...]
+    symbols: tuple[SymbolLocation, ...]
+
+
+_FILE_CACHE: dict[Path, _PythonFileCacheEntry] = {}
+
+
 def list_document_symbols(path: Path) -> list[SymbolLocation]:
     """Return top-level and nested symbols from one Python source file."""
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    symbols: list[SymbolLocation] = []
-    _collect_symbols(tree, path, symbols, parent=None)
-    return symbols
+    return list(_cached_python_file(path).symbols)
 
 
 def workspace_symbol_search(root: Path, query: str) -> list[SymbolLocation]:
@@ -46,7 +54,11 @@ def workspace_symbol_search(root: Path, query: str) -> list[SymbolLocation]:
         return []
     matches: list[SymbolLocation] = []
     for file_path in iter_python_files(root):
-        for symbol in list_document_symbols(file_path):
+        try:
+            symbols = list_document_symbols(file_path)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for symbol in symbols:
             if needle in symbol.name.lower():
                 matches.append(symbol)
     return matches
@@ -66,7 +78,11 @@ def go_to_definition(
         return []
     matches: list[SymbolLocation] = []
     for candidate in iter_python_files(root):
-        for item in list_document_symbols(candidate):
+        try:
+            symbols = list_document_symbols(candidate)
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for item in symbols:
             if item.name == target:
                 matches.append(item)
     return matches
@@ -87,7 +103,11 @@ def find_references(
     pattern = re.compile(rf"\b{re.escape(target)}\b")
     matches: list[tuple[Path, int, str]] = []
     for candidate in iter_python_files(root):
-        for lineno, raw_line in enumerate(candidate.read_text(encoding="utf-8").splitlines(), start=1):
+        try:
+            lines = _cached_python_file(candidate).lines
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for lineno, raw_line in enumerate(lines, start=1):
             if pattern.search(raw_line):
                 matches.append((candidate, lineno, raw_line.strip()))
     return matches
@@ -121,7 +141,7 @@ def extract_symbol_at_position(
     """Extract a probable identifier from a 1-based line/character position."""
     if line is None:
         return None
-    lines = file_path.read_text(encoding="utf-8").splitlines()
+    lines = _cached_python_file(file_path).lines
     if line < 1 or line > len(lines):
         return None
     text = lines[line - 1]
@@ -146,6 +166,32 @@ def iter_python_files(root: Path) -> list[Path]:
             files.append(path)
     files.sort()
     return files
+
+
+def _cached_python_file(path: Path) -> _PythonFileCacheEntry:
+    stat_result = path.stat()
+    cached = _FILE_CACHE.get(path)
+    if (
+        cached is not None
+        and cached.mtime_ns == stat_result.st_mtime_ns
+        and cached.size == stat_result.st_size
+    ):
+        return cached
+    text = path.read_text(encoding="utf-8")
+    lines = tuple(text.splitlines())
+    tree = ast.parse(text, filename=str(path))
+    symbols: list[SymbolLocation] = []
+    _collect_symbols(tree, path, symbols, parent=None)
+    entry = _PythonFileCacheEntry(
+        mtime_ns=stat_result.st_mtime_ns,
+        size=stat_result.st_size,
+        lines=lines,
+        symbols=tuple(symbols),
+    )
+    _FILE_CACHE[path] = entry
+    if len(_FILE_CACHE) > 2000:
+        _FILE_CACHE.clear()
+    return entry
 
 
 def _collect_symbols(

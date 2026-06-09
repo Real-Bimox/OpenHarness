@@ -10,13 +10,14 @@ Settings are resolved with the following precedence (highest first):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from openharness.hooks.schemas import HookDefinition
 from openharness.mcp.types import McpServerConfig
@@ -27,6 +28,7 @@ from openharness.utils.fs import atomic_write_text
 
 # ANSI escape sequence pattern
 _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*m")
+log = logging.getLogger(__name__)
 
 
 def strip_ansi_escape_sequences(text: str) -> str:
@@ -961,23 +963,36 @@ def _apply_env_overrides(settings: Settings) -> Settings:
 
     max_tokens = os.environ.get("OPENHARNESS_MAX_TOKENS")
     if max_tokens:
-        updates["max_tokens"] = int(max_tokens)
+        parsed = _parse_int_env("OPENHARNESS_MAX_TOKENS", max_tokens)
+        if parsed is not None:
+            updates["max_tokens"] = parsed
 
     timeout = os.environ.get("OPENHARNESS_TIMEOUT")
     if timeout:
-        updates["timeout"] = float(timeout)
+        parsed = _parse_float_env("OPENHARNESS_TIMEOUT", timeout)
+        if parsed is not None:
+            updates["timeout"] = parsed
 
     max_turns = os.environ.get("OPENHARNESS_MAX_TURNS")
     if max_turns:
-        updates["max_turns"] = int(max_turns)
+        parsed = _parse_int_env("OPENHARNESS_MAX_TURNS", max_turns)
+        if parsed is not None:
+            updates["max_turns"] = parsed
 
     context_window_tokens = os.environ.get("OPENHARNESS_CONTEXT_WINDOW_TOKENS")
     if context_window_tokens:
-        updates["context_window_tokens"] = int(context_window_tokens)
+        parsed = _parse_int_env("OPENHARNESS_CONTEXT_WINDOW_TOKENS", context_window_tokens)
+        if parsed is not None:
+            updates["context_window_tokens"] = parsed
 
     auto_compact_threshold_tokens = os.environ.get("OPENHARNESS_AUTO_COMPACT_THRESHOLD_TOKENS")
     if auto_compact_threshold_tokens:
-        updates["auto_compact_threshold_tokens"] = int(auto_compact_threshold_tokens)
+        parsed = _parse_int_env(
+            "OPENHARNESS_AUTO_COMPACT_THRESHOLD_TOKENS",
+            auto_compact_threshold_tokens,
+        )
+        if parsed is not None:
+            updates["auto_compact_threshold_tokens"] = parsed
 
     provider = os.environ.get("OPENHARNESS_PROVIDER")
     api_format = os.environ.get("OPENHARNESS_API_FORMAT")
@@ -1044,6 +1059,22 @@ def _parse_bool_env(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parse_int_env(name: str, value: str) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        log.warning("Ignoring invalid integer value for %s: %r", name, value)
+        return None
+
+
+def _parse_float_env(name: str, value: str) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        log.warning("Ignoring invalid float value for %s: %r", name, value)
+        return None
+
+
 def load_settings(config_path: Path | None = None) -> Settings:
     """Load settings from config file, merging with defaults.
 
@@ -1059,8 +1090,13 @@ def load_settings(config_path: Path | None = None) -> Settings:
         config_path = get_config_file_path()
 
     if config_path.exists():
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-        settings = Settings.model_validate(raw)
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            settings = Settings.model_validate(raw)
+        except (OSError, json.JSONDecodeError, ValidationError) as exc:
+            log.warning("Ignoring invalid settings file %s: %s", config_path, exc)
+            raw = {}
+            settings = Settings()
         env_profile = os.environ.get("OPENHARNESS_PROFILE")
         if env_profile:
             settings = settings.model_copy(update={"active_profile": env_profile.strip()})

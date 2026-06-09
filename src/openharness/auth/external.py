@@ -260,10 +260,12 @@ def _read_claude_credentials_from_keychain(
         raw_payload = subprocess.check_output(
             ["security", "find-generic-password", "-w", "-s", service],
             text=True,
+            timeout=10,
         )
         metadata = subprocess.check_output(
             ["security", "find-generic-password", "-s", service],
             text=True,
+            timeout=10,
         )
     except subprocess.CalledProcessError as exc:
         raise ValueError(f"Claude Keychain credential not found for service: {service}") from exc
@@ -533,6 +535,7 @@ def _write_claude_credentials_to_keychain(
         check=True,
         capture_output=True,
         text=True,
+        timeout=10,
     )
 
 

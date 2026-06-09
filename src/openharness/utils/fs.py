@@ -31,9 +31,12 @@ import contextlib
 import os
 import stat
 import tempfile
+import threading
 from pathlib import Path
 
 __all__ = ["atomic_write_bytes", "atomic_write_text"]
+
+_UMASK_LOCK = threading.Lock()
 
 
 def atomic_write_bytes(path: str | os.PathLike[str], data: bytes, *, mode: int | None = None) -> None:
@@ -83,8 +86,9 @@ def _resolve_target_mode(path: Path, explicit_mode: int | None) -> int:
     try:
         st = path.stat()
     except FileNotFoundError:
-        current_umask = os.umask(0)
-        os.umask(current_umask)
+        with _UMASK_LOCK:
+            current_umask = os.umask(0)
+            os.umask(current_umask)
         return 0o666 & ~current_umask
     return stat.S_IMODE(st.st_mode)
 

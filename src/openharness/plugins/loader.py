@@ -204,7 +204,18 @@ def _walk_plugin_markdown(
     if not root.exists():
         return []
     files: list[Path] = []
-    for current_root, dirnames, filenames in os.walk(root, followlinks=True):
+    max_dirs = 2000
+    max_files = 5000
+    visited_dirs = 0
+    for current_root, dirnames, filenames in os.walk(root, followlinks=False):
+        visited_dirs += 1
+        if visited_dirs > max_dirs or len(files) >= max_files:
+            break
+        dirnames[:] = [
+            dirname
+            for dirname in dirnames
+            if not (Path(current_root) / dirname).is_symlink()
+        ]
         current = Path(current_root)
         skill_file = current / "SKILL.md"
         if stop_at_skill_dir and skill_file.exists():
@@ -214,6 +225,8 @@ def _walk_plugin_markdown(
         for filename in sorted(filenames):
             if filename.lower().endswith(".md"):
                 files.append(current / filename)
+                if len(files) >= max_files:
+                    break
     return sorted(files)
 
 
@@ -435,6 +448,11 @@ def _load_single_command_file(
     if resolved in seen:
         return None
     seen.add(resolved)
+    try:
+        if file_path.stat().st_size > 1_000_000:
+            return None
+    except OSError:
+        return None
     content = file_path.read_text(encoding="utf-8")
     frontmatter, body = _parse_frontmatter(content, file_path)
     if metadata_override:

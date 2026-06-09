@@ -17,6 +17,7 @@ import subprocess
 import shlex
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 TICK_INTERVAL_SECONDS = 30
 """How often the scheduler checks for due jobs."""
+_HISTORY_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +62,9 @@ def append_history(entry: dict[str, Any]) -> None:
     """Append one execution record to the history log."""
     path = get_history_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry) + "\n")
+    with _HISTORY_LOCK:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
 
 
 def load_history(*, limit: int = 50, job_name: str | None = None) -> list[dict[str, Any]]:

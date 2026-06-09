@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from openharness.ui.app import run_print_mode, run_repl, run_task_worker
 from openharness.engine.stream_events import AssistantTurnComplete
 from openharness.engine.messages import ConversationMessage, TextBlock
-from openharness.ui.react_launcher import build_backend_command
+from openharness.ui.react_launcher import build_backend_command, build_backend_env
 
 
 class _AsyncIterator:
@@ -33,7 +33,13 @@ def test_build_backend_command_includes_flags():
     assert "--model" in command
     assert "--base-url" in command
     assert "--system-prompt" in command
-    assert "--api-key" in command
+    assert "--api-key" not in command
+    assert "secret" not in command
+
+
+def test_build_backend_env_carries_api_key():
+    env = build_backend_env(api_key="secret")
+    assert env == {"OPENHARNESS_ANTHROPIC_API_KEY": "secret"}
 
 
 @pytest.mark.asyncio

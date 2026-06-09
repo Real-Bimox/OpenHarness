@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 import re
@@ -32,7 +33,7 @@ class EnterWorktreeTool(BaseTool):
         arguments: EnterWorktreeToolInput,
         context: ToolExecutionContext,
     ) -> ToolResult:
-        top_level = _git_output(context.cwd, "rev-parse", "--show-toplevel")
+        top_level = await asyncio.to_thread(_git_output, context.cwd, "rev-parse", "--show-toplevel")
         if top_level is None:
             return ToolResult(output="enter_worktree requires a git repository", is_error=True)
 
@@ -44,7 +45,8 @@ class EnterWorktreeTool(BaseTool):
             cmd.extend(["-b", arguments.branch, str(worktree_path), arguments.base_ref])
         else:
             cmd.extend([str(worktree_path), arguments.branch])
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             cmd,
             cwd=repo_root,
             capture_output=True,

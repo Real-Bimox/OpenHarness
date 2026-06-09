@@ -104,13 +104,20 @@ def build_backend_command(
         command.extend(["--base-url", base_url])
     if system_prompt:
         command.extend(["--system-prompt", system_prompt])
-    if api_key:
-        command.extend(["--api-key", api_key])
     if api_format:
         command.extend(["--api-format", api_format])
     if permission_mode:
         command.extend(["--permission-mode", permission_mode])
     return command
+
+
+def build_backend_env(*, api_key: str | None = None, api_format: str | None = None) -> dict[str, str]:
+    """Return child-only backend environment overrides."""
+    if not api_key:
+        return {}
+    if (api_format or "").strip().lower() == "openai":
+        return {"OPENHARNESS_OPENAI_API_KEY": api_key}
+    return {"OPENHARNESS_ANTHROPIC_API_KEY": api_key}
 
 
 async def launch_react_tui(
@@ -155,10 +162,10 @@ async def launch_react_tui(
                 effort=effort,
                 base_url=base_url,
                 system_prompt=system_prompt,
-                api_key=api_key,
                 api_format=api_format,
                 permission_mode=permission_mode,
             ),
+            "backend_env": build_backend_env(api_key=api_key, api_format=api_format),
             "initial_prompt": prompt,
             "theme": _resolve_theme(),
         }
@@ -176,4 +183,4 @@ async def launch_react_tui(
     return await process.wait()
 
 
-__all__ = ["build_backend_command", "get_frontend_dir", "launch_react_tui"]
+__all__ = ["build_backend_command", "build_backend_env", "get_frontend_dir", "launch_react_tui"]

@@ -126,12 +126,14 @@ class AnthropicApiClient:
         base_url: str | None = None,
         claude_oauth: bool = False,
         auth_token_resolver: Callable[[], str] | None = None,
+        timeout: float | None = None,
     ) -> None:
         self._api_key = api_key
         self._auth_token = auth_token
         self._base_url = base_url
         self._claude_oauth = claude_oauth
         self._auth_token_resolver = auth_token_resolver
+        self._timeout = timeout
         self._session_id = get_claude_code_session_id() if claude_oauth else ""
         self._client = self._create_client()
 
@@ -148,19 +150,26 @@ class AnthropicApiClient:
             )
         if self._base_url:
             kwargs["base_url"] = self._base_url
+        if self._timeout is not None:
+            kwargs["timeout"] = self._timeout
         return AsyncAnthropic(**kwargs)
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""
         await self._client.close()
 
-    def _refresh_client_auth(self) -> None:
+    async def _refresh_client_auth(self) -> None:
         if not self._claude_oauth or self._auth_token_resolver is None:
             return
         next_token = self._auth_token_resolver()
         if next_token and next_token != self._auth_token:
+            old_client = self._client
             self._auth_token = next_token
             self._client = self._create_client()
+            try:
+                await old_client.close()
+            except Exception:
+                log.debug("Failed to close stale Anthropic client after token refresh", exc_info=True)
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Yield text deltas and the final assistant message with retry on transient errors."""
@@ -168,7 +177,7 @@ class AnthropicApiClient:
 
         for attempt in range(MAX_RETRIES + 1):
             try:
-                self._refresh_client_auth()
+                await self._refresh_client_auth()
                 async for event in self._stream_once(request):
                     yield event
                 return  # Success

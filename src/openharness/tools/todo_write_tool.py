@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.tools._file_ops import atomic_write_utf8, lock_for_path, resolve_workspace_path
 
 
 class TodoWriteToolInput(BaseModel):
@@ -25,22 +26,27 @@ class TodoWriteTool(BaseTool):
     input_model = TodoWriteToolInput
 
     async def execute(self, arguments: TodoWriteToolInput, context: ToolExecutionContext) -> ToolResult:
-        path = Path(context.cwd) / arguments.path
-        existing = path.read_text(encoding="utf-8") if path.exists() else "# TODO\n"
+        try:
+            path = resolve_workspace_path(Path(context.cwd), arguments.path)
+        except ValueError as exc:
+            return ToolResult(output=str(exc), is_error=True)
 
-        unchecked_line = f"- [ ] {arguments.item}"
-        checked_line = f"- [x] {arguments.item}"
-        target_line = checked_line if arguments.checked else unchecked_line
+        async with lock_for_path(path):
+            existing = path.read_text(encoding="utf-8") if path.exists() else "# TODO\n"
 
-        if unchecked_line in existing and arguments.checked:
-            # Mark existing unchecked item as done (in-place update)
-            updated = existing.replace(unchecked_line, checked_line, 1)
-        elif target_line in existing:
-            # Item already in desired state — no-op
-            return ToolResult(output=f"No change needed in {path}")
-        else:
-            # New item — append
-            updated = existing.rstrip() + f"\n{target_line}\n"
+            unchecked_line = f"- [ ] {arguments.item}"
+            checked_line = f"- [x] {arguments.item}"
+            target_line = checked_line if arguments.checked else unchecked_line
 
-        path.write_text(updated, encoding="utf-8")
+            if unchecked_line in existing and arguments.checked:
+                # Mark existing unchecked item as done (in-place update)
+                updated = existing.replace(unchecked_line, checked_line, 1)
+            elif target_line in existing:
+                # Item already in desired state — no-op
+                return ToolResult(output=f"No change needed in {path}")
+            else:
+                # New item — append
+                updated = existing.rstrip() + f"\n{target_line}\n"
+
+            atomic_write_utf8(path, updated)
         return ToolResult(output=f"Updated {path}")

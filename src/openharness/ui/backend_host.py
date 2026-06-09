@@ -39,6 +39,7 @@ from openharness.ui.runtime import build_runtime, close_runtime, handle_line, st
 from openharness.services.session_backend import SessionBackend
 
 log = logging.getLogger(__name__)
+_REQUEST_QUEUE_MAXSIZE = 100
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class ReactBackendHost:
         self._config = config
         self._bundle = None
         self._write_lock = asyncio.Lock()
-        self._request_queue: asyncio.Queue[FrontendRequest] = asyncio.Queue()
+        self._request_queue: asyncio.Queue[FrontendRequest] = asyncio.Queue(maxsize=_REQUEST_QUEUE_MAXSIZE)
         self._permission_requests: dict[str, asyncio.Future[bool]] = {}
         self._edit_approval_requests: dict[str, asyncio.Future[str]] = {}
         self._question_requests: dict[str, asyncio.Future[str]] = {}
@@ -85,6 +86,7 @@ class ReactBackendHost:
         self._busy = False
         self._running = True
         self._active_request_task: asyncio.Task[bool] | None = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
         # Track last tool input per name for rich event emission
         self._last_tool_inputs: dict[str, dict] = {}
         self._edit_always_approved = False
@@ -183,6 +185,11 @@ class ReactBackendHost:
             reader.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await reader
+            for task in list(self._background_tasks):
+                task.cancel()
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+                self._background_tasks.clear()
             if self._bundle is not None:
                 await close_runtime(self._bundle)
         return 0
@@ -191,7 +198,7 @@ class ReactBackendHost:
         while True:
             raw = await asyncio.to_thread(sys.stdin.buffer.readline)
             if not raw:
-                await self._request_queue.put(FrontendRequest(type="shutdown"))
+                await self._enqueue_request(FrontendRequest(type="shutdown"))
                 return
             payload = raw.decode("utf-8").strip()
             if not payload:
@@ -219,7 +226,7 @@ class ReactBackendHost:
             if request.type == "interrupt":
                 await self._interrupt_active_request()
                 continue
-            await self._request_queue.put(request)
+            await self._enqueue_request(request)
 
     async def _run_active_request(self, awaitable: Coroutine[Any, Any, bool]) -> bool:
         task = asyncio.create_task(awaitable)
@@ -447,9 +454,17 @@ class ReactBackendHost:
         """Emit a swarm_status event synchronously (schedule as coroutine)."""
         import asyncio
         loop = asyncio.get_event_loop()
-        loop.create_task(
+        task = loop.create_task(
             self._emit(BackendEvent(type="swarm_status", swarm_teammates=teammates, swarm_notifications=notifications))
         )
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    async def _enqueue_request(self, request: FrontendRequest) -> None:
+        try:
+            self._request_queue.put_nowait(request)
+        except asyncio.QueueFull:
+            await self._emit(BackendEvent(type="error", message="Frontend request queue is full"))
 
     async def _handle_list_sessions(self) -> None:
         import time as _time
@@ -837,7 +852,10 @@ class ReactBackendHost:
             )
         )
         try:
-            return await future
+            return await asyncio.wait_for(future, timeout=300)
+        except asyncio.TimeoutError:
+            log.warning("Question request %s timed out after 300s", request_id)
+            return ""
         finally:
             self._question_requests.pop(request_id, None)
 

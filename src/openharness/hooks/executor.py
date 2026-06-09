@@ -83,7 +83,15 @@ class HookExecutor:
         event: HookEvent,
         payload: dict[str, Any],
     ) -> HookResult:
+        if _is_unsafe_argument_template(hook.command):
+            return HookResult(
+                hook_type=hook.type,
+                success=False,
+                blocked=hook.block_on_failure,
+                reason="command hook uses an unsafe $ARGUMENTS shell template",
+            )
         command = _inject_arguments(hook.command, payload, shell_escape=True)
+        process: asyncio.subprocess.Process | None = None
         try:
             process = await create_shell_subprocess(
                 command,
@@ -118,6 +126,15 @@ class HookExecutor:
                 blocked=hook.block_on_failure,
                 reason=f"command hook timed out after {hook.timeout_seconds}s",
             )
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    process.kill()
+                    await process.wait()
+            raise
 
         output = "\n".join(
             part for part in (
@@ -227,6 +244,13 @@ def _inject_arguments(
     if shell_escape:
         serialized = shlex.quote(serialized)
     return template.replace("$ARGUMENTS", serialized)
+
+
+def _is_unsafe_argument_template(template: str) -> bool:
+    if "$ARGUMENTS" not in template:
+        return False
+    lowered = template.casefold()
+    return " eval " in f" {lowered} " or "bash -c" in lowered or "sh -c" in lowered
 
 
 def _parse_hook_json(text: str) -> dict[str, Any]:

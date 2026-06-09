@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -18,6 +20,9 @@ from openharness.utils.shell import create_shell_subprocess
 
 log = logging.getLogger(__name__)
 _TASK_RESTART_NOTICE = "[OpenHarness] Agent task restarted; prior interactive context was not preserved.\n"
+_MAX_TASK_LOG_BYTES = 1_000_000
+_STDIN_DRAIN_TIMEOUT_SECONDS = 30.0
+_LOG_TRUNCATION_MARKER = b"[OpenHarness] Earlier task output truncated.\n"
 
 
 def _encode_task_worker_payload(data: str) -> bytes:
@@ -138,7 +143,8 @@ class BackgroundTaskManager:
                 raise ValueError(
                     "Local agent tasks require ANTHROPIC_API_KEY or an explicit command/argv override"
                 )
-            argv = ["python", "-m", "openharness", "--api-key", effective_api_key]
+            env = {**(env or {}), "OPENHARNESS_ANTHROPIC_API_KEY": effective_api_key}
+            argv = ["python", "-m", "openharness"]
             if model:
                 argv.extend(["--model", model])
 
@@ -220,21 +226,20 @@ class BackgroundTaskManager:
             process = await self._ensure_writable_process(task)
             process.stdin.write(payload)
             try:
-                await process.stdin.drain()
+                await asyncio.wait_for(process.stdin.drain(), timeout=_STDIN_DRAIN_TIMEOUT_SECONDS)
             except (BrokenPipeError, ConnectionResetError):
                 if task.type not in {"local_agent", "remote_agent", "in_process_teammate"}:
                     raise ValueError(f"Task {task_id} does not accept input") from None
                 process = await self._restart_agent_task(task)
                 process.stdin.write(payload)
-                await process.stdin.drain()
+                await asyncio.wait_for(process.stdin.drain(), timeout=_STDIN_DRAIN_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as exc:
+                raise ValueError(f"Timed out writing to task {task_id}") from exc
 
     def read_task_output(self, task_id: str, *, max_bytes: int = 12000) -> str:
         """Return the tail of a task's output file."""
         task = self._require_task(task_id)
-        content = task.output_file.read_text(encoding="utf-8", errors="replace")
-        if len(content) > max_bytes:
-            return content[-max_bytes:]
-        return content
+        return _read_tail_text(task.output_file, max_bytes=max_bytes)
 
     def register_completion_listener(self, listener: CompletionListener) -> Callable[[], None]:
         """Register a callback fired whenever a task reaches a terminal state."""
@@ -253,8 +258,14 @@ class BackgroundTaskManager:
         generation: int,
     ) -> None:
         reader = asyncio.create_task(self._copy_output(task_id, process))
-        return_code = await process.wait()
-        await reader
+        try:
+            return_code = await process.wait()
+            await reader
+        finally:
+            if not reader.done():
+                reader.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reader
         await _close_process_stdin(process)
 
         current_generation = self._generations.get(task_id)
@@ -273,13 +284,22 @@ class BackgroundTaskManager:
     async def _copy_output(self, task_id: str, process: asyncio.subprocess.Process) -> None:
         if process.stdout is None:
             return
-        while True:
-            chunk = await process.stdout.read(4096)
-            if not chunk:
-                return
-            async with self._output_locks[task_id]:
-                with self._tasks[task_id].output_file.open("ab") as handle:
+        output_file = self._tasks[task_id].output_file
+        handle = output_file.open("ab")
+        try:
+            while True:
+                chunk = await process.stdout.read(4096)
+                if not chunk:
+                    return
+                async with self._output_locks[task_id]:
                     handle.write(chunk)
+                    handle.flush()
+                    if handle.tell() > _MAX_TASK_LOG_BYTES:
+                        handle.close()
+                        _cap_output_file(output_file, max_bytes=_MAX_TASK_LOG_BYTES)
+                        handle = output_file.open("ab")
+        finally:
+            handle.close()
 
     def _require_task(self, task_id: str) -> TaskRecord:
         task = self._tasks.get(task_id)
@@ -358,8 +378,11 @@ class BackgroundTaskManager:
         task.started_at = time.time()
         task.ended_at = None
         task.return_code = None
-        with task.output_file.open("ab") as handle:
-            handle.write(_TASK_RESTART_NOTICE.encode("utf-8"))
+        _append_capped_bytes(
+            task.output_file,
+            _TASK_RESTART_NOTICE.encode("utf-8"),
+            max_bytes=_MAX_TASK_LOG_BYTES,
+        )
         return await self._start_process(task.id)
 
     async def _notify_completion_listeners(self, task: TaskRecord) -> None:
@@ -421,36 +444,41 @@ class BackgroundTaskManager:
 
 _DEFAULT_MANAGER: BackgroundTaskManager | None = None
 _DEFAULT_MANAGER_KEY: str | None = None
+_DEFAULT_MANAGER_LOCK = threading.Lock()
 
 
 def get_task_manager() -> BackgroundTaskManager:
     """Return the singleton task manager."""
     global _DEFAULT_MANAGER, _DEFAULT_MANAGER_KEY
     current_key = str(get_tasks_dir().resolve())
-    if _DEFAULT_MANAGER is None or _DEFAULT_MANAGER_KEY != current_key:
-        if _DEFAULT_MANAGER is not None:
-            _DEFAULT_MANAGER.close()
-        _DEFAULT_MANAGER = BackgroundTaskManager()
-        _DEFAULT_MANAGER_KEY = current_key
-    return _DEFAULT_MANAGER
+    with _DEFAULT_MANAGER_LOCK:
+        if _DEFAULT_MANAGER is None or _DEFAULT_MANAGER_KEY != current_key:
+            if _DEFAULT_MANAGER is not None:
+                _DEFAULT_MANAGER.close()
+            _DEFAULT_MANAGER = BackgroundTaskManager()
+            _DEFAULT_MANAGER_KEY = current_key
+        return _DEFAULT_MANAGER
 
 
 def reset_task_manager() -> None:
     """Reset the singleton task manager, closing tracked subprocesses first."""
     global _DEFAULT_MANAGER, _DEFAULT_MANAGER_KEY
-    if _DEFAULT_MANAGER is not None:
-        _DEFAULT_MANAGER.close()
-    _DEFAULT_MANAGER = None
-    _DEFAULT_MANAGER_KEY = None
+    with _DEFAULT_MANAGER_LOCK:
+        if _DEFAULT_MANAGER is not None:
+            _DEFAULT_MANAGER.close()
+        _DEFAULT_MANAGER = None
+        _DEFAULT_MANAGER_KEY = None
 
 
 async def shutdown_task_manager() -> None:
     """Async reset that fully reaps tracked subprocesses before clearing state."""
     global _DEFAULT_MANAGER, _DEFAULT_MANAGER_KEY
-    if _DEFAULT_MANAGER is not None:
-        await _DEFAULT_MANAGER.aclose()
-    _DEFAULT_MANAGER = None
-    _DEFAULT_MANAGER_KEY = None
+    with _DEFAULT_MANAGER_LOCK:
+        manager = _DEFAULT_MANAGER
+        _DEFAULT_MANAGER = None
+        _DEFAULT_MANAGER_KEY = None
+    if manager is not None:
+        await manager.aclose()
 
 
 def _task_id(task_type: TaskType) -> str:
@@ -473,3 +501,36 @@ async def _close_process_stdin(process: asyncio.subprocess.Process) -> None:
         await stdin.wait_closed()
     except (BrokenPipeError, ConnectionResetError):
         pass
+
+
+def _read_tail_text(path: Path, *, max_bytes: int) -> str:
+    if max_bytes <= 0 or not path.exists():
+        return ""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(size - max_bytes, 0), os.SEEK_SET)
+        data = handle.read(max_bytes)
+    return data.decode("utf-8", errors="replace")
+
+
+def _append_capped_bytes(path: Path, data: bytes, *, max_bytes: int) -> None:
+    with path.open("ab") as handle:
+        handle.write(data)
+    _cap_output_file(path, max_bytes=max_bytes)
+
+
+def _cap_output_file(path: Path, *, max_bytes: int) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size <= max_bytes:
+        return
+    keep_bytes = max(max_bytes - len(_LOG_TRUNCATION_MARKER), 0)
+    with path.open("rb") as handle:
+        handle.seek(max(size - keep_bytes, 0), os.SEEK_SET)
+        tail = handle.read(keep_bytes)
+    with path.open("wb") as handle:
+        handle.write(_LOG_TRUNCATION_MARKER)
+        handle.write(tail)

@@ -31,6 +31,8 @@ from openharness.tasks import get_task_manager
 from openharness.ui.coordinator_drain import drain_coordinator_async_agents
 from openharness.ui.runtime import build_runtime, close_runtime, handle_line, start_runtime
 
+_MAX_TRANSCRIPT_LINES = 500
+
 
 @dataclass(frozen=True)
 class AppConfig:
@@ -421,7 +423,14 @@ class OpenHarnessTerminalApp(App[None]):
 
     def _append_line(self, message: str) -> None:
         self.transcript_lines.append(message)
-        self.query_one("#transcript", RichLog).write(message)
+        transcript = self.query_one("#transcript", RichLog)
+        if len(self.transcript_lines) > _MAX_TRANSCRIPT_LINES:
+            self.transcript_lines = self.transcript_lines[-_MAX_TRANSCRIPT_LINES:]
+            transcript.clear()
+            for line in self.transcript_lines:
+                transcript.write(line)
+            return
+        transcript.write(message)
 
     async def _clear_transcript(self) -> None:
         self.query_one("#transcript", RichLog).clear()

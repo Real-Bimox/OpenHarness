@@ -223,6 +223,7 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             base_url=settings.base_url,
             claude_oauth=True,
             auth_token_resolver=lambda: settings.resolve_auth().value,
+            timeout=settings.timeout,
         )
     if settings.api_format in ("openai", "openai_compat"):
         auth = _safe_resolve_auth()
@@ -235,6 +236,7 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
     return AnthropicApiClient(
         api_key=auth.value,
         base_url=settings.base_url,
+        timeout=settings.timeout,
     )
 
 

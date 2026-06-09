@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.tools._file_ops import atomic_write_utf8, file_signature, lock_for_path
 
 
 class FileWriteToolInput(BaseModel):
@@ -42,21 +43,32 @@ class FileWriteTool(BaseTool):
                 return ToolResult(output=f"Sandbox: {reason}", is_error=True)
 
         approval_prompt = context.metadata.get("edit_approval_prompt") if context.metadata else None
-        if approval_prompt is not None:
-            original = path.read_text(encoding="utf-8") if path.exists() else ""
-            diff_text, added, removed = _compute_diff(str(path), original, arguments.content)
-            reply = await approval_prompt(str(path), diff_text, added, removed)
-            if reply == "reject":
-                return ToolResult(output=f"Write rejected by user: {path}", is_error=True)
+        async with lock_for_path(path):
+            before_signature = file_signature(path)
+            if approval_prompt is not None:
+                original = path.read_text(encoding="utf-8") if path.exists() else ""
+                diff_text, added, removed = _compute_diff(str(path), original, arguments.content)
+                reply = await approval_prompt(str(path), diff_text, added, removed)
+                if reply == "reject":
+                    return ToolResult(output=f"Write rejected by user: {path}", is_error=True)
+                if file_signature(path) != before_signature:
+                    return ToolResult(
+                        output=f"File changed while awaiting approval: {path}",
+                        is_error=True,
+                    )
+                if arguments.create_directories:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                elif not path.parent.exists():
+                    return ToolResult(output=f"Parent directory does not exist: {path.parent}", is_error=True)
+                atomic_write_utf8(path, arguments.content)
+                stats = f"  ({_ANSI_GREEN}+{added}{_ANSI_RESET} {_ANSI_RED}-{removed}{_ANSI_RESET})"
+                return ToolResult(output=f"Wrote {path}{stats}")
+
             if arguments.create_directories:
                 path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(arguments.content, encoding="utf-8")
-            stats = f"  ({_ANSI_GREEN}+{added}{_ANSI_RESET} {_ANSI_RED}-{removed}{_ANSI_RESET})"
-            return ToolResult(output=f"Wrote {path}{stats}")
-
-        if arguments.create_directories:
-            path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(arguments.content, encoding="utf-8")
+            elif not path.parent.exists():
+                return ToolResult(output=f"Parent directory does not exist: {path.parent}", is_error=True)
+            atomic_write_utf8(path, arguments.content)
         return ToolResult(output=f"Wrote {path}")
 
 

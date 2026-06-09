@@ -111,6 +111,7 @@ class TeammateMailbox:
     def __init__(self, team_name: str, agent_id: str) -> None:
         self.team_name = team_name
         self.agent_id = agent_id
+        self._async_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Public API
@@ -147,8 +148,9 @@ class TeammateMailbox:
                 os.replace(tmp_path, final_path)
 
         # Offload blocking I/O to thread pool
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _write_atomic)
+        async with self._async_lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _write_atomic)
 
     async def read_all(self, unread_only: bool = True) -> list[MailboxMessage]:
         """Return messages from the inbox, sorted by timestamp (oldest first).
@@ -177,7 +179,7 @@ class TeammateMailbox:
             return messages
 
         # Offload blocking I/O to thread pool
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _read_all)
 
     async def mark_read(self, message_id: str) -> None:
@@ -205,8 +207,9 @@ class TeammateMailbox:
                 return False
 
         # Offload blocking I/O to thread pool
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _mark_read)
+        async with self._async_lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _mark_read)
 
     async def clear(self) -> None:
         """Remove all message files from the inbox."""
@@ -225,8 +228,9 @@ class TeammateMailbox:
                         pass
 
         # Offload blocking I/O to thread pool
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _clear)
+        async with self._async_lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _clear)
 
 
 # ---------------------------------------------------------------------------

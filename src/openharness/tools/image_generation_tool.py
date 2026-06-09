@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from openharness.api.codex_client import _build_codex_headers, _resolve_codex_url
 from openharness.api.openai_client import _normalize_openai_base_url
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.tools._file_ops import MAX_IMAGE_INPUT_BYTES, check_max_file_size
 
 log = logging.getLogger(__name__)
 
@@ -200,8 +201,11 @@ class ImageGenerationTool(BaseTool):
             base_url=_normalize_openai_base_url(base_url),
             default_headers={"Authorization": f"Bearer {api_key}"},
         )
-        result = await client.images.generate(**_image_payload(arguments, model))
-        return _extract_b64_images(result)
+        try:
+            result = await client.images.generate(**_image_payload(arguments, model))
+            return _extract_b64_images(result)
+        finally:
+            await client.close()
 
     @staticmethod
     async def _edit_images(arguments: ImageGenerationToolInput, model: str, api_key: str, base_url: str) -> list[str]:
@@ -210,20 +214,29 @@ class ImageGenerationTool(BaseTool):
             base_url=_normalize_openai_base_url(base_url),
             default_headers={"Authorization": f"Bearer {api_key}"},
         )
-        image_handles = [Path(path).expanduser().resolve().open("rb") for path in arguments.image_paths]
-        mask_handle = Path(arguments.mask_path).expanduser().resolve().open("rb") if arguments.mask_path else None
+        image_handles = []
+        mask_handle = None
         try:
+            for path in arguments.image_paths:
+                resolved = Path(path).expanduser().resolve()
+                check_max_file_size(resolved, max_bytes=MAX_IMAGE_INPUT_BYTES)
+                image_handles.append(resolved.open("rb"))
+            if arguments.mask_path:
+                mask_path = Path(arguments.mask_path).expanduser().resolve()
+                check_max_file_size(mask_path, max_bytes=MAX_IMAGE_INPUT_BYTES)
+                mask_handle = mask_path.open("rb")
             payload = _image_payload(arguments, model)
             payload["image"] = image_handles if len(image_handles) > 1 else image_handles[0]
             if mask_handle is not None:
                 payload["mask"] = mask_handle
             result = await client.images.edit(**payload)
+            return _extract_b64_images(result)
         finally:
             for handle in image_handles:
                 handle.close()
             if mask_handle is not None:
                 mask_handle.close()
-        return _extract_b64_images(result)
+            await client.close()
 
     @staticmethod
     def _resolve_output_paths(arguments: ImageGenerationToolInput, cwd: Path) -> list[Path]:
@@ -299,6 +312,7 @@ def _codex_user_content(arguments: ImageGenerationToolInput, prompt: str) -> lis
     content = [{"type": "input_text", "text": prompt}]
     for path_str in arguments.image_paths:
         path = Path(path_str).expanduser().resolve()
+        check_max_file_size(path, max_bytes=MAX_IMAGE_INPUT_BYTES)
         media_type = _media_type_for_path(path)
         data = base64.b64encode(path.read_bytes()).decode("ascii")
         content.append({"type": "input_image", "image_url": f"data:{media_type};base64,{data}"})

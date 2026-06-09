@@ -7,6 +7,7 @@ import re
 import smtplib
 import ssl
 import logging
+from collections import deque
 from datetime import date
 from email import policy
 from email.header import decode_header, make_header
@@ -58,6 +59,7 @@ class EmailChannel(BaseChannel):
         self._last_subject_by_chat: dict[str, str] = {}
         self._last_message_id_by_chat: dict[str, str] = {}
         self._processed_uids: set[str] = set()  # Capped to prevent unbounded growth
+        self._processed_uid_order: deque[str] = deque()
         self._MAX_PROCESSED_UIDS = 100000
 
     async def start(self) -> None:
@@ -308,10 +310,12 @@ class EmailChannel(BaseChannel):
 
                 if dedupe and uid:
                     self._processed_uids.add(uid)
+                    self._processed_uid_order.append(uid)
                     # mark_seen is the primary dedup; this set is a safety net
                     if len(self._processed_uids) > self._MAX_PROCESSED_UIDS:
-                        # Evict a random half to cap memory; mark_seen is the primary dedup
-                        self._processed_uids = set(list(self._processed_uids)[len(self._processed_uids) // 2:])
+                        while len(self._processed_uids) > self._MAX_PROCESSED_UIDS // 2:
+                            old_uid = self._processed_uid_order.popleft()
+                            self._processed_uids.discard(old_uid)
 
                 if mark_seen:
                     client.store(imap_id, "+FLAGS", "\\Seen")

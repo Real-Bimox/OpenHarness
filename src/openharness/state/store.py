@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import replace
 
 from openharness.state.app_state import AppState
 
+log = logging.getLogger(__name__)
 
 Listener = Callable[[AppState], None]
 
@@ -26,7 +28,10 @@ class AppStateStore:
         """Update the state and notify listeners."""
         self._state = replace(self._state, **updates)
         for listener in list(self._listeners):
-            listener(self._state)
+            try:
+                listener(self._state)
+            except Exception:
+                log.exception("State listener failed")
         return self._state
 
     def subscribe(self, listener: Listener) -> Callable[[], None]:

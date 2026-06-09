@@ -177,8 +177,10 @@ def clear_provider_credentials(provider: str, *, use_keyring: bool | None = None
             for key in ("api_key", "token", "github_token"):
                 try:
                     keyring.delete_password(_KEYRING_SERVICE, _keyring_key(provider, key))
-                except (PasswordDeleteError, Exception):
+                except PasswordDeleteError:
                     pass
+                except Exception as exc:
+                    log.warning("Keyring delete failed for %s/%s: %s", provider, key, exc)
         except ImportError:
             pass
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import logging
 from contextlib import AsyncExitStack
 from typing import Any
 
@@ -20,6 +20,11 @@ from openharness.mcp.types import (
     McpStdioServerConfig,
     McpToolInfo,
 )
+
+log = logging.getLogger(__name__)
+
+_MCP_OPERATION_TIMEOUT_SECONDS = 60.0
+_MCP_CONNECT_TIMEOUT_SECONDS = 30.0
 
 
 class McpServerNotConnectedError(Exception):
@@ -103,8 +108,12 @@ class McpClientManager:
     async def close(self) -> None:
         """Close all active MCP sessions."""
         for stack in list(self._stacks.values()):
-            with contextlib.suppress(RuntimeError, asyncio.CancelledError):
+            try:
                 await stack.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("MCP stack close failed", exc_info=True)
         self._stacks.clear()
         self._sessions.clear()
 
@@ -136,7 +145,15 @@ class McpClientManager:
                 f"MCP server '{server_name}' is not connected: {detail}"
             )
         try:
-            result: CallToolResult = await session.call_tool(tool_name, arguments)
+            result: CallToolResult = await asyncio.wait_for(
+                session.call_tool(tool_name, arguments),
+                timeout=_MCP_OPERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise McpServerNotConnectedError(
+                f"MCP server '{server_name}' call timed out after "
+                f"{_MCP_OPERATION_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
         except Exception as exc:
             raise McpServerNotConnectedError(
                 f"MCP server '{server_name}' call failed: {exc}"
@@ -163,7 +180,15 @@ class McpClientManager:
                 f"MCP server '{server_name}' is not connected: {detail}"
             )
         try:
-            result: ReadResourceResult = await session.read_resource(uri)
+            result: ReadResourceResult = await asyncio.wait_for(
+                session.read_resource(uri),
+                timeout=_MCP_OPERATION_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise McpServerNotConnectedError(
+                f"MCP server '{server_name}' resource read timed out after "
+                f"{_MCP_OPERATION_TIMEOUT_SECONDS:.0f}s"
+            ) from exc
         except Exception as exc:
             raise McpServerNotConnectedError(
                 f"MCP server '{server_name}' resource read failed: {exc}"
@@ -219,7 +244,7 @@ class McpClientManager:
         stack = AsyncExitStack()
         try:
             http_client = await stack.enter_async_context(
-                httpx.AsyncClient(headers=config.headers or None)
+                httpx.AsyncClient(headers=config.headers or None, timeout=_MCP_CONNECT_TIMEOUT_SECONDS)
             )
             read_stream, write_stream, _get_session_id = await stack.enter_async_context(
                 streamable_http_client(config.url, http_client=http_client)
@@ -260,11 +285,14 @@ class McpClientManager:
         auth_configured: bool,
     ) -> None:
         session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-        await session.initialize()
-        tool_result = await session.list_tools()
+        await asyncio.wait_for(session.initialize(), timeout=_MCP_CONNECT_TIMEOUT_SECONDS)
+        tool_result = await asyncio.wait_for(session.list_tools(), timeout=_MCP_OPERATION_TIMEOUT_SECONDS)
         resource_result = None
         try:
-            resource_result = await session.list_resources()
+            resource_result = await asyncio.wait_for(
+                session.list_resources(),
+                timeout=_MCP_OPERATION_TIMEOUT_SECONDS,
+            )
         except Exception as exc:
             if "Method not found" not in str(exc):
                 raise

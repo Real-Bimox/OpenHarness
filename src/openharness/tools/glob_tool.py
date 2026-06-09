@@ -168,8 +168,12 @@ async def _glob(root: Path, pattern: str, *, limit: int) -> list[str]:
         lines.sort()
         return lines
 
-    # Fallback: non-recursive patterns are usually cheap; keep Python semantics.
-    return sorted(
-        str(path.relative_to(root))
-        for path in root.glob(pattern)
-    )[:limit]
+    # Fallback: stop once enough matches are collected instead of materializing
+    # and sorting an entire large tree.
+    matches: list[str] = []
+    for path in root.glob(pattern):
+        matches.append(str(path.relative_to(root)))
+        if len(matches) >= limit:
+            break
+    matches.sort()
+    return matches

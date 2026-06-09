@@ -18,8 +18,22 @@ const PROTOCOL_PREFIX = 'OHJSON:';
 const ASSISTANT_DELTA_FLUSH_MS = 50;
 const ASSISTANT_DELTA_FLUSH_CHARS = 384;
 const TRANSCRIPT_EVENT_FLUSH_MS = 50;
+const MAX_TRANSCRIPT_ITEMS = 500;
+const MAX_ASSISTANT_BUFFER_CHARS = 200_000;
+const TRUNCATED_PREFIX = '[earlier output truncated]\n';
 
 const stableStringify = (value: unknown): string => JSON.stringify(value);
+
+const capTranscript = (items: TranscriptItem[]): TranscriptItem[] =>
+	items.length > MAX_TRANSCRIPT_ITEMS ? items.slice(-MAX_TRANSCRIPT_ITEMS) : items;
+
+const appendCappedAssistantText = (current: string, delta: string): string => {
+	const next = current + delta;
+	if (next.length <= MAX_ASSISTANT_BUFFER_CHARS) {
+		return next;
+	}
+	return TRUNCATED_PREFIX + next.slice(-(MAX_ASSISTANT_BUFFER_CHARS - TRUNCATED_PREFIX.length));
+};
 
 export function useBackendSession(config: FrontendConfig, onExit: (code?: number | null) => void) {
 	const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
@@ -38,6 +52,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 	const [swarmTeammates, setSwarmTeammates] = useState<SwarmTeammateSnapshot[]>([]);
 	const [swarmNotifications, setSwarmNotifications] = useState<SwarmNotificationSnapshot[]>([]);
 	const statusRef = useRef<Record<string, unknown>>({});
+	const busyRef = useRef(false);
 	const childRef = useRef<ChildProcessWithoutNullStreams | null>(null);
 	const sentInitialPrompt = useRef(false);
 	const lastStatusSnapshotRef = useRef('');
@@ -53,13 +68,18 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 	const pendingTranscriptItemsRef = useRef<TranscriptItem[]>([]);
 	const transcriptFlushTimerRef = useRef<NodeJS.Timeout | null>(null);
 
+	const setBusyTracked = (value: boolean): void => {
+		busyRef.current = value;
+		setBusy(value);
+	};
+
 	const flushAssistantDelta = (): void => {
 		const pending = pendingAssistantDeltaRef.current;
 		if (!pending) {
 			return;
 		}
 		pendingAssistantDeltaRef.current = '';
-		assistantBufferRef.current += pending;
+		assistantBufferRef.current = appendCappedAssistantText(assistantBufferRef.current, pending);
 		startTransition(() => {
 			setAssistantBuffer(assistantBufferRef.current);
 		});
@@ -72,7 +92,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 		}
 		pendingTranscriptItemsRef.current = [];
 		startTransition(() => {
-			setTranscript((items) => [...items, ...pending]);
+			setTranscript((items) => capTranscript([...items, ...pending]));
 		});
 	};
 
@@ -117,7 +137,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 		const useDetachedGroup = process.platform !== 'win32';
 		const child = spawn(command, args, {
 			stdio: ['pipe', 'pipe', 'inherit'],
-			env: process.env,
+			env: {...process.env, ...(config.backend_env ?? {})},
 			// On Windows, a detached child gets its own console window and can
 			// flash open/closed. Keep detached groups for POSIX only.
 			detached: useDetachedGroup,
@@ -131,7 +151,16 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 				queueTranscriptItem({role: 'log', text: line});
 				return;
 			}
-			const event = JSON.parse(line.slice(PROTOCOL_PREFIX.length)) as BackendEvent;
+			let event: BackendEvent;
+			try {
+				event = JSON.parse(line.slice(PROTOCOL_PREFIX.length)) as BackendEvent;
+			} catch (error) {
+				queueTranscriptItem({
+					role: 'log',
+					text: `Malformed backend event: ${error instanceof Error ? error.message : String(error)}`,
+				});
+				return;
+			}
 			handleEvent(event);
 		});
 
@@ -205,7 +234,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 			if (config.initial_prompt && !sentInitialPrompt.current) {
 				sentInitialPrompt.current = true;
 				sendRequest({type: 'submit_line', line: config.initial_prompt});
-				setBusy(true);
+				setBusyTracked(true);
 			}
 			return;
 		}
@@ -255,7 +284,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 				return;
 			}
 			queueTranscriptItem({role: 'status', text: message});
-			if (busy) {
+			if (busyRef.current) {
 				setBusyLabel(message);
 			}
 			return;
@@ -303,7 +332,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 			if (isCodexStyle) {
 				// Keep collecting text for assistant_complete fallback, but avoid
 				// token-level rerenders in compact codex mode.
-				assistantBufferRef.current += delta;
+				assistantBufferRef.current = appendCappedAssistantText(assistantBufferRef.current, delta);
 				return;
 			}
 			pendingAssistantDeltaRef.current += delta;
@@ -328,7 +357,10 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 			const isCodexStyle = String(statusRef.current.output_style ?? 'default') === 'codex';
 			if (isCodexStyle) {
 				if (pendingAssistantDeltaRef.current) {
-					assistantBufferRef.current += pendingAssistantDeltaRef.current;
+					assistantBufferRef.current = appendCappedAssistantText(
+						assistantBufferRef.current,
+						pendingAssistantDeltaRef.current,
+					);
 					pendingAssistantDeltaRef.current = '';
 				}
 			} else {
@@ -336,7 +368,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 			}
 			const text = event.message ?? assistantBufferRef.current;
 			startTransition(() => {
-				setTranscript((items) => [...items, {role: 'assistant', text}]);
+				setTranscript((items) => capTranscript([...items, {role: 'assistant', text}]));
 			});
 			clearAssistantDelta();
 			// Do NOT reset busy here: tool calls may follow this event.
@@ -347,13 +379,13 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 		if (event.type === 'line_complete') {
 			// Final end-of-turn: clear everything, stop spinner.
 			clearAssistantDelta();
-			setBusy(false);
+			setBusyTracked(false);
 			setBusyLabel(undefined);
 			return;
 		}
 		if ((event.type === 'tool_started' || event.type === 'tool_completed') && event.item) {
 			if (event.type === 'tool_started') {
-				setBusy(true);
+				setBusyTracked(true);
 				setBusyLabel(`Running ${event.tool_name ?? 'tool'}...`);
 			} else {
 				setBusyLabel('Processing...');
@@ -392,7 +424,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 			flushTranscriptItems();
 			queueTranscriptItem({role: 'system', text: `error: ${event.message ?? 'unknown error'}`});
 			clearAssistantDelta();
-			setBusy(false);
+			setBusyTracked(false);
 			setBusyLabel(undefined);
 			return;
 		}
@@ -453,7 +485,7 @@ export function useBackendSession(config: FrontendConfig, onExit: (code?: number
 			swarmNotifications,
 			setModal,
 			setSelectRequest,
-			setBusy,
+			setBusy: setBusyTracked,
 			setBusyLabel,
 			sendRequest,
 		}),

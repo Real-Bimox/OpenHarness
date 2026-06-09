@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+import time
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -67,6 +68,7 @@ class GrepTool(BaseTool):
                     case_sensitive=arguments.case_sensitive,
                     limit=arguments.limit,
                     display_base=display_base,
+                    timeout_seconds=arguments.timeout_seconds,
                 )
             )
 
@@ -90,6 +92,7 @@ class GrepTool(BaseTool):
                 case_sensitive=arguments.case_sensitive,
                 limit=arguments.limit,
                 display_base=root,
+                timeout_seconds=arguments.timeout_seconds,
             )
         )
 
@@ -109,6 +112,7 @@ def _python_grep_files(
     case_sensitive: bool,
     limit: int,
     display_base: Path,
+    timeout_seconds: int,
 ) -> str:
     # Python fallback (kept for portability).
     flags = 0 if case_sensitive else re.IGNORECASE
@@ -117,23 +121,31 @@ def _python_grep_files(
     except re.error as exc:
         return f"(invalid regex pattern '{pattern}': {exc})"
     collected: list[str] = []
+    deadline = time.monotonic() + timeout_seconds
 
     for path in paths:
         if len(collected) >= limit:
             break
+        if time.monotonic() >= deadline:
+            collected.append(f"[grep timed out after {timeout_seconds} seconds]")
+            break
         if not path.is_file():
             continue
         try:
-            raw = path.read_bytes()
+            handle = path.open("rb")
         except OSError:
             continue
-        if b"\x00" in raw:
-            continue
-        text = raw.decode("utf-8", errors="replace")
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            if compiled.search(line):
-                collected.append(f"{_format_path(path, display_base)}:{line_no}:{line}")
-                if len(collected) >= limit:
+        with handle:
+            for line_no, raw_line in enumerate(handle, start=1):
+                if b"\x00" in raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if compiled.search(line):
+                    collected.append(f"{_format_path(path, display_base)}:{line_no}:{line}")
+                    if len(collected) >= limit:
+                        break
+                if time.monotonic() >= deadline:
+                    collected.append(f"[grep timed out after {timeout_seconds} seconds]")
                     break
 
     if not collected:

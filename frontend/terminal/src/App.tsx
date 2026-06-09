@@ -42,6 +42,7 @@ const SELECTABLE_COMMANDS = new Set([
 	'/vim',
 	'/voice',
 ]);
+const MAX_HISTORY_ITEMS = 200;
 
 type SelectModalState = {
 	title: string;
@@ -469,14 +470,14 @@ function AppInner({config}: {config: FrontendConfig}): React.JSX.Element {
 		}
 		// Check if it's an interactive command
 		if (imageAttachments.length === 0 && handleCommand(value)) {
-			setHistory((items) => [...items, value]);
+			setHistory((items) => [...items, value].slice(-MAX_HISTORY_ITEMS));
 			setHistoryIndex(-1);
 			setInput('');
 			return;
 		}
 		session.sendRequest({type: 'submit_line', line: value, images: imagePayloads()});
 		if (value.trim()) {
-			setHistory((items) => [...items, value]);
+			setHistory((items) => [...items, value].slice(-MAX_HISTORY_ITEMS));
 		}
 		setHistoryIndex(-1);
 		setInput('');

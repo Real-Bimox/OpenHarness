@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.tools._file_ops import read_text_lines
 
 
 class FileReadToolInput(BaseModel):
@@ -49,13 +50,10 @@ class FileReadTool(BaseTool):
         if path.is_dir():
             return ToolResult(output=f"Cannot read directory: {path}", is_error=True)
 
-        raw = path.read_bytes()
-        if b"\x00" in raw:
-            return ToolResult(output=f"Binary file cannot be read as text: {path}", is_error=True)
-
-        text = raw.decode("utf-8", errors="replace")
-        lines = text.splitlines()
-        selected = lines[arguments.offset : arguments.offset + arguments.limit]
+        try:
+            selected = read_text_lines(path, offset=arguments.offset, limit=arguments.limit)
+        except ValueError as exc:
+            return ToolResult(output=str(exc), is_error=True)
         numbered = [
             f"{arguments.offset + index + 1:>6}\t{line}"
             for index, line in enumerate(selected)

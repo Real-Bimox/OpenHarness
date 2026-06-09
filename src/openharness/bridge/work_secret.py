@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from urllib.parse import urlsplit
 
 from openharness.bridge.types import WorkSecret
 
@@ -25,6 +26,7 @@ def decode_work_secret(secret: str) -> WorkSecret:
         raise ValueError("Invalid work secret: missing session_ingress_token")
     if not isinstance(data.get("api_base_url"), str):
         raise ValueError("Invalid work secret: missing api_base_url")
+    _validate_api_base_url(data["api_base_url"])
     return WorkSecret(
         version=data["version"],
         session_ingress_token=data["session_ingress_token"],
@@ -34,8 +36,19 @@ def decode_work_secret(secret: str) -> WorkSecret:
 
 def build_sdk_url(api_base_url: str, session_id: str) -> str:
     """Build a session ingress WebSocket URL."""
-    is_local = "localhost" in api_base_url or "127.0.0.1" in api_base_url
+    parsed = _validate_api_base_url(api_base_url)
+    hostname = (parsed.hostname or "").lower()
+    is_local = hostname in {"localhost", "127.0.0.1", "::1"}
     protocol = "ws" if is_local else "wss"
     version = "v2" if is_local else "v1"
-    host = api_base_url.replace("https://", "").replace("http://", "").rstrip("/")
+    host = parsed.netloc.rstrip("/")
     return f"{protocol}://{host}/{version}/session_ingress/ws/{session_id}"
+
+
+def _validate_api_base_url(api_base_url: str):
+    parsed = urlsplit(api_base_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Invalid work secret: api_base_url must be an http(s) URL")
+    if parsed.username or parsed.password:
+        raise ValueError("Invalid work secret: api_base_url must not contain credentials")
+    return parsed

@@ -1,5 +1,6 @@
 export type FrontendConfig = {
 	backend_command: string[];
+	backend_env?: Record<string, string>;
 	initial_prompt?: string | null;
 };
 

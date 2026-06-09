@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from openharness.api.openai_client import OpenAICompatibleClient
 from openharness.tools.base import BaseTool, ToolExecutionContext, ToolResult
+from openharness.tools._file_ops import MAX_IMAGE_INPUT_BYTES, check_max_file_size
 
 log = logging.getLogger(__name__)
 
@@ -157,9 +158,10 @@ class ImageToTextTool(BaseTool):
                 return None, None
 
             try:
+                check_max_file_size(path, max_bytes=MAX_IMAGE_INPUT_BYTES)
                 raw = path.read_bytes()
                 data = base64.b64encode(raw).decode("ascii")
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 log.warning("image_to_text: failed to read %s: %s", path, exc)
                 return None, None
 

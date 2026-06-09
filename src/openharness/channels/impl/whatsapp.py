@@ -57,6 +57,8 @@ class WhatsAppChannel(BaseChannel):
                             await self._handle_bridge_message(message)
                         except Exception as e:
                             logger.error("Error handling bridge message: %s", e)
+                    self._connected = False
+                    self._ws = None
 
             except asyncio.CancelledError:
                 break

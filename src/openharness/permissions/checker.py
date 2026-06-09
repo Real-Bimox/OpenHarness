@@ -118,8 +118,9 @@ class PermissionChecker:
 
         # Check command deny patterns (e.g. deny "rm -rf /")
         if command:
+            normalized_command = command.casefold()
             for pattern in getattr(self._settings, "denied_commands", []):
-                if isinstance(pattern, str) and fnmatch.fnmatch(command, pattern):
+                if isinstance(pattern, str) and fnmatch.fnmatch(normalized_command, pattern.casefold()):
                     return PermissionDecision(
                         allowed=False,
                         reason=f"Command matches deny pattern: {pattern}",

@@ -115,6 +115,7 @@ class DingTalkChannel(BaseChannel):
         # Access Token management for sending messages
         self._access_token: str | None = None
         self._token_expiry: float = 0
+        self._token_lock = asyncio.Lock()
 
         # Hold references to background tasks to prevent GC
         self._background_tasks: set[asyncio.Task] = set()
@@ -133,7 +134,7 @@ class DingTalkChannel(BaseChannel):
                 return
 
             self._running = True
-            self._http = httpx.AsyncClient()
+            self._http = httpx.AsyncClient(timeout=30.0)
 
             logger.info(
                 "Initializing DingTalk Stream Client with Client ID: %s...",
@@ -177,28 +178,31 @@ class DingTalkChannel(BaseChannel):
         """Get or refresh Access Token."""
         if self._access_token and time.time() < self._token_expiry:
             return self._access_token
+        async with self._token_lock:
+            if self._access_token and time.time() < self._token_expiry:
+                return self._access_token
 
-        url = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
-        data = {
-            "appKey": self.config.client_id,
-            "appSecret": self.config.client_secret,
-        }
+            url = "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+            data = {
+                "appKey": self.config.client_id,
+                "appSecret": self.config.client_secret,
+            }
 
-        if not self._http:
-            logger.warning("DingTalk HTTP client not initialized, cannot refresh token")
-            return None
+            if not self._http:
+                logger.warning("DingTalk HTTP client not initialized, cannot refresh token")
+                return None
 
-        try:
-            resp = await self._http.post(url, json=data)
-            resp.raise_for_status()
-            res_data = resp.json()
-            self._access_token = res_data.get("accessToken")
-            # Expire 60s early to be safe
-            self._token_expiry = time.time() + int(res_data.get("expireIn", 7200)) - 60
-            return self._access_token
-        except Exception as e:
-            logger.error("Failed to get DingTalk access token: %s", e)
-            return None
+            try:
+                resp = await self._http.post(url, json=data)
+                resp.raise_for_status()
+                res_data = resp.json()
+                self._access_token = res_data.get("accessToken")
+                # Expire 60s early to be safe
+                self._token_expiry = time.time() + int(res_data.get("expireIn", 7200)) - 60
+                return self._access_token
+            except Exception as e:
+                logger.error("Failed to get DingTalk access token: %s", e)
+                return None
 
     @staticmethod
     def _is_http_url(value: str) -> bool:

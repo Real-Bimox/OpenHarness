@@ -151,6 +151,7 @@ class QueryContext:
     permission_prompt: PermissionPrompt | None = None
     ask_user_prompt: AskUserPrompt | None = None
     max_turns: int | None = 200
+    tool_timeout_seconds: float = 300.0
     hook_executor: HookExecutor | None = None
     tool_metadata: dict[str, object] | None = None
 
@@ -662,37 +663,40 @@ async def run_query(
         force: bool = False,
     ) -> AsyncIterator[tuple[StreamEvent, UsageSnapshot | None]]:
         nonlocal last_compaction_result
-        progress_queue: asyncio.Queue[CompactProgressEvent] = asyncio.Queue()
+        progress_queue: asyncio.Queue[CompactProgressEvent | None] = asyncio.Queue(maxsize=100)
 
         async def _progress(event: CompactProgressEvent) -> None:
             await progress_queue.put(event)
 
-        task = asyncio.create_task(
-            auto_compact_if_needed(
-                messages,
-                api_client=context.api_client,
-                model=context.model,
-                system_prompt=context.system_prompt,
-                state=compact_state,
-                progress_callback=_progress,
-                force=force,
-                trigger=trigger,
-                hook_executor=context.hook_executor,
-                carryover_metadata=context.tool_metadata,
-                context_window_tokens=context.context_window_tokens,
-                auto_compact_threshold_tokens=context.auto_compact_threshold_tokens,
-            )
-        )
-        while True:
+        async def _run_compaction() -> tuple[list[ConversationMessage], bool]:
             try:
-                event = await asyncio.wait_for(progress_queue.get(), timeout=0.05)
-                yield event, None
-            except asyncio.TimeoutError:
-                if task.done():
-                    break
-                continue
+                return await auto_compact_if_needed(
+                    messages,
+                    api_client=context.api_client,
+                    model=context.model,
+                    system_prompt=context.system_prompt,
+                    state=compact_state,
+                    progress_callback=_progress,
+                    force=force,
+                    trigger=trigger,
+                    hook_executor=context.hook_executor,
+                    carryover_metadata=context.tool_metadata,
+                    context_window_tokens=context.context_window_tokens,
+                    auto_compact_threshold_tokens=context.auto_compact_threshold_tokens,
+                )
+            finally:
+                await progress_queue.put(None)
+
+        task = asyncio.create_task(_run_compaction())
+        while True:
+            event = await progress_queue.get()
+            if event is None:
+                break
+            yield event, None
         while not progress_queue.empty():
-            yield progress_queue.get_nowait(), None
+            event = progress_queue.get_nowait()
+            if event is not None:
+                yield event, None
         last_compaction_result = await task
         return
 
@@ -967,18 +971,33 @@ async def _execute_tool_call(
 
     log.debug("executing %s ...", tool_name)
     t0 = time.monotonic()
-    result = await tool.execute(
-        parsed_input,
-        ToolExecutionContext(
-            cwd=context.cwd,
-            metadata={
-                "tool_registry": context.tool_registry,
-                "ask_user_prompt": context.ask_user_prompt,
-                **(context.tool_metadata or {}),
-            },
-            hook_executor=context.hook_executor,
-        ),
-    )
+    try:
+        result = await asyncio.wait_for(
+            tool.execute(
+                parsed_input,
+                ToolExecutionContext(
+                    cwd=context.cwd,
+                    metadata={
+                        "tool_registry": context.tool_registry,
+                        "ask_user_prompt": context.ask_user_prompt,
+                        **(context.tool_metadata or {}),
+                    },
+                    hook_executor=context.hook_executor,
+                ),
+            ),
+            timeout=context.tool_timeout_seconds,
+        )
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - t0
+        log.warning("tool %s timed out after %.2fs", tool_name, elapsed)
+        return ToolResultBlock(
+            tool_use_id=tool_use_id,
+            content=(
+                f"Tool {tool_name} timed out after "
+                f"{context.tool_timeout_seconds:.0f} seconds"
+            ),
+            is_error=True,
+        )
     elapsed = time.monotonic() - t0
     log.debug("executed %s in %.2fs err=%s output_len=%d",
               tool_name, elapsed, result.is_error, len(result.output or ""))

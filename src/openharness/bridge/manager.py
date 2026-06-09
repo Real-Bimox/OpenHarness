@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from openharness.config.paths import get_data_dir
 from openharness.bridge.session_runner import SessionHandle, spawn_session
+
+_MAX_BRIDGE_LOG_BYTES = 1_000_000
+_MAX_COMPLETED_BRIDGE_SESSIONS = 100
+_BRIDGE_TRUNCATION_MARKER = b"[OpenHarness] Earlier bridge output truncated.\n"
 
 
 @dataclass(frozen=True)
@@ -71,27 +76,79 @@ class BridgeSessionManager:
         path = self._output_paths.get(session_id)
         if path is None or not path.exists():
             return ""
-        content = path.read_text(encoding="utf-8", errors="replace")
-        if len(content) > max_bytes:
-            return content[-max_bytes:]
-        return content
+        return _read_tail_text(path, max_bytes=max_bytes)
 
     async def stop(self, session_id: str) -> None:
         handle = self._sessions.get(session_id)
         if handle is None:
             raise ValueError(f"Unknown bridge session: {session_id}")
         await handle.kill()
+        copy_task = self._copy_tasks.get(session_id)
+        if copy_task is not None:
+            try:
+                await asyncio.wait_for(copy_task, timeout=2.0)
+            except asyncio.TimeoutError:
+                copy_task.cancel()
 
     async def _copy_output(self, session_id: str, handle: SessionHandle) -> None:
         path = self._output_paths[session_id]
-        if handle.process.stdout is not None:
-            while True:
-                chunk = await handle.process.stdout.read(4096)
-                if not chunk:
-                    break
-                with path.open("ab") as stream:
+        stream = path.open("ab")
+        try:
+            if handle.process.stdout is not None:
+                while True:
+                    chunk = await handle.process.stdout.read(4096)
+                    if not chunk:
+                        break
                     stream.write(chunk)
-        await handle.process.wait()
+                    stream.flush()
+                    if stream.tell() > _MAX_BRIDGE_LOG_BYTES:
+                        stream.close()
+                        _cap_output_file(path, max_bytes=_MAX_BRIDGE_LOG_BYTES)
+                        stream = path.open("ab")
+            await handle.process.wait()
+        finally:
+            stream.close()
+            self._copy_tasks.pop(session_id, None)
+            self._prune_completed_sessions()
+
+    def _prune_completed_sessions(self) -> None:
+        completed = [
+            (session_id, handle)
+            for session_id, handle in self._sessions.items()
+            if handle.process.returncode is not None
+        ]
+        completed.sort(key=lambda item: item[1].started_at, reverse=True)
+        for session_id, _handle in completed[_MAX_COMPLETED_BRIDGE_SESSIONS:]:
+            self._sessions.pop(session_id, None)
+            self._commands.pop(session_id, None)
+            self._output_paths.pop(session_id, None)
+
+
+def _read_tail_text(path: Path, *, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(size - max_bytes, 0), os.SEEK_SET)
+        data = handle.read(max_bytes)
+    return data.decode("utf-8", errors="replace")
+
+
+def _cap_output_file(path: Path, *, max_bytes: int) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size <= max_bytes:
+        return
+    keep_bytes = max(max_bytes - len(_BRIDGE_TRUNCATION_MARKER), 0)
+    with path.open("rb") as handle:
+        handle.seek(max(size - keep_bytes, 0), os.SEEK_SET)
+        tail = handle.read(keep_bytes)
+    with path.open("wb") as handle:
+        handle.write(_BRIDGE_TRUNCATION_MARKER)
+        handle.write(tail)
 
 
 _DEFAULT_MANAGER: BridgeSessionManager | None = None
@@ -103,4 +160,3 @@ def get_bridge_manager() -> BridgeSessionManager:
     if _DEFAULT_MANAGER is None:
         _DEFAULT_MANAGER = BridgeSessionManager()
     return _DEFAULT_MANAGER
-
