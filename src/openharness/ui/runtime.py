@@ -343,7 +343,10 @@ async def build_runtime(
         runtime_mcp_configs.update(mcp_server_configs)
     mcp_manager = McpClientManager(runtime_mcp_configs)
     await mcp_manager.connect_all()
-    tool_registry = create_default_tool_registry(mcp_manager)
+    tool_registry = create_default_tool_registry(
+        mcp_manager,
+        include_network_tools=not bare,
+    )
     # Register plugin-provided tools
     for plugin in plugins:
         if plugin.enabled and plugin.tools:

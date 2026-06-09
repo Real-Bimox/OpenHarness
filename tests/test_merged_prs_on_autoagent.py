@@ -15,16 +15,23 @@ import tempfile
 import time
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 API_KEY = os.environ.get(
     "ANTHROPIC_API_KEY",
-    "sk-Ue1kdhq9prvNwuwySlzRtWVD7ek0iJJaHyPdKDa3ecKLwYuG",
+    "",
 )
 ANTHROPIC_BASE = "https://api.moonshot.cn/anthropic"
 OPENAI_BASE = "https://api.moonshot.cn/v1"
 MODEL = "kimi-k2.5"
 WORKSPACE = Path("/home/tangjiabin/AutoAgent")
+
+pytestmark = pytest.mark.skipif(
+    not API_KEY or not WORKSPACE.exists(),
+    reason="Needs real API key + AutoAgent",
+)
 
 RESULTS: dict[str, tuple[bool, float]] = {}
 

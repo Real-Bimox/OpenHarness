@@ -249,7 +249,7 @@ def _command_name_from_file(file_path: Path, base_dir: Path, plugin_name: str) -
 
 
 def _load_plugin_skills(path: Path) -> list[SkillDefinition]:
-    """Load plugin skills using Claude Code's directory SKILL.md layout."""
+    """Load plugin skills using the directory-based SKILL.md layout."""
     if not path.exists():
         return []
     skills: list[SkillDefinition] = []

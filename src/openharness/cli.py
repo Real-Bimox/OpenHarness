@@ -515,7 +515,7 @@ def _build_dry_run_preview(
     mcp_servers = {} if bare else load_mcp_server_configs(settings, plugins)
     if mcp_server_configs and not bare:
         mcp_servers.update(mcp_server_configs)
-    tool_registry = create_default_tool_registry()
+    tool_registry = create_default_tool_registry(include_network_tools=not bare)
     tool_schemas = []
     for tool_schema in tool_registry.to_api_schema():
         args_preview = _schema_argument_preview(tool_schema)

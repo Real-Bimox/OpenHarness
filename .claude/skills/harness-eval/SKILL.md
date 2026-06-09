@@ -23,7 +23,7 @@ Validate OpenHarness features by running real agent loops against an unfamiliar 
 Clone an unfamiliar project (do not use OpenHarness):
 
 ```bash
-git clone https://github.com/HKUDS/AutoAgent /tmp/eval-workspace
+git clone https://github.com/Real-Bimox/OpenHarness /tmp/eval-workspace
 ```
 
 ### 2. Configure Environment

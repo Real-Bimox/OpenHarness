@@ -45,7 +45,11 @@ from openharness.tools.web_fetch_tool import WebFetchTool
 from openharness.tools.web_search_tool import WebSearchTool
 
 
-def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
+def create_default_tool_registry(
+    mcp_manager=None,
+    *,
+    include_network_tools: bool = True,
+) -> ToolRegistry:
     """Return the default built-in tool registry."""
     registry = ToolRegistry()
     for tool in (
@@ -59,12 +63,8 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         McpAuthTool(),
         GlobTool(),
         GrepTool(),
-        ImageToTextTool(),
-        ImageGenerationTool(),
         SkillTool(),
         ToolSearchTool(),
-        WebFetchTool(),
-        WebSearchTool(),
         ConfigTool(),
         BriefTool(),
         SleepTool(),
@@ -90,6 +90,14 @@ def create_default_tool_registry(mcp_manager=None) -> ToolRegistry:
         TeamDeleteTool(),
     ):
         registry.register(tool)
+    if include_network_tools:
+        for tool in (
+            ImageToTextTool(),
+            ImageGenerationTool(),
+            WebFetchTool(),
+            WebSearchTool(),
+        ):
+            registry.register(tool)
     if mcp_manager is not None:
         registry.register(ListMcpResourcesTool(mcp_manager))
         registry.register(ReadMcpResourceTool(mcp_manager))

@@ -1,4 +1,4 @@
-"""Tests for Claude Code-inspired memory runtime behavior."""
+"""Tests for OpenHarness memory runtime behavior."""
 
 from __future__ import annotations
 
@@ -175,7 +175,7 @@ def test_team_memory_guards_and_agent_memory(tmp_path: Path, monkeypatch: pytest
     assert team_dir.exists()
     assert valid_path is not None and error is None
     assert escaped_path is None and escaped_error
-    assert check_team_memory_secrets("OPENAI_API_KEY=sk-12345678901234567890")
+    assert check_team_memory_secrets("OPENAI_API_KEY=sk-test-secret")
     assert agent_dir.exists()
     assert get_agent_memory_entrypoint(project, "reviewer/bot", "project").exists()
 

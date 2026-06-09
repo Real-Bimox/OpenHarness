@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # OpenHarness one-click installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/Real-Bimox/OpenHarness/main/scripts/install.sh | bash
 #        bash scripts/install.sh [--from-source] [--with-channels]
 
 set -euo pipefail
@@ -183,7 +183,7 @@ fi
 # ---------------------------------------------------------------------------
 step "Installing OpenHarness"
 
-REPO_URL="https://github.com/HKUDS/OpenHarness.git"
+REPO_URL="https://github.com/Real-Bimox/OpenHarness.git"
 INSTALL_DIR="$HOME/.openharness-src"
 VENV_DIR="$HOME/.openharness-venv"
 BIN_DIR="$HOME/.local/bin"
@@ -379,7 +379,7 @@ echo "         fish:     source ~/.config/fish/config.fish"
 echo "    2. Set your API key:        export ANTHROPIC_API_KEY=your_key"
 echo "    3. Launch:                  oh"
 echo "    4. Launch ohmo:             ohmo"
-echo "    5. Docs:                    https://github.com/HKUDS/OpenHarness"
+echo "    5. Docs:                    https://github.com/Real-Bimox/OpenHarness"
 echo ""
 echo "  Notes:"
 echo "    - Commands are linked into: ${BIN_DIR}"

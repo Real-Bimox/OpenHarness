@@ -27,7 +27,7 @@ class OhmoCreateFeishuGroupInput(BaseModel):
     )
     repo: str | None = Field(
         default=None,
-        description="Repository identifier associated with the group, for example HKUDS/OpenHarness.",
+        description="Repository identifier associated with the group, for example Real-Bimox/OpenHarness.",
     )
     reason: str | None = Field(
         default=None,

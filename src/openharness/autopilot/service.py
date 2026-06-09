@@ -1845,14 +1845,11 @@ class RepoAutopilotStore:
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{repo_name} Autopilot Kanban</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
   <style>
     :root {{
       --bg: #0a0a0a; --bg-elevated: #1a1a1a; --ink: #fff;
       --accent: #00d4aa; --muted: #666; --line: #222;
-      --mono: "JetBrains Mono", ui-monospace, monospace;
+      --mono: ui-monospace, "SFMono-Regular", Consolas, monospace;
     }}
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{ background: var(--bg); color: var(--ink); font-family: var(--mono); font-size: 13px; }}

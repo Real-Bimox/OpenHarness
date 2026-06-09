@@ -41,7 +41,7 @@
 ### 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Real-Bimox/OpenHarness/main/scripts/install.sh | bash
 ```
 
 常用安装参数：
@@ -52,13 +52,13 @@ curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/inst
 例如：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.sh | bash -s -- --from-source --with-channels
+curl -fsSL https://raw.githubusercontent.com/Real-Bimox/OpenHarness/main/scripts/install.sh | bash -s -- --from-source --with-channels
 ```
 
 ### 本地运行
 
 ```bash
-git clone https://github.com/HKUDS/OpenHarness.git
+git clone https://github.com/Real-Bimox/OpenHarness.git
 cd OpenHarness
 uv sync --extra dev
 uv run oh
@@ -398,7 +398,7 @@ python scripts/test_real_skills_plugins.py
 开发环境：
 
 ```bash
-git clone https://github.com/HKUDS/OpenHarness.git
+git clone https://github.com/Real-Bimox/OpenHarness.git
 cd OpenHarness
 uv sync --extra dev
 uv run pytest -q

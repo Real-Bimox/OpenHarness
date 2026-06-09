@@ -354,7 +354,7 @@ def is_credential_expired(credential: ExternalAuthCredential, *, now_ms: int | N
 
 
 def get_claude_code_version() -> str:
-    """Return the locally installed Claude Code version or a fallback."""
+    """Return the locally installed external CLI version or a fallback."""
     global _claude_code_version_cache
     if _claude_code_version_cache is not None:
         return _claude_code_version_cache
@@ -378,7 +378,7 @@ def get_claude_code_version() -> str:
 
 
 def get_claude_code_session_id() -> str:
-    """Return a stable Claude Code-style session identifier for this process."""
+    """Return a stable external CLI session identifier for this process."""
     global _claude_code_session_id
     if _claude_code_session_id is None:
         _claude_code_session_id = str(uuid.uuid4())
@@ -391,7 +391,7 @@ def claude_oauth_betas() -> list[str]:
 
 
 def claude_attribution_header() -> str:
-    """Return the Claude Code billing attribution prefix used in system prompts."""
+    """Return the external CLI billing attribution prefix used in system prompts."""
     version = get_claude_code_version()
     return (
         "x-anthropic-billing-header: "
@@ -400,7 +400,7 @@ def claude_attribution_header() -> str:
 
 
 def claude_oauth_headers() -> dict[str, str]:
-    """Return Claude Code-style headers for subscription OAuth traffic."""
+    """Return external CLI-compatible headers for subscription OAuth traffic."""
     all_betas = ",".join(claude_oauth_betas())
     return {
         "anthropic-beta": all_betas,
