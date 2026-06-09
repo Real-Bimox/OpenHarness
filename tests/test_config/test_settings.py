@@ -80,6 +80,20 @@ class TestSettings:
         assert updated.permission.mode == "full_auto"
         assert s.permission.mode == "default"
 
+    def test_merge_cli_overrides_applies_permission_lists_and_appended_prompt(self):
+        s = Settings(system_prompt="base")
+        updated = s.merge_cli_overrides(
+            permission_mode="full_auto",
+            allowed_tools=["read_file"],
+            denied_tools=["bash"],
+            append_system_prompt="extra",
+        )
+
+        assert updated.permission.mode.value == "full_auto"
+        assert updated.permission.allowed_tools == ["read_file"]
+        assert updated.permission.denied_tools == ["bash"]
+        assert updated.system_prompt == "base\n\nextra"
+
     def test_web_settings_env_overrides(self, monkeypatch):
         monkeypatch.setenv("OPENHARNESS_WEB_PROXY", "http://proxy.example.com:7890")
         monkeypatch.setenv("OPENHARNESS_WEB_RESOLUTION_MODE", "synthetic_dns")

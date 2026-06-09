@@ -33,6 +33,7 @@ In scope:
 - `oh -p "..." --resume <id>` and `oh -p "..." --continue` run in print mode, not the TUI.
 - `--output-format json` and `stream-json` include `session_id`.
 - A public local JSONL control mode, `oh --headless`, accepts structured requests on stdin and emits structured events on stdout.
+- `oh --headless` supports local session discovery, status snapshots, and active-turn interruption.
 - Noninteractive permissions are policy-driven:
   - `full_auto` approves confirmation prompts.
   - `default` and `plan` deny confirmation prompts with a machine-readable denial event.
@@ -58,6 +59,9 @@ Requests:
 {"type":"submit","prompt":"inspect this repo","request_id":"optional"}
 {"type":"resume","session_id":"abc123","prompt":"optional follow-up","request_id":"optional"}
 {"type":"continue","session_id":"optional","prompt":"optional follow-up","request_id":"optional"}
+{"type":"list_sessions","request_id":"optional"}
+{"type":"status","request_id":"optional"}
+{"type":"interrupt","request_id":"optional"}
 {"type":"shutdown","request_id":"optional"}
 ```
 
@@ -69,12 +73,17 @@ confirmation prompts are denied unless the process was started with
 Events:
 
 ```json
+{"type":"process_ready","protocol_version":1}
 {"type":"ready","session_id":"abc123","request_id":"optional"}
+{"type":"sessions","request_id":"optional","sessions":[]}
+{"type":"state_snapshot","session_id":"abc123","request_id":"optional","state":{},"busy":false}
 {"type":"assistant_delta","session_id":"abc123","request_id":"optional","text":"..."}
 {"type":"assistant_complete","session_id":"abc123","request_id":"optional","text":"..."}
 {"type":"tool_started","session_id":"abc123","request_id":"optional","tool_name":"read_file","tool_input":{}}
 {"type":"tool_completed","session_id":"abc123","request_id":"optional","tool_name":"read_file","output":"...","is_error":false}
 {"type":"permission_denied","session_id":"abc123","request_id":"optional","tool_name":"write_file","reason":"..."}
+{"type":"interrupting","request_id":"optional","active":true,"active_request_id":"submit-1"}
+{"type":"interrupted","session_id":"abc123","request_id":"optional"}
 {"type":"line_complete","session_id":"abc123","request_id":"optional"}
 {"type":"error","request_id":"optional","message":"...","recoverable":true}
 {"type":"shutdown","session_id":"abc123","request_id":"optional"}
@@ -87,6 +96,6 @@ This protocol intentionally mirrors the current `stream-json` and React backend 
 1. `oh -p "remember x" --output-format json` returns `session_id`.
 2. `oh -p "what did I ask you to remember?" --resume <session_id> --output-format json` runs headlessly and restores context.
 3. `oh -p "..." --resume` with no value errors instead of opening a picker.
-4. `oh --headless` accepts `submit` requests and emits JSONL events including `ready`, deltas/completion, and `line_complete`.
+4. `oh --headless` accepts `submit` requests and emits JSONL events including `process_ready`, `ready`, deltas/completion, and `line_complete`.
 5. In noninteractive `default` mode, mutating ask-path permissions are denied with `permission_denied`; `full_auto` still approves.
 6. No new runtime dependencies are added.

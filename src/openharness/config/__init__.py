@@ -15,6 +15,7 @@ from openharness.config.settings import (
     auth_source_provider_name,
     default_auth_source_for_provider,
     default_provider_profiles,
+    load_settings_from_source,
     load_settings,
     save_settings,
 )
@@ -30,5 +31,6 @@ __all__ = [
     "get_data_dir",
     "get_logs_dir",
     "load_settings",
+    "load_settings_from_source",
     "save_settings",
 ]

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import io
 import json
+import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -99,7 +101,8 @@ async def test_headless_control_submit_and_shutdown(tmp_path: Path, monkeypatch)
     )
 
     events = _json_lines(output_stream.getvalue())
-    assert events[0]["type"] == "ready"
+    assert events[0]["type"] == "process_ready"
+    ready = next(event for event in events if event["type"] == "ready")
     assert any(
         event["type"] == "assistant_complete"
         and event["text"] == "world"
@@ -109,7 +112,7 @@ async def test_headless_control_submit_and_shutdown(tmp_path: Path, monkeypatch)
     assert any(
         event["type"] == "line_complete"
         and event["request_id"] == "submit-1"
-        and event["session_id"] == events[0]["session_id"]
+        and event["session_id"] == ready["session_id"]
         for event in events
     )
     assert events[-1]["type"] == "shutdown"
@@ -187,3 +190,94 @@ async def test_headless_control_denies_default_permission_prompts(tmp_path: Path
         and event["request_id"] == "submit-1"
         for event in events
     )
+
+
+@pytest.mark.asyncio
+async def test_headless_control_lists_sessions_and_status(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(
+        cwd=project,
+        model="test-model",
+        system_prompt="system",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="earlier")])],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        session_id="listed123",
+    )
+
+    input_stream = io.StringIO(
+        '{"type":"list_sessions","request_id":"list-1"}\n'
+        '{"type":"status","request_id":"status-1"}\n'
+        '{"type":"shutdown","request_id":"shutdown-1"}\n'
+    )
+    output_stream = io.StringIO()
+
+    await run_headless_control(
+        cwd=str(project),
+        api_client=StaticApiClient("unused"),
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
+
+    events = _json_lines(output_stream.getvalue())
+    sessions = next(event for event in events if event["type"] == "sessions")
+    assert sessions["request_id"] == "list-1"
+    assert sessions["sessions"][0]["session_id"] == "listed123"
+    status = next(event for event in events if event["type"] == "state_snapshot")
+    assert status["request_id"] == "status-1"
+    assert status["session_id"] is None
+    assert status["busy"] is False
+
+
+@pytest.mark.asyncio
+async def test_headless_control_interrupts_active_request(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    started = threading.Event()
+
+    async def _blocking_handle_line(*args, **kwargs):
+        del args, kwargs
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("openharness.ui.app.handle_line", _blocking_handle_line)
+
+    class _Input:
+        def __init__(self) -> None:
+            self._submit_sent = False
+            self._shutdown_sent = False
+
+        def readline(self) -> str:
+            if not self._submit_sent:
+                self._submit_sent = True
+                return '{"type":"submit","prompt":"block","request_id":"submit-1"}\n'
+            started.wait(timeout=2)
+            if not hasattr(self, "_status_sent"):
+                self._status_sent = True
+                return '{"type":"status","request_id":"status-1"}\n'
+            if not self._shutdown_sent:
+                self._shutdown_sent = True
+                return '{"type":"interrupt","request_id":"interrupt-1"}\n'
+            return '{"type":"shutdown","request_id":"shutdown-1"}\n'
+
+    output_stream = io.StringIO()
+
+    await run_headless_control(
+        cwd=str(tmp_path),
+        api_client=StaticApiClient("unused"),
+        input_stream=_Input(),
+        output_stream=output_stream,
+    )
+
+    events = _json_lines(output_stream.getvalue())
+    assert any(
+        event["type"] == "state_snapshot"
+        and event["request_id"] == "status-1"
+        and event["busy"] is True
+        for event in events
+    )
+    assert any(event["type"] == "interrupting" and event["request_id"] == "interrupt-1" for event in events)
+    assert any(event["type"] == "interrupted" and event["request_id"] == "submit-1" for event in events)
+    assert events[-1]["type"] == "shutdown"

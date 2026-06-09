@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import sys
+from dataclasses import asdict
 from typing import Any, TextIO
 
 from openharness.coordinator.coordinator_mode import is_coordinator_mode
@@ -22,6 +24,7 @@ from openharness.engine.stream_events import (
 )
 from openharness.ui.backend_host import run_backend_host
 from openharness.ui.coordinator_drain import drain_coordinator_async_agents
+from openharness.ui.headless_protocol import HEADLESS_PROTOCOL_VERSION, HeadlessRequest
 from openharness.ui.react_launcher import launch_react_tui
 from openharness.ui.runtime import build_runtime, close_runtime, handle_line, start_runtime
 
@@ -106,6 +109,13 @@ def _headless_permission_allowed(permission_mode: str | None) -> bool:
     return permission_mode == "full_auto"
 
 
+def _app_state_payload(bundle) -> dict[str, Any]:
+    state = bundle.app_state.get()
+    payload = asdict(state)
+    payload["session_id"] = bundle.session_id
+    return payload
+
+
 async def run_repl(
     *,
     prompt: str | None = None,
@@ -121,7 +131,15 @@ async def run_repl(
     backend_only: bool = False,
     restore_messages: list[dict] | None = None,
     restore_tool_metadata: dict[str, object] | None = None,
+    session_id: str | None = None,
+    append_system_prompt: str | None = None,
     permission_mode: str | None = None,
+    allowed_tools: list[str] | None = None,
+    denied_tools: list[str] | None = None,
+    settings_source: str | None = None,
+    mcp_server_configs: dict[str, object] | None = None,
+    bare: bool = False,
+    resume_session_id: str | None = None,
 ) -> None:
     """Run the default OpenHarness interactive application (React TUI)."""
     if backend_only:
@@ -137,8 +155,15 @@ async def run_repl(
             api_client=api_client,
             restore_messages=restore_messages,
             restore_tool_metadata=restore_tool_metadata,
+            session_id=session_id,
+            append_system_prompt=append_system_prompt,
             enforce_max_turns=max_turns is not None,
             permission_mode=permission_mode,
+            allowed_tools=allowed_tools,
+            denied_tools=denied_tools,
+            settings_source=settings_source,
+            mcp_server_configs=mcp_server_configs,
+            bare=bare,
         )
         return
 
@@ -153,6 +178,13 @@ async def run_repl(
         api_key=api_key,
         api_format=api_format,
         permission_mode=permission_mode,
+        append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
+        denied_tools=denied_tools,
+        settings_source=settings_source,
+        mcp_server_configs=mcp_server_configs,
+        bare=bare,
+        resume_session_id=resume_session_id or session_id,
     )
     if exit_code != 0:
         raise SystemExit(exit_code)
@@ -170,6 +202,12 @@ async def run_task_worker(
     api_format: str | None = None,
     api_client: SupportsStreamingMessages | None = None,
     permission_mode: str | None = None,
+    append_system_prompt: str | None = None,
+    allowed_tools: list[str] | None = None,
+    denied_tools: list[str] | None = None,
+    settings_source: str | None = None,
+    mcp_server_configs: dict[str, object] | None = None,
+    bare: bool = False,
 ) -> None:
     """Run a stdin-driven headless worker for background agent tasks.
 
@@ -223,6 +261,12 @@ async def run_task_worker(
         ask_user_prompt=_noop_ask,
         enforce_max_turns=max_turns is not None,
         permission_mode=permission_mode,
+        append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
+        denied_tools=denied_tools,
+        settings_source=settings_source,
+        mcp_server_configs=mcp_server_configs,
+        bare=bare,
     )
     await start_runtime(bundle)
     try:
@@ -266,6 +310,11 @@ async def run_print_mode(
     restore_messages: list[dict] | None = None,
     restore_tool_metadata: dict[str, object] | None = None,
     session_id: str | None = None,
+    allowed_tools: list[str] | None = None,
+    denied_tools: list[str] | None = None,
+    settings_source: str | None = None,
+    mcp_server_configs: dict[str, object] | None = None,
+    bare: bool = False,
 ) -> None:
     """Non-interactive mode: submit prompt, stream output, exit."""
     if output_format not in _VALID_PRINT_OUTPUT_FORMATS:
@@ -314,6 +363,12 @@ async def run_print_mode(
         restore_tool_metadata=restore_tool_metadata,
         session_id=session_id,
         permission_mode=permission_mode,
+        append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
+        denied_tools=denied_tools,
+        settings_source=settings_source,
+        mcp_server_configs=mcp_server_configs,
+        bare=bare,
     )
     session_ref["session_id"] = bundle.session_id
     await start_runtime(bundle)
@@ -431,26 +486,40 @@ async def run_headless_control(
     permission_mode: str | None = None,
     input_stream: TextIO | None = None,
     output_stream: TextIO | None = None,
+    append_system_prompt: str | None = None,
+    allowed_tools: list[str] | None = None,
+    denied_tools: list[str] | None = None,
+    settings_source: str | None = None,
+    mcp_server_configs: dict[str, object] | None = None,
+    bare: bool = False,
 ) -> None:
     """Run the local JSONL headless control protocol over stdin/stdout."""
-    from openharness.services.session_storage import load_session_by_id, load_session_snapshot
+    from openharness.services.session_storage import (
+        list_session_snapshots,
+        load_session_by_id,
+        load_session_snapshot,
+    )
 
     input_stream = input_stream or sys.stdin
     output_stream = output_stream or sys.stdout
     bundle = None
+    request_queue: asyncio.Queue[HeadlessRequest] = asyncio.Queue()
+    write_lock = asyncio.Lock()
     current_request_id: str | None = None
+    active_request_id: str | None = None
+    active_request_task: asyncio.Task[bool] | None = None
 
-    def _request_id(payload: dict[str, Any]) -> str | None:
-        request_id = payload.get("request_id", payload.get("id"))
-        return request_id if isinstance(request_id, str) and request_id else None
-
-    def _emit(payload: dict[str, Any], *, request_id: str | None = None) -> None:
+    async def _emit(payload: dict[str, Any], *, request_id: str | None = None) -> None:
         if request_id:
             payload = {**payload, "request_id": request_id}
-        _write_jsonl(output_stream, payload)
+        async with write_lock:
+            _write_jsonl(output_stream, payload)
 
-    def _error(message: str, *, request_id: str | None = None, recoverable: bool = True) -> None:
-        _emit({"type": "error", "message": message, "recoverable": recoverable}, request_id=request_id)
+    async def _error(message: str, *, request_id: str | None = None, recoverable: bool = True) -> None:
+        await _emit({"type": "error", "message": message, "recoverable": recoverable}, request_id=request_id)
+
+    def _session_lookup_cwd() -> str:
+        return bundle.cwd if bundle is not None else (cwd or ".")
 
     async def _permission(tool_name: str, reason: str) -> bool:
         if _headless_permission_allowed(permission_mode):
@@ -458,7 +527,7 @@ async def run_headless_control(
         payload = {"type": "permission_denied", "tool_name": tool_name, "reason": reason}
         if bundle is not None:
             payload["session_id"] = bundle.session_id
-        _emit(payload, request_id=current_request_id)
+        await _emit(payload, request_id=current_request_id)
         return False
 
     async def _ask_user(question: str) -> str:
@@ -470,7 +539,7 @@ async def run_headless_control(
         }
         if bundle is not None:
             payload["session_id"] = bundle.session_id
-        _emit(payload, request_id=current_request_id)
+        await _emit(payload, request_id=current_request_id)
         return ""
 
     async def _start_bundle(
@@ -507,40 +576,45 @@ async def run_headless_control(
             session_id=session_id if isinstance(session_id, str) and session_id else None,
             enforce_max_turns=max_turns is not None,
             permission_mode=permission_mode,
+            append_system_prompt=append_system_prompt,
+            allowed_tools=allowed_tools,
+            denied_tools=denied_tools,
+            settings_source=settings_source,
+            mcp_server_configs=mcp_server_configs,
+            bare=bare,
         )
         await start_runtime(bundle)
-        payload = {"type": "ready", "session_id": bundle.session_id}
+        payload = {
+            "type": "ready",
+            "protocol_version": HEADLESS_PROTOCOL_VERSION,
+            "session_id": bundle.session_id,
+        }
         if snapshot is not None:
             payload["resumed"] = True
-        _emit(payload, request_id=request_id)
+        await _emit(payload, request_id=request_id)
 
     async def _print_system(message: str) -> None:
         payload = {"type": "system", "message": message}
         if bundle is not None:
             payload["session_id"] = bundle.session_id
-        _emit(payload, request_id=current_request_id)
+        await _emit(payload, request_id=current_request_id)
 
     async def _render_event(event: StreamEvent) -> None:
         payload = _stream_event_payload(event, session_id=bundle.session_id if bundle is not None else None)
         if payload is not None:
-            _emit(payload, request_id=current_request_id)
+            await _emit(payload, request_id=current_request_id)
 
     async def _clear_output() -> None:
         payload = {"type": "clear_transcript"}
         if bundle is not None:
             payload["session_id"] = bundle.session_id
-        _emit(payload, request_id=current_request_id)
-
-    def _request_text(payload: dict[str, Any]) -> str:
-        for key in ("prompt", "line", "text"):
-            value = payload.get(key)
-            if isinstance(value, str):
-                return value.strip()
-        return ""
+        await _emit(payload, request_id=current_request_id)
 
     async def _submit(line: str, *, request_id: str | None) -> bool:
         if bundle is None:
-            _error("Headless runtime is not ready", request_id=request_id)
+            await _start_bundle(request_id=request_id)
+        if bundle is None:
+            await _error("Headless runtime is not ready", request_id=request_id)
             return True
         should_continue = await handle_line(
             bundle,
@@ -549,83 +623,166 @@ async def run_headless_control(
             render_event=_render_event,
             clear_output=_clear_output,
         )
-        _emit({"type": "line_complete", "session_id": bundle.session_id}, request_id=request_id)
+        await _emit({"type": "line_complete", "session_id": bundle.session_id}, request_id=request_id)
         if not should_continue:
-            _emit({"type": "shutdown", "session_id": bundle.session_id}, request_id=request_id)
+            await _emit({"type": "shutdown", "session_id": bundle.session_id}, request_id=request_id)
         return should_continue
 
-    await _start_bundle()
-    try:
+    async def _emit_sessions(request_id: str | None) -> None:
+        sessions = list_session_snapshots(_session_lookup_cwd(), limit=20)
+        await _emit({"type": "sessions", "sessions": sessions}, request_id=request_id)
+
+    async def _emit_status(request_id: str | None) -> None:
+        if bundle is None:
+            await _emit(
+                {
+                    "type": "state_snapshot",
+                    "protocol_version": HEADLESS_PROTOCOL_VERSION,
+                    "session_id": None,
+                    "state": None,
+                    "busy": active_request_task is not None and not active_request_task.done(),
+                },
+                request_id=request_id,
+            )
+            return
+        await _emit(
+            {
+                "type": "state_snapshot",
+                "protocol_version": HEADLESS_PROTOCOL_VERSION,
+                "session_id": bundle.session_id,
+                "state": _app_state_payload(bundle),
+                "busy": active_request_task is not None and not active_request_task.done(),
+            },
+            request_id=request_id,
+        )
+
+    async def _run_active_request(awaitable, *, request_id: str | None) -> bool:
+        nonlocal active_request_id, active_request_task, current_request_id
+        task = asyncio.create_task(awaitable)
+        active_request_task = task
+        active_request_id = request_id
+        current_request_id = request_id
+        try:
+            return await task
+        except asyncio.CancelledError:
+            payload = {"type": "interrupted"}
+            if bundle is not None:
+                payload["session_id"] = bundle.session_id
+            await _emit(payload, request_id=request_id)
+            if bundle is not None:
+                await _emit({"type": "line_complete", "session_id": bundle.session_id}, request_id=request_id)
+            return True
+        finally:
+            if active_request_task is task:
+                active_request_task = None
+                active_request_id = None
+                current_request_id = None
+
+    async def _interrupt_active_request(request_id: str | None) -> None:
+        if active_request_task is None or active_request_task.done():
+            await _emit({"type": "interrupted", "active": False}, request_id=request_id)
+            return
+        active_request_task.cancel()
+        await _emit(
+            {"type": "interrupting", "active": True, "active_request_id": active_request_id},
+            request_id=request_id,
+        )
+
+    async def _read_requests() -> None:
         while True:
             raw = await asyncio.to_thread(input_stream.readline)
             if raw == "":
-                break
+                await request_queue.put(HeadlessRequest(type="shutdown"))
+                return
             raw = raw.strip()
             if not raw:
                 continue
             try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                _error(f"Invalid JSON request: {exc.msg}", recoverable=True)
+                request = HeadlessRequest.model_validate_json(raw)
+            except Exception as exc:
+                await _error(f"Invalid request: {exc}", recoverable=True)
                 continue
-            if not isinstance(payload, dict):
-                _error("Headless requests must be JSON objects", recoverable=True)
+            if request.type == "list_sessions":
+                await _emit_sessions(request.correlation_id)
                 continue
+            if request.type == "status":
+                await _emit_status(request.correlation_id)
+                continue
+            if request.type == "interrupt":
+                await _interrupt_active_request(request.correlation_id)
+                continue
+            if request.type == "shutdown" and active_request_task is not None and not active_request_task.done():
+                active_request_task.cancel()
+            await request_queue.put(request)
 
-            request_id = _request_id(payload)
-            current_request_id = request_id
-            request_type = payload.get("type")
-            if request_type in {"submit", "submit_line"}:
-                line = _request_text(payload)
+    await _emit({"type": "process_ready", "protocol_version": HEADLESS_PROTOCOL_VERSION})
+    reader = asyncio.create_task(_read_requests())
+    try:
+        while True:
+            request = await request_queue.get()
+            request_id = request.correlation_id
+            if request.type in {"submit", "submit_line"}:
+                line = request.submitted_text
                 if not line:
-                    _error("submit requires a non-empty prompt or line", request_id=request_id)
-                    current_request_id = None
+                    await _error("submit requires a non-empty prompt or line", request_id=request_id)
                     continue
-                if not await _submit(line, request_id=request_id):
+                if active_request_task is not None and not active_request_task.done():
+                    await _error("Session is busy", request_id=request_id)
+                    continue
+                if not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
                     break
-            elif request_type == "resume":
-                session_id = payload.get("session_id")
+            elif request.type == "resume":
+                session_id = request.session_id
                 if not isinstance(session_id, str) or not session_id.strip():
-                    _error("resume requires a non-empty session_id", request_id=request_id)
-                    current_request_id = None
+                    await _error("resume requires a non-empty session_id", request_id=request_id)
                     continue
-                snapshot = load_session_by_id(bundle.cwd if bundle is not None else (cwd or "."), session_id.strip())
+                if active_request_task is not None and not active_request_task.done():
+                    await _error("Session is busy", request_id=request_id)
+                    continue
+                snapshot = load_session_by_id(_session_lookup_cwd(), session_id.strip())
                 if snapshot is None:
-                    _error(f"Session not found: {session_id}", request_id=request_id)
-                    current_request_id = None
+                    await _error(f"Session not found: {session_id}", request_id=request_id)
                     continue
                 await _start_bundle(snapshot, request_id=request_id)
-                line = _request_text(payload)
-                if line and not await _submit(line, request_id=request_id):
+                line = request.submitted_text
+                if line and not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
                     break
-            elif request_type == "continue":
-                session_id = payload.get("session_id")
+            elif request.type == "continue":
+                session_id = request.session_id
+                if active_request_task is not None and not active_request_task.done():
+                    await _error("Session is busy", request_id=request_id)
+                    continue
                 if isinstance(session_id, str) and session_id.strip():
-                    snapshot = load_session_by_id(bundle.cwd if bundle is not None else (cwd or "."), session_id.strip())
+                    snapshot = load_session_by_id(_session_lookup_cwd(), session_id.strip())
                 else:
-                    snapshot = load_session_snapshot(bundle.cwd if bundle is not None else (cwd or "."))
+                    snapshot = load_session_snapshot(_session_lookup_cwd())
                 if snapshot is None:
-                    _error("No previous session found in this directory.", request_id=request_id)
-                    current_request_id = None
+                    await _error("No previous session found in this directory.", request_id=request_id)
                     continue
                 await _start_bundle(snapshot, request_id=request_id)
-                line = _request_text(payload)
-                if line and not await _submit(line, request_id=request_id):
+                line = request.submitted_text
+                if line and not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
                     break
-            elif request_type == "permission_response":
-                _error(
+            elif request.type == "list_sessions":
+                await _emit_sessions(request_id)
+            elif request.type == "status":
+                await _emit_status(request_id)
+            elif request.type == "interrupt":
+                await _interrupt_active_request(request_id)
+            elif request.type == "permission_response":
+                await _error(
                     "permission_response is not used by this deterministic headless mode",
                     request_id=request_id,
                 )
-            elif request_type == "shutdown":
-                _emit(
+            elif request.type == "shutdown":
+                await _emit(
                     {"type": "shutdown", "session_id": bundle.session_id if bundle is not None else ""},
                     request_id=request_id,
                 )
                 break
-            else:
-                _error(f"Unsupported headless request type: {request_type}", request_id=request_id)
-            current_request_id = None
     finally:
+        reader.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader
         if bundle is not None:
             await close_runtime(bundle)

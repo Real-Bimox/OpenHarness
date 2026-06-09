@@ -89,6 +89,13 @@ def build_backend_command(
     api_key: str | None = None,
     api_format: str | None = None,
     permission_mode: str | None = None,
+    append_system_prompt: str | None = None,
+    allowed_tools: list[str] | None = None,
+    denied_tools: list[str] | None = None,
+    settings_source: str | None = None,
+    mcp_server_configs: dict[str, object] | None = None,
+    bare: bool = False,
+    resume_session_id: str | None = None,
 ) -> list[str]:
     """Return the command used by the React frontend to spawn the backend host."""
     command = [sys.executable, "-m", "openharness", "--backend-only"]
@@ -110,6 +117,32 @@ def build_backend_command(
         command.extend(["--api-format", api_format])
     if permission_mode:
         command.extend(["--permission-mode", permission_mode])
+    if append_system_prompt:
+        command.extend(["--append-system-prompt", append_system_prompt])
+    if allowed_tools:
+        command.extend(["--allowed-tools", ",".join(allowed_tools)])
+    if denied_tools:
+        command.extend(["--disallowed-tools", ",".join(denied_tools)])
+    if settings_source:
+        command.extend(["--settings", settings_source])
+    if mcp_server_configs:
+        payload = {
+            "mcpServers": {
+                name: (
+                    config.model_dump(mode="json")
+                    if hasattr(config, "model_dump")
+                    else dict(config)
+                    if isinstance(config, dict)
+                    else config
+                )
+                for name, config in mcp_server_configs.items()
+            }
+        }
+        command.extend(["--mcp-config", json.dumps(payload)])
+    if bare:
+        command.append("--bare")
+    if resume_session_id:
+        command.extend(["--resume", resume_session_id])
     return command
 
 
@@ -125,6 +158,13 @@ async def launch_react_tui(
     api_key: str | None = None,
     api_format: str | None = None,
     permission_mode: str | None = None,
+    append_system_prompt: str | None = None,
+    allowed_tools: list[str] | None = None,
+    denied_tools: list[str] | None = None,
+    settings_source: str | None = None,
+    mcp_server_configs: dict[str, object] | None = None,
+    bare: bool = False,
+    resume_session_id: str | None = None,
 ) -> int:
     """Launch the React terminal frontend as the default UI."""
     frontend_dir = get_frontend_dir()
@@ -158,6 +198,13 @@ async def launch_react_tui(
                 api_key=api_key,
                 api_format=api_format,
                 permission_mode=permission_mode,
+                append_system_prompt=append_system_prompt,
+                allowed_tools=allowed_tools,
+                denied_tools=denied_tools,
+                settings_source=settings_source,
+                mcp_server_configs=mcp_server_configs,
+                bare=bare,
+                resume_session_id=resume_session_id,
             ),
             "initial_prompt": prompt,
             "theme": _resolve_theme(),

@@ -66,6 +66,67 @@ def _schema_argument_preview(tool_schema: dict[str, object]) -> dict[str, object
     return {"required_args": required, "optional_args": optional}
 
 
+def _parse_tool_filter(values: Optional[list[str]]) -> list[str] | None:
+    """Normalize comma or whitespace separated tool names from CLI options."""
+    if not values:
+        return None
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for item in re.split(r"[\s,]+", value or ""):
+            name = item.strip()
+            if name and name not in seen:
+                seen.add(name)
+                parsed.append(name)
+    return parsed or None
+
+
+def _load_cli_mcp_configs(values: Optional[list[str]]) -> dict[str, object] | None:
+    """Load process-local MCP configs from JSON strings or JSON files."""
+    if not values:
+        return None
+    from openharness.mcp.types import McpJsonConfig
+
+    configs: dict[str, object] = {}
+    for raw in values:
+        source = (raw or "").strip()
+        if not source:
+            continue
+        if source.startswith("{"):
+            text = source
+        else:
+            path = Path(source).expanduser()
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                print(f"Error: could not read --mcp-config {source}: {exc}", file=sys.stderr)
+                raise typer.Exit(1)
+        try:
+            payload = json.loads(text)
+            if not isinstance(payload, dict):
+                raise ValueError("MCP config must be a JSON object")
+            if "mcpServers" not in payload:
+                payload = {"mcpServers": payload}
+            parsed = McpJsonConfig.model_validate(payload)
+        except Exception as exc:
+            print(f"Error: invalid --mcp-config {source}: {exc}", file=sys.stderr)
+            raise typer.Exit(1)
+        configs.update(parsed.mcpServers)
+    return configs or None
+
+
+def _validate_settings_source(source: str | None) -> None:
+    if source is None or not source.strip():
+        return
+    from openharness.config import load_settings_from_source
+
+    try:
+        load_settings_from_source(source)
+    except Exception as exc:
+        print(f"Error: invalid --settings value: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
+
+
 def _mcp_transport_preview(config: object) -> dict[str, str]:
     if hasattr(config, "type"):
         transport = str(getattr(config, "type") or "unknown")
@@ -405,11 +466,16 @@ def _build_dry_run_preview(
     api_key: str | None,
     api_format: str | None,
     permission_mode: str | None,
+    allowed_tools: list[str] | None,
+    denied_tools: list[str] | None,
+    settings_source: str | None,
+    mcp_server_configs: dict[str, object] | None,
+    bare: bool,
     effort: str | None = None,
 ) -> dict[str, object]:
     from openharness.api.provider import auth_status, detect_provider
     from openharness.commands import create_default_command_registry
-    from openharness.config import get_config_file_path, load_settings
+    from openharness.config import get_config_file_path, load_settings_from_source
     from openharness.mcp.config import load_mcp_server_configs
     from openharness.plugins import load_plugins
     from openharness.prompts.context import build_runtime_system_prompt
@@ -418,7 +484,7 @@ def _build_dry_run_preview(
     from openharness.ui.runtime import _resolve_api_client_from_settings
 
     resolved_cwd = str(Path(cwd).expanduser().resolve())
-    settings = load_settings().merge_cli_overrides(
+    settings = load_settings_from_source(settings_source).merge_cli_overrides(
         model=model,
         max_turns=max_turns,
         base_url=base_url,
@@ -426,13 +492,17 @@ def _build_dry_run_preview(
         api_key=api_key,
         api_format=api_format,
         permission_mode=permission_mode,
+        append_system_prompt=append_system_prompt,
+        allowed_tools=allowed_tools,
+        denied_tools=denied_tools,
         effort=effort,
+        bare=bare,
     )
     provider = detect_provider(settings)
     auth = auth_status(settings)
     profile_name, profile = settings.resolve_profile()
 
-    plugins = load_plugins(settings, resolved_cwd)
+    plugins = [] if bare else load_plugins(settings, resolved_cwd)
     plugin_commands = [
         command
         for plugin in plugins
@@ -441,9 +511,10 @@ def _build_dry_run_preview(
     ]
     command_registry = create_default_command_registry(plugin_commands=plugin_commands)
     command_match = command_registry.lookup(prompt) if prompt else None
-    skill_registry = load_skill_registry(resolved_cwd, settings=settings)
-    skills = skill_registry.list_skills()
-    mcp_servers = load_mcp_server_configs(settings, plugins)
+    skills = [] if bare else load_skill_registry(resolved_cwd, settings=settings).list_skills()
+    mcp_servers = {} if bare else load_mcp_server_configs(settings, plugins)
+    if mcp_server_configs and not bare:
+        mcp_servers.update(mcp_server_configs)
     tool_registry = create_default_tool_registry()
     tool_schemas = []
     for tool_schema in tool_registry.to_api_schema():
@@ -467,15 +538,11 @@ def _build_dry_run_preview(
 
     preview_prompt = prompt.strip() if prompt else None
     prompt_seed = preview_prompt
-    if append_system_prompt:
-        appended = append_system_prompt.strip()
-        if appended:
-            existing = settings.system_prompt or ""
-            settings = settings.model_copy(update={"system_prompt": f"{existing}\n\n{appended}".strip()})
     system_prompt_text = build_runtime_system_prompt(
         settings,
         cwd=resolved_cwd,
         latest_user_prompt=prompt_seed,
+        include_project_memory=not bare,
     )
 
     command_entries = []
@@ -2392,6 +2459,11 @@ def main(
     if dangerously_skip_permissions:
         permission_mode = "full_auto"
 
+    allowed_tool_names = _parse_tool_filter(allowed_tools)
+    denied_tool_names = _parse_tool_filter(disallowed_tools)
+    _validate_settings_source(settings_file)
+    runtime_mcp_configs = _load_cli_mcp_configs(mcp_config)
+
     # Apply --theme override to settings
     if theme:
         from openharness.config.settings import load_settings, save_settings
@@ -2422,6 +2494,11 @@ def main(
             api_key=api_key,
             api_format=api_format,
             permission_mode=permission_mode,
+            allowed_tools=allowed_tool_names,
+            denied_tools=denied_tool_names,
+            settings_source=settings_file,
+            mcp_server_configs=runtime_mcp_configs,
+            bare=bare,
             effort=effort,
         )
         effective_output_format = output_format or "text"
@@ -2460,6 +2537,12 @@ def main(
                 api_format=api_format,
                 permission_mode=permission_mode,
                 effort=effort,
+                append_system_prompt=append_system_prompt,
+                allowed_tools=allowed_tool_names,
+                denied_tools=denied_tool_names,
+                settings_source=settings_file,
+                mcp_server_configs=runtime_mcp_configs,
+                bare=bare,
             )
         )
         return
@@ -2518,6 +2601,11 @@ def main(
                 restore_messages=session_data.get("messages") if session_data else None,
                 restore_tool_metadata=session_data.get("tool_metadata") if session_data else None,
                 session_id=session_data.get("session_id") if session_data else None,
+                allowed_tools=allowed_tool_names,
+                denied_tools=denied_tool_names,
+                settings_source=settings_file,
+                mcp_server_configs=runtime_mcp_configs,
+                bare=bare,
             )
         )
         return
@@ -2577,7 +2665,15 @@ def main(
                 api_key=api_key,
                 restore_messages=session_data.get("messages"),
                 restore_tool_metadata=session_data.get("tool_metadata"),
+                session_id=session_data.get("session_id"),
+                append_system_prompt=append_system_prompt,
                 permission_mode=permission_mode,
+                allowed_tools=allowed_tool_names,
+                denied_tools=denied_tool_names,
+                settings_source=settings_file,
+                mcp_server_configs=runtime_mcp_configs,
+                bare=bare,
+                resume_session_id=session_data.get("session_id"),
                 api_format=api_format,
                 effort=effort,
             )
@@ -2596,6 +2692,12 @@ def main(
                 api_format=api_format,
                 permission_mode=permission_mode,
                 effort=effort,
+                append_system_prompt=append_system_prompt,
+                allowed_tools=allowed_tool_names,
+                denied_tools=denied_tool_names,
+                settings_source=settings_file,
+                mcp_server_configs=runtime_mcp_configs,
+                bare=bare,
             )
         )
         return
@@ -2613,5 +2715,11 @@ def main(
             api_format=api_format,
             permission_mode=permission_mode,
             effort=effort,
+            append_system_prompt=append_system_prompt,
+            allowed_tools=allowed_tool_names,
+            denied_tools=denied_tool_names,
+            settings_source=settings_file,
+            mcp_server_configs=runtime_mcp_configs,
+            bare=bare,
         )
     )
