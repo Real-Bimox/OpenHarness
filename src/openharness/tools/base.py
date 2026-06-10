@@ -62,10 +62,12 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, BaseTool] = {}
+        self._api_schema_cache: list[dict[str, Any]] | None = None
 
     def register(self, tool: BaseTool) -> None:
         """Register a tool instance."""
         self._tools[tool.name] = tool
+        self._api_schema_cache = None
 
     def get(self, name: str) -> BaseTool | None:
         """Return a registered tool by name."""
@@ -76,5 +78,12 @@ class ToolRegistry:
         return list(self._tools.values())
 
     def to_api_schema(self) -> list[dict[str, Any]]:
-        """Return all tool schemas in API format."""
-        return [tool.to_api_schema() for tool in self._tools.values()]
+        """Return all tool schemas in API format.
+
+        Schema generation runs pydantic ``model_json_schema()`` per tool,
+        which is otherwise repeated on every model turn; the registry only
+        changes via ``register()``, so cache until then.
+        """
+        if self._api_schema_cache is None:
+            self._api_schema_cache = [tool.to_api_schema() for tool in self._tools.values()]
+        return self._api_schema_cache

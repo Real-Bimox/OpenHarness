@@ -84,6 +84,7 @@ class ReactBackendHost:
         self._config = config
         self._bundle = None
         self._write_lock = asyncio.Lock()
+        self._last_snapshot_payloads: dict[str, str] = {}
         self._request_queue: asyncio.Queue[FrontendRequest] = asyncio.Queue()
         self._permission_requests: dict[str, asyncio.Future[bool]] = {}
         self._edit_approval_requests: dict[str, asyncio.Future[str]] = {}
@@ -343,8 +344,10 @@ class ReactBackendHost:
                         ),
                     )
                 )
-                await self._emit(BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))
-                await self._emit(self._status_snapshot())
+                # Tool-heavy turns complete many tools in a row; only ship
+                # snapshot frames when their content actually changed.
+                await self._emit_if_changed("tasks", BackendEvent.tasks_snapshot(get_task_manager().list_tasks()))
+                await self._emit_if_changed("status", self._status_snapshot())
                 # Emit todo_update when TodoWrite tool runs
                 if event.tool_name in ("TodoWrite", "todo_write"):
                     tool_input = self._last_tool_inputs.get(event.tool_name, {})
@@ -857,8 +860,19 @@ class ReactBackendHost:
 
     async def _emit(self, event: BackendEvent) -> None:
         log.debug("emit event: type=%s tool=%s", event.type, getattr(event, "tool_name", None))
+        await self._emit_serialized(event.model_dump_json())
+
+    async def _emit_if_changed(self, key: str, event: BackendEvent) -> None:
+        """Emit a snapshot-style event only when its payload changed."""
+        payload = event.model_dump_json()
+        if self._last_snapshot_payloads.get(key) == payload:
+            return
+        self._last_snapshot_payloads[key] = payload
+        await self._emit_serialized(payload)
+
+    async def _emit_serialized(self, serialized: str) -> None:
         async with self._write_lock:
-            payload = _PROTOCOL_PREFIX + event.model_dump_json() + "\n"
+            payload = _PROTOCOL_PREFIX + serialized + "\n"
             buffer = getattr(sys.stdout, "buffer", None)
             if buffer is not None:
                 buffer.write(payload.encode("utf-8"))

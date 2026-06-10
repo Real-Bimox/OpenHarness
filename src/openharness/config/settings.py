@@ -68,6 +68,8 @@ class MemorySettings(BaseModel):
     auto_compact_threshold_tokens: int | None = None
     auto_extract_enabled: bool = False
     auto_extract_max_records: int = 3
+    # Model for the background memory-extraction pass; empty = session model.
+    extract_model: str = ""
     session_memory_enabled: bool = True
     auto_dream_enabled: bool = False
     auto_dream_min_hours: float = 24.0
@@ -579,6 +581,9 @@ class Settings(BaseModel):
     active_profile: str = "claude-api"
     profiles: dict[str, ProviderProfile] = Field(default_factory=default_provider_profiles)
     max_turns: int = 200
+    # Idle seconds before a persistent --task-worker process exits and waits
+    # to be restarted by the task manager on the next message. <= 0 disables.
+    task_worker_idle_timeout_s: float = 600.0
 
     # Behavior
     system_prompt: str | None = None

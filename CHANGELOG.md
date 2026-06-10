@@ -4,6 +4,27 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
+## [0.1.13] - 2026-06-10
+
+### Added
+
+- Background task workers (`--task-worker`) are now persistent: one process serves all coordinator follow-ups until EOF, a terminating command, or the new `task_worker_idle_timeout_s` setting (default 600 s) elapses. The task manager injects a stable per-task session id (`OPENHARNESS_TASK_SESSION_ID`), and workers save/restore their conversation under it — crash or idle restarts resume with full context instead of an empty conversation.
+- New `memory.extract_model` setting routes the optional durable-memory extraction pass to a cheaper model than the session model.
+
+### Changed (performance)
+
+- Removed a fixed ~50 ms per-turn latency floor: the compaction progress loop now races the worker task instead of polling on a timeout.
+- Tool API schemas are cached on the registry and regenerate only when a tool is registered, instead of running pydantic schema generation for every tool on every model turn.
+- The per-turn autocompact token estimate is incremental (only newly appended messages are counted) instead of re-scanning and re-stringifying the entire history each turn.
+- Durable memory extraction runs as a background task (one in flight, skipped when the conversation has not grown) instead of delaying every turn's completion by a full model call; session-memory checkpoint writes moved off the event loop.
+- `CodexApiClient` reuses one HTTP connection pool and one decoded-JWT header set across turns instead of a TLS handshake and JWT decode per request, and closes the pool on shutdown.
+- The OpenAI-compatible client accumulates streamed text/reasoning/tool-call arguments in lists joined once, removing quadratic copying on large streamed arguments.
+- The Anthropic client closes the replaced connection pool on auth refresh instead of leaking it across token rotations.
+- Oversized tool-output artifact writes moved off the event loop so concurrent sibling tools and streaming are not stalled.
+- `compact_checkpoints` is capped at 10 entries and excluded from hook payloads, bounding hook subprocess environment size over long sessions.
+- Swarm mailbox `mark_read` targets messages by their filename-embedded id instead of parsing the whole archive under the write lock; auto-dream periodic scans read session ids from filenames instead of parsing every snapshot.
+- Coordinator drain wakes on task-manager completion listeners instead of 100 ms polling; swarm permission polling backs off 0.2 s → 2 s; the React backend host emits tasks/status snapshot frames only when their content changed.
+
 ## [0.1.10] - 2026-06-10
 
 ### Added

@@ -82,12 +82,12 @@ async def test_write_to_stopped_agent_task_restarts_process(tmp_path: Path, monk
 
     output = manager.read_task_output(task.id)
     assert "got:ready" in output
-    assert "[OpenHarness] Agent task restarted; prior interactive context was not preserved." in output
+    assert "[OpenHarness] Agent task restarted; conversation restored from its session snapshot." in output
     assert "got:follow-up" in output
     updated = manager.get_task(task.id)
     assert updated is not None
     assert updated.metadata["restart_count"] == "1"
-    assert updated.metadata["status_note"] == "Task restarted; prior interactive context was not preserved."
+    assert updated.metadata["status_note"] == "Task restarted; conversation restored from its session snapshot."
 
 
 @pytest.mark.asyncio
@@ -231,3 +231,25 @@ async def test_completion_listener_fires_when_task_finishes(tmp_path: Path, monk
     await asyncio.wait_for(done.wait(), timeout=5)
 
     assert seen == [(task.id, "completed", 0)]
+
+
+@pytest.mark.asyncio
+async def test_agent_task_process_receives_stable_session_id_env(tmp_path: Path, monkeypatch):
+    """Workers get a per-task session id so restarts can restore context (WS1)."""
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    manager = BackgroundTaskManager()
+
+    task = await manager.create_agent_task(
+        prompt="first",
+        description="agent",
+        cwd=tmp_path,
+        command='read line; echo "sid:$OPENHARNESS_TASK_SESSION_ID"',
+    )
+    await asyncio.wait_for(manager._waiters[task.id], timeout=5)  # type: ignore[attr-defined]
+    assert f"sid:task-{task.id}" in manager.read_task_output(task.id)
+
+    # The same id is injected again on restart.
+    await manager.write_to_task(task.id, "follow-up")
+    await asyncio.wait_for(manager._waiters[task.id], timeout=5)  # type: ignore[attr-defined]
+    output = manager.read_task_output(task.id)
+    assert output.count(f"sid:task-{task.id}") == 2

@@ -134,6 +134,7 @@ class AnthropicApiClient:
         self._auth_token_resolver = auth_token_resolver
         self._session_id = get_claude_code_session_id() if claude_oauth else ""
         self._client = self._create_client()
+        self._stale_close_tasks: set[asyncio.Task[None]] = set()
 
     def _create_client(self) -> AsyncAnthropic:
         kwargs: dict[str, Any] = {}
@@ -160,7 +161,20 @@ class AnthropicApiClient:
         next_token = self._auth_token_resolver()
         if next_token and next_token != self._auth_token:
             self._auth_token = next_token
+            previous = self._client
             self._client = self._create_client()
+            # Close the replaced client's connection pool instead of leaking
+            # it; fire-and-forget with a held reference so GC can't cancel it.
+            close = getattr(previous, "close", None)
+            if close is None:
+                return
+            try:
+                task = asyncio.get_running_loop().create_task(close())
+            except RuntimeError:
+                pass
+            else:
+                self._stale_close_tasks.add(task)
+                task.add_done_callback(self._stale_close_tasks.discard)
 
     async def stream_message(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Yield text deltas and the final assistant message with retry on transient errors."""

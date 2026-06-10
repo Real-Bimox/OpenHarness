@@ -332,9 +332,11 @@ class OpenAICompatibleClient:
             # that requires reasoning_content on every assistant message.
             params.pop("stream_options", None)
 
-        # Collect full response while streaming text deltas
-        collected_content = ""
-        collected_reasoning = ""
+        # Collect full response while streaming text deltas. Accumulate into
+        # lists and join once: dict/str `+=` re-copies the whole buffer per
+        # chunk, which goes quadratic on large tool arguments.
+        collected_content_parts: list[str] = []
+        collected_reasoning_parts: list[str] = []
         collected_tool_calls: dict[int, dict[str, Any]] = {}
         finish_reason: str | None = None
         usage_data: dict[str, int] = {}
@@ -361,14 +363,14 @@ class OpenAICompatibleClient:
             # Accumulate reasoning_content from thinking models (not shown to user)
             reasoning_piece = getattr(delta, "reasoning_content", None) or ""
             if reasoning_piece:
-                collected_reasoning += reasoning_piece
+                collected_reasoning_parts.append(reasoning_piece)
 
             # Stream text content to user, stripping inline <think> blocks
             if delta.content:
                 _think_buf += delta.content
                 visible, _think_buf = _strip_think_blocks(_think_buf)
                 if visible:
-                    collected_content += visible
+                    collected_content_parts.append(visible)
                     yield ApiTextDeltaEvent(text=visible)
 
             # Accumulate tool calls
@@ -379,7 +381,7 @@ class OpenAICompatibleClient:
                         collected_tool_calls[idx] = {
                             "id": tc_delta.id or "",
                             "name": "",
-                            "arguments": "",
+                            "argument_parts": [],
                         }
                     entry = collected_tool_calls[idx]
                     if tc_delta.id:
@@ -388,7 +390,7 @@ class OpenAICompatibleClient:
                         if tc_delta.function.name:
                             entry["name"] = tc_delta.function.name
                         if tc_delta.function.arguments:
-                            entry["arguments"] += tc_delta.function.arguments
+                            entry["argument_parts"].append(tc_delta.function.arguments)
 
             # Usage in chunk (if provider sends it)
             if chunk.usage:
@@ -398,6 +400,8 @@ class OpenAICompatibleClient:
                 }
 
         # Build the final ConversationMessage
+        collected_content = "".join(collected_content_parts)
+        collected_reasoning = "".join(collected_reasoning_parts)
         content: list[ContentBlock] = []
         if collected_content:
             content.append(TextBlock(text=collected_content))
@@ -408,7 +412,7 @@ class OpenAICompatibleClient:
             if not tc["name"]:
                 continue
             try:
-                args = json.loads(tc["arguments"])
+                args = json.loads("".join(tc["argument_parts"]))
             except (json.JSONDecodeError, TypeError):
                 args = {}
             content.append(ToolUseBlock(

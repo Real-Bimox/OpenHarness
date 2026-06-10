@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -58,6 +59,8 @@ class QueryEngine:
         self._settings = settings
         self._messages: list[ConversationMessage] = []
         self._cost_tracker = CostTracker()
+        self._extract_task: asyncio.Task[None] | None = None
+        self._extract_last_message_count = 0
 
     @property
     def messages(self) -> list[ConversationMessage]:
@@ -176,12 +179,36 @@ class QueryEngine:
             return
         from openharness.services.session_memory import update_session_memory_file
 
-        update_session_memory_file(
+        # The checkpoint write fsyncs; keep it off the event loop.
+        await asyncio.to_thread(
+            update_session_memory_file,
             self._cwd,
             list(self._messages),
             tool_metadata=self._tool_metadata,
             session_id=str(self._tool_metadata.get("session_id") or "default"),
         )
+
+    def _schedule_durable_memory_extraction(self) -> None:
+        """Run the optional extraction pass in the background.
+
+        Extraction is a full model call; it must not delay turn completion.
+        One extraction runs at a time, and only when the conversation grew
+        since the last attempt.
+        """
+        if self._settings is None or not self._settings.memory.auto_extract_enabled:
+            return
+        if not self._settings.memory.enabled:
+            return
+        if self._extract_task is not None and not self._extract_task.done():
+            return
+        if len(self._messages) <= self._extract_last_message_count:
+            return
+        self._extract_last_message_count = len(self._messages)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._extract_task = loop.create_task(self._extract_durable_memories())
 
     async def _extract_durable_memories(self) -> None:
         """Run the optional durable memory extraction pass."""
@@ -196,7 +223,7 @@ class QueryEngine:
             result = await extract_memories_from_turn(
                 cwd=self._cwd,
                 api_client=self._api_client,
-                model=self._model,
+                model=self._settings.memory.extract_model or self._model,
                 messages=list(self._messages),
                 max_records=self._settings.memory.auto_extract_max_records,
             )
@@ -274,7 +301,7 @@ class QueryEngine:
                 yield event
         finally:
             await self._update_session_memory()
-            await self._extract_durable_memories()
+            self._schedule_durable_memory_extraction()
             self._schedule_auto_dream()
 
     async def continue_pending(self, *, max_turns: int | None = None) -> AsyncIterator[StreamEvent]:
@@ -303,4 +330,4 @@ class QueryEngine:
                 self._cost_tracker.add(usage)
             yield event
         await self._update_session_memory()
-        await self._extract_durable_memories()
+        self._schedule_durable_memory_extraction()

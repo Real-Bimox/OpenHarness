@@ -114,6 +114,8 @@ def list_sessions_touched_since(
     resolved_session_dir = Path(session_dir) if session_dir is not None else get_project_session_dir(cwd)
     session_ids: list[str] = []
     seen: set[str] = set()
+    # The session ID is embedded in the filename; parsing each snapshot just
+    # to re-read it made this periodic scan O(total session bytes).
     for path in sorted(resolved_session_dir.glob("session-*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
         try:
             mtime = path.stat().st_mtime
@@ -122,13 +124,8 @@ def list_sessions_touched_since(
         if mtime <= since_ts:
             continue
         session_id = path.stem.removeprefix("session-")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            raw_id = payload.get("session_id")
-            if isinstance(raw_id, str) and raw_id.strip():
-                session_id = raw_id.strip()
-        except (OSError, json.JSONDecodeError):
-            pass
+        if not session_id:
+            continue
         if current_session_id and session_id == current_session_id:
             continue
         if session_id in seen:

@@ -18,7 +18,7 @@ from openharness.utils.fs import read_text_tail
 from openharness.utils.shell import create_shell_subprocess
 
 log = logging.getLogger(__name__)
-_TASK_RESTART_NOTICE = "[OpenHarness] Agent task restarted; prior interactive context was not preserved.\n"
+_TASK_RESTART_NOTICE = "[OpenHarness] Agent task restarted; conversation restored from its session snapshot.\n"
 
 
 def _encode_task_worker_payload(data: str) -> bytes:
@@ -300,6 +300,13 @@ class BackgroundTaskManager:
             merged_env = {**os.environ, **task.env}
         else:
             merged_env = None
+        if task.type in {"local_agent", "remote_agent", "in_process_teammate"}:
+            # Stable per-task session id: the worker saves its conversation
+            # under this id and restores it after idle-exit or crash restarts.
+            merged_env = {
+                **(merged_env or os.environ),
+                "OPENHARNESS_TASK_SESSION_ID": f"task-{task.id}",
+            }
 
         if task.argv is not None:
             # Direct-exec route. No shell. Used for teammate spawn so we
@@ -351,7 +358,7 @@ class BackgroundTaskManager:
 
         restart_count = int(task.metadata.get("restart_count", "0")) + 1
         task.metadata["restart_count"] = str(restart_count)
-        task.metadata["status_note"] = "Task restarted; prior interactive context was not preserved."
+        task.metadata["status_note"] = "Task restarted; conversation restored from its session snapshot."
         task.status = "running"
         task.started_at = time.time()
         task.ended_at = None

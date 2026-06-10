@@ -201,10 +201,24 @@ class TeammateMailbox:
 
         def _mark_read() -> bool:
             with exclusive_file_lock(lock_path):
-                for path in list(inbox.glob("*.json")) + list(read_dir.glob("*.json")):
-                    # Skip lock files and temp files
-                    if path.name.startswith(".") or path.name.endswith(".tmp"):
-                        continue
+                # The message id is embedded in the filename
+                # (``<timestamp>_<id>.json``), so target it directly instead
+                # of parsing every archived message under the lock.
+                candidates = [
+                    path
+                    for root in (inbox, read_dir)
+                    for path in root.glob(f"*_{message_id}.json")
+                    if not path.name.startswith(".")
+                ]
+                # Legacy fallback for files not following the naming scheme.
+                if not candidates:
+                    candidates = [
+                        path
+                        for root in (inbox, read_dir)
+                        for path in root.glob("*.json")
+                        if not path.name.startswith(".") and not path.name.endswith(".tmp")
+                    ]
+                for path in candidates:
                     try:
                         data = json.loads(path.read_text(encoding="utf-8"))
                     except (json.JSONDecodeError, OSError):
