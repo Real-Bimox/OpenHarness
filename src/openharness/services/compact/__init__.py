@@ -66,6 +66,7 @@ CONTEXT_COLLAPSE_HEAD_CHARS = 900
 CONTEXT_COLLAPSE_TAIL_CHARS = 500
 MAX_COMPACT_ATTACHMENTS = 6
 MAX_DISCOVERED_TOOLS = 12
+MAX_COMPACT_CHECKPOINTS = 10
 
 # Microcompact defaults
 DEFAULT_KEEP_RECENT = 5
@@ -113,22 +114,52 @@ class CompactionResult:
 # Token estimation
 # ---------------------------------------------------------------------------
 
+def _estimate_single_message_raw(msg: ConversationMessage, image_token_estimate: int) -> int:
+    total = 0
+    for block in msg.content:
+        if isinstance(block, TextBlock):
+            total += estimate_tokens(block.text)
+        elif isinstance(block, ToolResultBlock):
+            total += estimate_tokens(block.content)
+        elif isinstance(block, ToolUseBlock):
+            total += estimate_tokens(block.name)
+            total += estimate_tokens(str(block.input))
+        elif isinstance(block, ImageBlock):
+            total += image_token_estimate
+    return total
+
+
 def estimate_message_tokens(messages: list[ConversationMessage]) -> int:
     """Estimate total tokens for a conversation, including the 4/3 padding."""
-    total = 0
     image_token_estimate = _vision_token_budget_per_image()
-    for msg in messages:
-        for block in msg.content:
-            if isinstance(block, TextBlock):
-                total += estimate_tokens(block.text)
-            elif isinstance(block, ToolResultBlock):
-                total += estimate_tokens(block.content)
-            elif isinstance(block, ToolUseBlock):
-                total += estimate_tokens(block.name)
-                total += estimate_tokens(str(block.input))
-            elif isinstance(block, ImageBlock):
-                total += image_token_estimate
+    total = sum(_estimate_single_message_raw(msg, image_token_estimate) for msg in messages)
     return int(total * TOKEN_ESTIMATION_PADDING)
+
+
+def estimate_message_tokens_cached(
+    messages: list[ConversationMessage],
+    state: "AutoCompactState",
+) -> int:
+    """Incremental estimate for the per-turn autocompact check.
+
+    Conversations are append-only between compactions, so only newly appended
+    messages need counting; a changed prefix (compaction, restore) triggers a
+    full recount. Avoids re-stringifying every historical tool input per turn.
+    """
+    image_token_estimate = _vision_token_budget_per_image()
+    ids = [id(msg) for msg in messages]
+    cached_n = len(state.token_cache_ids)
+    if cached_n <= len(ids) and ids[:cached_n] == state.token_cache_ids:
+        raw = state.token_cache_raw_total
+        start = cached_n
+    else:
+        raw = 0
+        start = 0
+    for msg in messages[start:]:
+        raw += _estimate_single_message_raw(msg, image_token_estimate)
+    state.token_cache_ids = ids
+    state.token_cache_raw_total = raw
+    return int(raw * TOKEN_ESTIMATION_PADDING)
 
 
 def estimate_conversation_tokens(messages: list[ConversationMessage]) -> int:
@@ -208,8 +239,23 @@ def _record_compact_checkpoint(
         checkpoints = carryover_metadata.setdefault("compact_checkpoints", [])
         if isinstance(checkpoints, list):
             checkpoints.append(payload)
+            # Bound the bucket: it is persisted in snapshots and serialized
+            # into hook payloads, so it must not grow for the session's life.
+            if len(checkpoints) > MAX_COMPACT_CHECKPOINTS:
+                del checkpoints[:-MAX_COMPACT_CHECKPOINTS]
         carryover_metadata["compact_last"] = payload
     return payload
+
+
+def _hook_safe_carryover(carryover_metadata: dict[str, Any] | None) -> dict[str, Any]:
+    """Carryover view for hook payloads, excluding the bulky checkpoint log.
+
+    Hook executors serialize the payload into a subprocess environment
+    variable; ``compact_last`` keeps the latest checkpoint available there.
+    """
+    if not carryover_metadata:
+        return {}
+    return {key: value for key, value in carryover_metadata.items() if key != "compact_checkpoints"}
 
 
 async def _emit_progress(
@@ -1056,6 +1102,9 @@ class AutoCompactState:
     turn_counter: int = 0
     turn_id: str = ""
     consecutive_failures: int = 0
+    # Incremental token-estimation cache (see estimate_message_tokens_cached).
+    token_cache_ids: list[int] = field(default_factory=list)
+    token_cache_raw_total: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1103,7 +1152,7 @@ def should_autocompact(
     """Return True when the conversation should be auto-compacted."""
     if state.consecutive_failures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES:
         return False
-    token_count = estimate_message_tokens(messages)
+    token_count = estimate_message_tokens_cached(messages, state)
     threshold = get_autocompact_threshold(
         model,
         context_window_tokens=context_window_tokens,
@@ -1183,7 +1232,7 @@ async def compact_conversation(
         "preserve_recent": preserve_recent,
         "attachments": attachment_paths,
         "discovered_tools": discovered_tools,
-        **(carryover_metadata or {}),
+        **_hook_safe_carryover(carryover_metadata),
     }
     start_checkpoint = _record_compact_checkpoint(
         carryover_metadata,
@@ -1393,7 +1442,7 @@ async def compact_conversation(
                 "post_compact_tokens": initial_post_compact_tokens,
                 "attachments": attachment_paths,
                 "discovered_tools": discovered_tools,
-                **(carryover_metadata or {}),
+                **_hook_safe_carryover(carryover_metadata),
             },
         )
         hook_note = post_hook_result.reason or "\n".join(

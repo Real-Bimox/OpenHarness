@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -683,14 +684,20 @@ async def run_query(
                 auto_compact_threshold_tokens=context.auto_compact_threshold_tokens,
             )
         )
-        while True:
-            try:
-                event = await asyncio.wait_for(progress_queue.get(), timeout=0.05)
-                yield event, None
-            except asyncio.TimeoutError:
-                if task.done():
-                    break
-                continue
+        # Race the worker task against the progress queue so the common
+        # no-compaction path completes immediately instead of paying a fixed
+        # poll timeout on every turn.
+        while not task.done():
+            getter = asyncio.ensure_future(progress_queue.get())
+            done, _ = await asyncio.wait(
+                {task, getter}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if getter in done:
+                yield getter.result(), None
+            else:
+                getter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await getter
         while not progress_queue.empty():
             yield progress_queue.get_nowait(), None
         last_compaction_result = await task
@@ -982,7 +989,10 @@ async def _execute_tool_call(
     elapsed = time.monotonic() - t0
     log.debug("executed %s in %.2fs err=%s output_len=%d",
               tool_name, elapsed, result.is_error, len(result.output or ""))
-    inline_output, artifact_path = _offload_tool_output_if_needed(
+    # Artifact offload writes multi-MB outputs to disk; keep it off the event
+    # loop so concurrently gathered sibling tools and streaming are not stalled.
+    inline_output, artifact_path = await asyncio.to_thread(
+        _offload_tool_output_if_needed,
         tool_name=tool_name,
         tool_use_id=tool_use_id,
         output=result.output,
