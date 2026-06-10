@@ -4,7 +4,7 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
-## [Unreleased]
+## [0.1.13] - 2026-06-10
 
 ### Added
 
