@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
@@ -610,6 +611,32 @@ def _format_pending_tool_results(messages: list[ConversationMessage]) -> str | N
     return "\n".join(lines)
 
 
+# auth_status() can hit the OS keyring (a D-Bus roundtrip on Linux) or even
+# refresh an OAuth token over the network; that must not run on every
+# submitted line. A short TTL keeps the status chip honest after external
+# logins; profile-identity changes refresh immediately via the key.
+_AUTH_STATUS_TTL_SECONDS = 30.0
+_AUTH_STATUS_CACHE: dict[tuple[str, str, str, bool], tuple[float, str]] = {}
+
+
+def _cached_auth_status(settings) -> str:
+    key = (
+        settings.active_profile or "",
+        settings.api_format or "",
+        settings.base_url or "",
+        bool(settings.api_key),
+    )
+    now = time.monotonic()
+    hit = _AUTH_STATUS_CACHE.get(key)
+    if hit is not None and now - hit[0] < _AUTH_STATUS_TTL_SECONDS:
+        return hit[1]
+    value = auth_status(settings)
+    if len(_AUTH_STATUS_CACHE) > 16:
+        _AUTH_STATUS_CACHE.clear()
+    _AUTH_STATUS_CACHE[key] = (now, value)
+    return value
+
+
 def sync_app_state(bundle: RuntimeBundle) -> None:
     """Refresh UI state from current settings and dynamic keybindings."""
     settings = bundle.current_settings()
@@ -622,7 +649,7 @@ def sync_app_state(bundle: RuntimeBundle) -> None:
         theme=settings.theme,
         cwd=bundle.cwd,
         provider=provider.name,
-        auth_status=auth_status(settings),
+        auth_status=_cached_auth_status(settings),
         base_url=settings.base_url or "",
         vim_enabled=settings.vim_mode,
         voice_enabled=settings.voice_mode,
@@ -641,6 +668,9 @@ def sync_app_state(bundle: RuntimeBundle) -> None:
 
 def refresh_runtime_client(bundle: RuntimeBundle) -> None:
     """Refresh the active runtime client after provider/auth/profile changes."""
+    # Auth state likely just changed; drop the TTL cache so the status chip
+    # reflects the new provider immediately.
+    _AUTH_STATUS_CACHE.clear()
     settings = bundle.current_settings()
     if not bundle.external_api_client:
         bundle.api_client = _resolve_api_client_from_settings(settings)

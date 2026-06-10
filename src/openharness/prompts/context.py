@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from functools import partial
 from pathlib import Path
 from typing import Iterable
 
@@ -99,6 +101,36 @@ def _build_permission_mode_section(settings: Settings) -> str:
     return f"# Current Permission Mode\n{guidance}"
 
 
+def _record_memory_usage(cwd: str | Path, headers: list) -> None:
+    """Record memory recall without blocking the prompt build.
+
+    The usage write takes a file lock and fsyncs; when an event loop is
+    running, push it to the executor instead of stalling the line.
+    """
+    if not headers:
+        return
+    write = partial(mark_memory_used, cwd, headers, memory_dir=headers[0].path.parent)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            write()
+        except OSError:
+            pass
+        return
+    loop.run_in_executor(None, _swallow_oserror(write))
+
+
+def _swallow_oserror(func):
+    def _run() -> None:
+        try:
+            func()
+        except OSError:
+            pass
+
+    return _run
+
+
 def build_runtime_system_prompt(
     settings: Settings,
     *,
@@ -177,11 +209,8 @@ def build_runtime_system_prompt(
                 max_results=settings.memory.max_files,
             )
             if relevant:
-                try:
-                    headers = [item.header for item in relevant]
-                    mark_memory_used(cwd, headers, memory_dir=headers[0].path.parent)
-                except OSError:
-                    pass
+                headers = [item.header for item in relevant]
+                _record_memory_usage(cwd, headers)
                 sections.append(format_relevant_memories(relevant))
 
     return "\n\n".join(section for section in sections if section.strip())

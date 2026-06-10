@@ -9,7 +9,7 @@ from pathlib import Path
 from openharness.memory.scan import scan_memory_files
 from openharness.memory.schema import parse_datetime, utc_now
 from openharness.memory.types import MemoryHeader
-from openharness.memory.usage import get_memory_usage
+from openharness.memory.usage import _normalize_usage_record, load_usage_index
 
 
 def find_relevant_memories(
@@ -28,6 +28,8 @@ def find_relevant_memories(
         return []
 
     scored: list[tuple[float, MemoryHeader]] = []
+    # One usage-index parse per memory directory, not per memory file.
+    usage_indexes: dict[Path, dict] = {}
     for header in scan_memory_files(cwd, max_files=100):
         meta = f"{header.title} {header.description}".lower()
         body = header.body_preview.lower()
@@ -35,7 +37,12 @@ def find_relevant_memories(
         # Metadata matches are weighted 2x; body matches 1x.
         meta_hits = sum(1 for t in tokens if t in meta)
         body_hits = sum(1 for t in tokens if t in body)
-        usage = get_memory_usage(cwd, header.id, memory_dir=header.path.parent)
+        memory_dir = header.path.parent
+        index = usage_indexes.get(memory_dir)
+        if index is None:
+            index = load_usage_index(cwd, memory_dir=memory_dir)
+            usage_indexes[memory_dir] = index
+        usage = _normalize_usage_record(index["memories"].get(header.id, {}))
         score = (
             meta_hits * 2.0
             + body_hits
