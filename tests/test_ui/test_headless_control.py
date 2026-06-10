@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import asyncio
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -46,6 +48,48 @@ class SequenceApiClient:
 
 def _json_lines(output: str) -> list[dict]:
     return [json.loads(line) for line in output.splitlines() if line.strip()]
+
+
+def test_headless_cli_consumes_piped_stdin(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "openharness",
+            "--headless",
+            "--bare",
+            "--cwd",
+            str(workspace),
+        ],
+        input=(
+            '{"type":"status","request_id":"status-1"}\n'
+            '{"type":"list_sessions","request_id":"sessions-1"}\n'
+            '{"type":"shutdown","request_id":"shutdown-1"}\n'
+        ),
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = _json_lines(result.stdout)
+    assert events[0]["type"] == "process_ready"
+    assert any(
+        event["type"] == "state_snapshot" and event.get("request_id") == "status-1"
+        for event in events
+    )
+    assert any(
+        event["type"] == "sessions" and event.get("request_id") == "sessions-1"
+        for event in events
+    )
+    assert events[-1]["type"] == "shutdown"
+    assert events[-1]["request_id"] == "shutdown-1"
 
 
 @pytest.mark.asyncio

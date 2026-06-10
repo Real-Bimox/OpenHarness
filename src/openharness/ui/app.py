@@ -546,6 +546,15 @@ async def run_headless_control(
     input_stream = input_stream or sys.stdin
     output_stream = output_stream or sys.stdout
     bundle = None
+    stdin_reader: asyncio.StreamReader | None = None
+    if input_stream is sys.stdin:
+        try:
+            stdin_reader = asyncio.StreamReader()
+            protocol = asyncio.StreamReaderProtocol(stdin_reader)
+            loop = asyncio.get_running_loop()
+            await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+        except (AttributeError, NotImplementedError, OSError, ValueError):
+            stdin_reader = None
     request_queue: asyncio.Queue[HeadlessRequest] = asyncio.Queue()
     write_lock = asyncio.Lock()
     current_request_id: str | None = None
@@ -785,7 +794,11 @@ async def run_headless_control(
         nonlocal force_shutdown
         while True:
             try:
-                raw = await asyncio.to_thread(input_stream.readline)
+                if stdin_reader is not None:
+                    raw_bytes = await stdin_reader.readline()
+                    raw = raw_bytes.decode("utf-8", errors="replace")
+                else:
+                    raw = await asyncio.to_thread(input_stream.readline)
             except Exception as exc:
                 with contextlib.suppress(Exception):
                     await _error(f"stdin read failed: {exc}", recoverable=False)
