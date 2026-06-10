@@ -312,9 +312,9 @@ class OhmoSessionRuntimePool:
             if command_context is None:
                 command_context = CommandContext(
                     engine=bundle.engine,
-                    hooks_summary=getattr(bundle, "hook_summary", lambda: "")(),
-                    mcp_summary=getattr(bundle, "mcp_summary", lambda: "")(),
-                    plugin_summary=getattr(bundle, "plugin_summary", lambda: "")(),
+                    hooks_summary=getattr(bundle, "hook_summary", lambda: ""),
+                    mcp_summary=getattr(bundle, "mcp_summary", lambda: ""),
+                    plugin_summary=getattr(bundle, "plugin_summary", lambda: ""),
                     cwd=getattr(bundle, "cwd", str(self._cwd)),
                     tool_registry=getattr(bundle, "tool_registry", None),
                     app_state=getattr(bundle, "app_state", None),

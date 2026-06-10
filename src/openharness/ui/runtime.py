@@ -22,7 +22,7 @@ from openharness.commands import (
     create_default_command_registry,
     lookup_skill_slash_command,
 )
-from openharness.config import get_config_file_path, load_settings_from_source
+from openharness.config import load_settings_from_source
 from openharness.engine import QueryEngine
 from openharness.engine.messages import (
     ConversationMessage,
@@ -33,7 +33,6 @@ from openharness.engine.messages import (
 from openharness.engine.query import MaxTurnsExceeded
 from openharness.engine.stream_events import StreamEvent
 from openharness.hooks import HookEvent, HookExecutionContext, HookExecutor, HookRegistry, load_hook_registry
-from openharness.hooks.hot_reload import HookReloader
 from openharness.mcp.client import McpClientManager
 from openharness.mcp.config import load_mcp_server_configs
 from openharness.permissions import PermissionChecker
@@ -380,15 +379,11 @@ async def build_runtime(
             keybindings=load_keybindings(),
         )
     )
-    hook_reloader = None if (bare or settings_source is not None) else HookReloader(get_config_file_path())
+    # Hooks always load from the (cached) settings + plugins so plugin hooks
+    # are present from the first turn; the per-line refresh in handle_line
+    # keeps hot-reload semantics now that its inputs are stat-cached.
     hook_executor = HookExecutor(
-        HookRegistry()
-        if bare
-        else load_hook_registry(settings, plugins)
-        if settings_source is not None
-        else hook_reloader.current_registry()
-        if api_client is None
-        else load_hook_registry(settings, plugins),
+        HookRegistry() if bare else load_hook_registry(settings, plugins),
         HookExecutionContext(
             cwd=Path(cwd).resolve(),
             api_client=resolved_api_client,
@@ -689,9 +684,11 @@ async def handle_line(
 
     command_context = CommandContext(
         engine=bundle.engine,
-        hooks_summary=bundle.hook_summary(),
-        mcp_summary=bundle.mcp_summary(),
-        plugin_summary=bundle.plugin_summary(),
+        # Bound methods, not values: plain prompts never pay for summary
+        # assembly; only commands that read a summary compute it.
+        hooks_summary=bundle.hook_summary,
+        mcp_summary=bundle.mcp_summary,
+        plugin_summary=bundle.plugin_summary,
         cwd=bundle.cwd,
         tool_registry=bundle.tool_registry,
         app_state=bundle.app_state,
