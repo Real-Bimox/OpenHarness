@@ -61,6 +61,7 @@ class QueryEngine:
         self._cost_tracker = CostTracker()
         self._extract_task: asyncio.Task[None] | None = None
         self._extract_last_message_count = 0
+        self._system_prompt_stable_chars: int | None = None
 
     @property
     def messages(self) -> list[ConversationMessage]:
@@ -102,9 +103,14 @@ class QueryEngine:
         self._messages.clear()
         self._cost_tracker = CostTracker()
 
-    def set_system_prompt(self, prompt: str) -> None:
-        """Update the active system prompt for future turns."""
+    def set_system_prompt(self, prompt: str, *, cache_stable_chars: int | None = None) -> None:
+        """Update the active system prompt for future turns.
+
+        ``cache_stable_chars`` marks the end of the prefix that is stable
+        between turns, used to place a provider prompt-cache breakpoint.
+        """
         self._system_prompt = prompt
+        self._system_prompt_stable_chars = cache_stable_chars
 
     def set_model(self, model: str) -> None:
         """Update the active model for future turns."""
@@ -278,6 +284,7 @@ class QueryEngine:
             cwd=self._cwd,
             model=self._model,
             system_prompt=self._system_prompt,
+            system_prompt_stable_chars=self._system_prompt_stable_chars,
             max_tokens=self._max_tokens,
             effort=self._effort,
             context_window_tokens=self._context_window_tokens,
@@ -315,6 +322,7 @@ class QueryEngine:
             cwd=self._cwd,
             model=self._model,
             system_prompt=self._system_prompt,
+            system_prompt_stable_chars=self._system_prompt_stable_chars,
             max_tokens=self._max_tokens,
             effort=self._effort,
             context_window_tokens=self._context_window_tokens,

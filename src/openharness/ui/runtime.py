@@ -39,7 +39,7 @@ from openharness.mcp.client import McpClientManager
 from openharness.mcp.config import load_mcp_server_configs
 from openharness.permissions import PermissionChecker
 from openharness.plugins import load_plugins
-from openharness.prompts import build_runtime_system_prompt
+from openharness.prompts import build_runtime_system_prompt_with_cache_boundary
 from openharness.state import AppState, AppStateStore
 from openharness.services.session_backend import DEFAULT_SESSION_BACKEND, SessionBackend
 from openharness.tools import ToolRegistry, create_default_tool_registry
@@ -270,6 +270,7 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             base_url=settings.base_url,
             claude_oauth=True,
             auth_token_resolver=lambda: settings.resolve_auth().value,
+            prompt_caching=settings.prompt_caching_enabled,
         )
     if settings.api_format in ("openai", "openai_compat"):
         auth = _safe_resolve_auth()
@@ -282,6 +283,7 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
     return AnthropicApiClient(
         api_key=auth.value,
         base_url=settings.base_url,
+        prompt_caching=settings.prompt_caching_enabled,
     )
 
 
@@ -432,7 +434,7 @@ async def build_runtime(
         ),
     )
     engine_max_turns = settings.max_turns if (enforce_max_turns or max_turns is not None) else None
-    system_prompt_text = build_runtime_system_prompt(
+    system_prompt_text, system_prompt_boundary = build_runtime_system_prompt_with_cache_boundary(
         settings,
         cwd=cwd,
         latest_user_prompt=prompt,
@@ -495,6 +497,7 @@ async def build_runtime(
             **restored_metadata,
         },
     )
+    engine.set_system_prompt(system_prompt_text, cache_stable_chars=system_prompt_boundary)
     if autodream_context is not None:
         engine.tool_metadata["autodream_context"] = autodream_context
     # Restore messages from a saved session if provided
@@ -722,7 +725,7 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
     bundle.engine.set_model(settings.model)
     bundle.engine.set_effort(settings.effort)
     bundle.engine.set_permission_checker(PermissionChecker(settings.permission))
-    system_prompt = build_runtime_system_prompt(
+    system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
         settings,
         cwd=bundle.cwd,
         latest_user_prompt=_last_user_text(bundle.engine.messages),
@@ -730,7 +733,7 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
         extra_plugin_roots=bundle.extra_plugin_roots,
         include_project_memory=bundle.include_project_memory,
     )
-    bundle.engine.set_system_prompt(system_prompt)
+    bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
     sync_app_state(bundle)
 
 
@@ -782,7 +785,7 @@ async def handle_line(
                 bundle.engine.set_model(result.submit_model)
             settings = bundle.current_settings()
             submit_prompt = result.submit_prompt
-            system_prompt = build_runtime_system_prompt(
+            system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
                 settings,
                 cwd=bundle.cwd,
                 latest_user_prompt=submit_prompt,
@@ -790,7 +793,7 @@ async def handle_line(
                 extra_plugin_roots=bundle.extra_plugin_roots,
                 include_project_memory=bundle.include_project_memory,
             )
-            bundle.engine.set_system_prompt(system_prompt)
+            bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
             try:
                 async for event in bundle.engine.submit_message(submit_prompt):
                     await render_event(event)
@@ -811,7 +814,7 @@ async def handle_line(
             settings = bundle.current_settings()
             if bundle.enforce_max_turns:
                 bundle.engine.set_max_turns(settings.max_turns)
-            system_prompt = build_runtime_system_prompt(
+            system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
                 settings,
                 cwd=bundle.cwd,
                 latest_user_prompt=_last_user_text(bundle.engine.messages),
@@ -819,7 +822,7 @@ async def handle_line(
                 extra_plugin_roots=bundle.extra_plugin_roots,
                 include_project_memory=bundle.include_project_memory,
             )
-            bundle.engine.set_system_prompt(system_prompt)
+            bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
             try:
                 async for event in bundle.engine.continue_pending(max_turns=turns):
@@ -837,7 +840,7 @@ async def handle_line(
     if bundle.enforce_max_turns:
         bundle.engine.set_max_turns(settings.max_turns)
     latest_user_prompt = line or (user_message.text if user_message is not None else "")
-    system_prompt = build_runtime_system_prompt(
+    system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
         settings,
         cwd=bundle.cwd,
         latest_user_prompt=latest_user_prompt,
@@ -845,7 +848,7 @@ async def handle_line(
         extra_plugin_roots=bundle.extra_plugin_roots,
         include_project_memory=bundle.include_project_memory,
     )
-    bundle.engine.set_system_prompt(system_prompt)
+    bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
     try:
         async for event in bundle.engine.submit_message(user_message or line):
             await render_event(event)

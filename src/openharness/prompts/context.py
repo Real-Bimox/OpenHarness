@@ -157,6 +157,32 @@ def build_runtime_system_prompt(
     include_project_memory: bool = True,
 ) -> str:
     """Build the runtime system prompt with project instructions and memory."""
+    prompt, _ = build_runtime_system_prompt_with_cache_boundary(
+        settings,
+        cwd=cwd,
+        latest_user_prompt=latest_user_prompt,
+        extra_skill_dirs=extra_skill_dirs,
+        extra_plugin_roots=extra_plugin_roots,
+        include_project_memory=include_project_memory,
+    )
+    return prompt
+
+
+def build_runtime_system_prompt_with_cache_boundary(
+    settings: Settings,
+    *,
+    cwd: str | Path,
+    latest_user_prompt: str | None = None,
+    extra_skill_dirs: Iterable[str | Path] | None = None,
+    extra_plugin_roots: Iterable[str | Path] | None = None,
+    include_project_memory: bool = True,
+) -> tuple[str, int]:
+    """Build the runtime system prompt and its cache-stable prefix length.
+
+    Everything except the per-line relevant-memories section is stable
+    between lines; the returned boundary lets the API client place a prompt
+    cache breakpoint at the end of the stable prefix.
+    """
     if is_coordinator_mode():
         sections = [get_coordinator_system_prompt()]
     else:
@@ -209,6 +235,7 @@ def build_runtime_system_prompt(
             if content:
                 sections.append(f"# {title}\n\n```md\n{content[:12000]}\n```")
 
+    relevant_section: str | None = None
     if include_project_memory and settings.memory.enabled:
         memory_section = load_memory_prompt(
             cwd,
@@ -227,6 +254,9 @@ def build_runtime_system_prompt(
             if relevant:
                 headers = [item.header for item in relevant]
                 _record_memory_usage(cwd, headers)
-                sections.append(format_relevant_memories(relevant))
+                relevant_section = format_relevant_memories(relevant)
 
-    return "\n\n".join(section for section in sections if section.strip())
+    stable = "\n\n".join(section for section in sections if section.strip())
+    if relevant_section and relevant_section.strip():
+        return f"{stable}\n\n{relevant_section}", len(stable)
+    return stable, len(stable)

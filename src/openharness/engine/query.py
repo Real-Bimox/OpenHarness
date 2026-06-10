@@ -154,6 +154,7 @@ class QueryContext:
     max_turns: int | None = 200
     hook_executor: HookExecutor | None = None
     tool_metadata: dict[str, object] | None = None
+    system_prompt_stable_chars: int | None = None
 
 
 def _append_capped_unique(bucket: list[Any], value: Any, *, limit: int) -> None:
@@ -737,6 +738,7 @@ async def run_query(
                     model=context.model,
                     messages=messages,
                     system_prompt=context.system_prompt,
+                    system_cache_stable_chars=context.system_prompt_stable_chars,
                     max_tokens=effective_max_tokens,
                     tools=context.tool_registry.to_api_schema(),
                     effort=context.effort,

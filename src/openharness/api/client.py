@@ -46,6 +46,10 @@ class ApiMessageRequest:
     max_tokens: int = 4096
     tools: list[dict[str, Any]] = field(default_factory=list)
     effort: str | None = None
+    # Length of the stable system-prompt prefix in characters. Content after
+    # this offset (e.g. per-line relevant-memories) changes between turns and
+    # must stay outside the provider's prompt cache.
+    system_cache_stable_chars: int | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +130,7 @@ class AnthropicApiClient:
         base_url: str | None = None,
         claude_oauth: bool = False,
         auth_token_resolver: Callable[[], str] | None = None,
+        prompt_caching: bool = True,
     ) -> None:
         self._api_key = api_key
         self._auth_token = auth_token
@@ -133,6 +138,7 @@ class AnthropicApiClient:
         self._claude_oauth = claude_oauth
         self._auth_token_resolver = auth_token_resolver
         self._session_id = get_claude_code_session_id() if claude_oauth else ""
+        self._prompt_caching = prompt_caching
         self._client = self._create_client()
         self._stale_close_tasks: set[asyncio.Task[None]] = set()
 
@@ -214,6 +220,62 @@ class AnthropicApiClient:
                 raise _translate_api_error(last_error) from last_error
             raise RequestFailure(str(last_error)) from last_error
 
+    def _system_param(self, request: ApiMessageRequest) -> str | list[dict[str, Any]] | None:
+        """Build the system parameter, with a cache breakpoint when enabled.
+
+        Block layout: [attribution (OAuth only)][stable prefix + cache_control]
+        [dynamic tail]. The stable prefix is everything before
+        ``system_cache_stable_chars``; per-line content after it stays out of
+        the provider cache so it cannot invalidate the prefix.
+        """
+        system = request.system_prompt or ""
+        attribution = claude_attribution_header() if self._claude_oauth else ""
+        if not self._prompt_caching:
+            if attribution:
+                return f"{attribution}\n{system}" if system else attribution
+            return system or None
+
+        blocks: list[dict[str, Any]] = []
+        if attribution:
+            blocks.append({"type": "text", "text": attribution})
+        boundary = request.system_cache_stable_chars
+        stable = system if boundary is None else system[:boundary]
+        tail = "" if boundary is None else system[boundary:]
+        if stable:
+            blocks.append(
+                {"type": "text", "text": stable, "cache_control": {"type": "ephemeral"}}
+            )
+        if tail:
+            blocks.append({"type": "text", "text": tail})
+        return blocks or None
+
+    @staticmethod
+    def _tools_with_cache_marker(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mark the last tool so the whole tool array becomes a cache prefix.
+
+        The registry's schema list is shared and cached; only the last entry
+        is copied for the marker.
+        """
+        marked = list(tools)
+        marked[-1] = {**marked[-1], "cache_control": {"type": "ephemeral"}}
+        return marked
+
+    @staticmethod
+    def _mark_history_prefix(messages: list[dict[str, Any]]) -> None:
+        """Set a cache breakpoint on the last block of the previous turn.
+
+        Everything up to and including the prior turn is a stable prefix;
+        only the newest message changes between requests.
+        """
+        if len(messages) < 2:
+            return
+        content = messages[-2].get("content")
+        if not isinstance(content, list) or not content:
+            return
+        last_block = content[-1]
+        if isinstance(last_block, dict) and last_block.get("type") in {"text", "tool_result"}:
+            content[-1] = {**last_block, "cache_control": {"type": "ephemeral"}}
+
     async def _stream_once(self, request: ApiMessageRequest) -> AsyncIterator[ApiStreamEvent]:
         """Single attempt at streaming a message."""
         params: dict[str, Any] = {
@@ -221,17 +283,17 @@ class AnthropicApiClient:
             "messages": [message.to_api_param() for message in request.messages],
             "max_tokens": request.max_tokens,
         }
-        if request.system_prompt:
-            params["system"] = request.system_prompt
-        if self._claude_oauth:
-            attribution = claude_attribution_header()
-            params["system"] = (
-                f"{attribution}\n{params['system']}"
-                if params.get("system")
-                else attribution
-            )
+        system_param = self._system_param(request)
+        if system_param:
+            params["system"] = system_param
         if request.tools:
-            params["tools"] = request.tools
+            params["tools"] = (
+                self._tools_with_cache_marker(request.tools)
+                if self._prompt_caching
+                else request.tools
+            )
+        if self._prompt_caching:
+            self._mark_history_prefix(params["messages"])
         if self._claude_oauth:
             params["betas"] = claude_oauth_betas()
             params["metadata"] = {
@@ -271,6 +333,12 @@ class AnthropicApiClient:
             usage=UsageSnapshot(
                 input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
                 output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                cache_creation_input_tokens=int(
+                    getattr(usage, "cache_creation_input_tokens", 0) or 0
+                ),
+                cache_read_input_tokens=int(
+                    getattr(usage, "cache_read_input_tokens", 0) or 0
+                ),
             ),
             stop_reason=getattr(final_message, "stop_reason", None),
         )

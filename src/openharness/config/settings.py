@@ -604,6 +604,9 @@ class Settings(BaseModel):
     theme: str = "default"
     output_style: str = "default"
     vim_mode: bool = False
+    # Anthropic prompt-caching breakpoints (system/tools/history prefix).
+    # Kill switch: set false if a provider rejects cache_control blocks.
+    prompt_caching_enabled: bool = True
     voice_mode: bool = False
     fast_mode: bool = False
     effort: str = "medium"
