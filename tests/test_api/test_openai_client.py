@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 
-import httpx
-
 import pytest
 
 from openharness.api.client import ApiMessageRequest
@@ -253,30 +251,37 @@ class _FakeOpenAIClient:
 
 
 @pytest.mark.asyncio
-async def test_openai_client_uses_full_base_url_path_for_requests():
+async def test_openai_client_uses_full_base_url_path_for_requests(monkeypatch):
     seen_urls: list[str] = []
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        seen_urls.append(str(request.url))
-        return httpx.Response(
-            200,
-            json={
-                "id": "x",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": "gpt-4o-mini",
-                "choices": [],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            },
-        )
+    class _CapturingCompletions:
+        def __init__(self, base_url: str) -> None:
+            self._base_url = base_url.rstrip("/")
 
-    transport = httpx.MockTransport(_handler)
-    http_client = httpx.AsyncClient(transport=transport)
+        async def create(self, **kwargs):
+            seen_urls.append(f"{self._base_url}/chat/completions")
+
+            async def _stream():
+                yield _FakeChunk()
+
+            return _stream()
+
+    class _CapturingChat:
+        def __init__(self, base_url: str) -> None:
+            self.completions = _CapturingCompletions(base_url)
+
+    class _CapturingOpenAIClient:
+        def __init__(self, **kwargs) -> None:
+            self.chat = _CapturingChat(str(kwargs["base_url"]))
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("openharness.api.openai_client.AsyncOpenAI", _CapturingOpenAIClient)
     client = OpenAICompatibleClient(
         api_key="test-key",
         base_url="https://jarodfund.xyz/openai/v1",
     )
-    client._client._client = http_client
 
     request = ApiMessageRequest(
         model="gpt-4o-mini",
@@ -286,7 +291,6 @@ async def test_openai_client_uses_full_base_url_path_for_requests():
 
     assert events
     assert seen_urls == ["https://jarodfund.xyz/openai/v1/chat/completions"]
-    await http_client.aclose()
 
 
 def test_openai_client_init_normalizes_base_url(monkeypatch):
