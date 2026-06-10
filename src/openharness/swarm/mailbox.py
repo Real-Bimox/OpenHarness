@@ -94,6 +94,13 @@ def get_agent_mailbox_dir(team_name: str, agent_id: str) -> Path:
     return inbox
 
 
+def get_agent_read_mailbox_dir(team_name: str, agent_id: str) -> Path:
+    """Return ~/.openharness/teams/<team>/agents/<agent_id>/inbox/read/."""
+    read_dir = get_agent_mailbox_dir(team_name, agent_id) / "read"
+    read_dir.mkdir(parents=True, exist_ok=True)
+    return read_dir
+
+
 # ---------------------------------------------------------------------------
 # TeammateMailbox
 # ---------------------------------------------------------------------------
@@ -122,6 +129,9 @@ class TeammateMailbox:
 
     def _lock_path(self) -> Path:
         return self.get_mailbox_dir() / ".write_lock"
+
+    def _read_dir(self) -> Path:
+        return get_agent_read_mailbox_dir(self.team_name, self.agent_id)
 
     async def write(self, msg: MailboxMessage) -> None:
         """Atomically write *msg* to the inbox as a JSON file.
@@ -159,10 +169,13 @@ class TeammateMailbox:
                 already-read ones.
         """
         inbox = self.get_mailbox_dir()
+        read_dir = self._read_dir()
 
         def _read_all() -> list[MailboxMessage]:
             messages: list[MailboxMessage] = []
-            for path in sorted(inbox.glob("*.json")):
+            roots = [inbox] if unread_only else [inbox, read_dir]
+            paths = [path for root in roots for path in root.glob("*.json")]
+            for path in sorted(paths):
                 # Skip lock files and temp files
                 if path.name.startswith(".") or path.name.endswith(".tmp"):
                     continue
@@ -183,11 +196,12 @@ class TeammateMailbox:
     async def mark_read(self, message_id: str) -> None:
         """Mark the message with *message_id* as read (in-place update)."""
         inbox = self.get_mailbox_dir()
+        read_dir = self._read_dir()
         lock_path = self._lock_path()
 
         def _mark_read() -> bool:
             with exclusive_file_lock(lock_path):
-                for path in inbox.glob("*.json"):
+                for path in list(inbox.glob("*.json")) + list(read_dir.glob("*.json")):
                     # Skip lock files and temp files
                     if path.name.startswith(".") or path.name.endswith(".tmp"):
                         continue
@@ -198,9 +212,12 @@ class TeammateMailbox:
 
                     if data.get("id") == message_id:
                         data["read"] = True
-                        tmp_path = path.with_suffix(".json.tmp")
+                        target = read_dir / path.name
+                        tmp_path = target.with_suffix(".json.tmp")
                         tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                        os.replace(tmp_path, path)
+                        os.replace(tmp_path, target)
+                        if path != target:
+                            path.unlink(missing_ok=True)
                         return True
                 return False
 
@@ -211,18 +228,20 @@ class TeammateMailbox:
     async def clear(self) -> None:
         """Remove all message files from the inbox."""
         inbox = self.get_mailbox_dir()
+        read_dir = self._read_dir()
         lock_path = self._lock_path()
 
         def _clear() -> None:
             with exclusive_file_lock(lock_path):
-                for path in inbox.glob("*.json"):
-                    # Skip lock files
-                    if path.name.startswith("."):
-                        continue
-                    try:
-                        path.unlink()
-                    except OSError:
-                        pass
+                for root in (inbox, read_dir):
+                    for path in root.glob("*.json"):
+                        # Skip lock files
+                        if path.name.startswith("."):
+                            continue
+                        try:
+                            path.unlink()
+                        except OSError:
+                            pass
 
         # Offload blocking I/O to thread pool
         loop = asyncio.get_event_loop()

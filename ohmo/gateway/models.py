@@ -18,6 +18,8 @@ class GatewayConfig(BaseModel):
     allow_remote_admin_commands: bool = False
     allowed_remote_admin_commands: list[str] = Field(default_factory=list)
     log_level: str = "INFO"
+    max_active_sessions: int = Field(default=64, ge=1)
+    idle_session_ttl_seconds: int = Field(default=21600, ge=60)
     channel_configs: dict[str, dict] = Field(default_factory=dict)
 
 
@@ -30,4 +32,3 @@ class GatewayState(BaseModel):
     provider_profile: str = "codex"
     enabled_channels: list[str] = Field(default_factory=list)
     last_error: str | None = None
-

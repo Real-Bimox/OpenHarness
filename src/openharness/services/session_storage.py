@@ -60,6 +60,56 @@ def get_project_session_dir(cwd: str | Path) -> Path:
     return session_dir
 
 
+def _session_index_path(session_dir: Path) -> Path:
+    return session_dir / "sessions-index.json"
+
+
+def _session_index_entry(payload: dict[str, Any], session_path: Path) -> dict[str, Any]:
+    return {
+        "session_id": payload.get("session_id", session_path.stem.replace("session-", "")),
+        "summary": payload.get("summary", ""),
+        "message_count": payload.get("message_count", len(payload.get("messages", []))),
+        "model": payload.get("model", ""),
+        "created_at": payload.get("created_at", session_path.stat().st_mtime if session_path.exists() else time.time()),
+        "path": session_path.name,
+    }
+
+
+def _load_session_index(session_dir: Path) -> list[dict[str, Any]]:
+    path = _session_index_path(session_dir)
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    entries = payload.get("sessions") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> None:
+    entries = sorted(entries, key=lambda item: item.get("created_at", 0), reverse=True)
+    atomic_write_text(
+        _session_index_path(session_dir),
+        json.dumps({"version": 1, "sessions": entries}, indent=2) + "\n",
+    )
+
+
+def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
+    session_id = str(entry.get("session_id") or "")
+    if not session_id:
+        return
+    entries = [
+        existing
+        for existing in _load_session_index(session_dir)
+        if str(existing.get("session_id") or "") != session_id
+    ]
+    entries.append(entry)
+    _write_session_index(session_dir, entries)
+
+
 def save_session_snapshot(
     *,
     cwd: str | Path,
@@ -103,6 +153,7 @@ def save_session_snapshot(
     # Save by session ID
     session_path = session_dir / f"session-{sid}.json"
     atomic_write_text(session_path, data)
+    _update_session_index(session_dir, _session_index_entry(payload, session_path))
 
     return latest_path
 
@@ -133,12 +184,34 @@ def list_session_snapshots(cwd: str | Path, limit: int = 20) -> list[dict[str, A
     session_dir = get_project_session_dir(cwd)
     sessions: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    indexed = _load_session_index(session_dir)
+    if indexed:
+        for item in indexed:
+            if not (session_dir / str(item.get("path") or "")).exists():
+                continue
+            sid = str(item.get("session_id") or "")
+            if sid:
+                seen_ids.add(sid)
+            sessions.append(
+                {
+                    "session_id": item.get("session_id", ""),
+                    "summary": item.get("summary", ""),
+                    "message_count": item.get("message_count", 0),
+                    "model": item.get("model", ""),
+                    "created_at": item.get("created_at", 0),
+                }
+            )
+        if len(sessions) >= limit:
+            sessions.sort(key=lambda item: item.get("created_at", 0), reverse=True)
+            return sessions[:limit]
 
     # Named session files
     for path in sorted(session_dir.glob("session-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             sid = data.get("session_id", path.stem.replace("session-", ""))
+            if sid in seen_ids:
+                continue
             seen_ids.add(sid)
             summary = data.get("summary", "")
             if not summary:

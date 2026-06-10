@@ -701,7 +701,11 @@ class RepoAutopilotStore:
         )
 
         if issue_number is not None and existing_attempts == 0:
-            self._comment_on_issue(issue_number, self._comment_started(card, existing_attempts + 1))
+            await asyncio.to_thread(
+                self._comment_on_issue,
+                issue_number,
+                self._comment_started(card, existing_attempts + 1),
+            )
 
         current_run_report = self._runs_dir / f"{card.id}-run.md"
         current_verification_report = self._runs_dir / f"{card.id}-verification.md"
@@ -715,7 +719,8 @@ class RepoAutopilotStore:
             is_first_attempt = attempt_count == 1 and existing_attempts == 0
             if use_worktree:
                 try:
-                    self._sync_worktree_to_base(
+                    await asyncio.to_thread(
+                        self._sync_worktree_to_base,
                         working_cwd,
                         base_branch=base_branch,
                         head_branch=head_branch,
@@ -788,7 +793,11 @@ class RepoAutopilotStore:
                     metadata={"error": str(exc), "attempt_count": attempt_count},
                 )
                 if issue_number is not None:
-                    self._comment_on_issue(issue_number, self._comment_terminal_failure(summary))
+                    await asyncio.to_thread(
+                        self._comment_on_issue,
+                        issue_number,
+                        self._comment_terminal_failure(summary),
+                    )
                 return RepoRunResult(
                     card_id=card.id,
                     status="failed",
@@ -821,7 +830,11 @@ class RepoAutopilotStore:
                 note="running verification gates",
                 metadata_updates={"assistant_summary_preview": _shorten(assistant_summary, limit=300)},
             )
-            verification_steps = self._run_verification_steps(policies, cwd=working_cwd)
+            verification_steps = await asyncio.to_thread(
+                self._run_verification_steps,
+                policies,
+                cwd=working_cwd,
+            )
             verification_text = self._render_verification_report(card, verification_steps)
             for path in (attempt_verification_report, current_verification_report):
                 atomic_write_text(path, verification_text)
@@ -859,7 +872,11 @@ class RepoAutopilotStore:
                         metadata={"attempt_count": attempt_count},
                     )
                     if issue_number is not None:
-                        self._comment_on_issue(issue_number, self._comment_local_failed(attempt_count, summary))
+                        await asyncio.to_thread(
+                            self._comment_on_issue,
+                            issue_number,
+                            self._comment_local_failed(attempt_count, summary),
+                        )
                     prior_failure_stage = "local_verification_failed"
                     prior_failure_summary = summary
                     continue
@@ -876,7 +893,11 @@ class RepoAutopilotStore:
                     task_id=card.id,
                 )
                 if issue_number is not None:
-                    self._comment_on_issue(issue_number, self._comment_terminal_failure(summary))
+                    await asyncio.to_thread(
+                        self._comment_on_issue,
+                        issue_number,
+                        self._comment_terminal_failure(summary),
+                    )
                 return RepoRunResult(
                     card_id=card.id,
                     status="failed",
@@ -910,13 +931,19 @@ class RepoAutopilotStore:
                     worktree_path=str(working_cwd),
                 )
 
-            commit_created = self._git_commit_all(
-                working_cwd,
-                f"autopilot({card.id}): {card.title}",
-            )
-            branch_has_progress = commit_created or self._git_branch_has_progress(
-                working_cwd,
-                base_branch=base_branch,
+            def _commit_and_check_progress() -> tuple[bool, bool]:
+                created = self._git_commit_all(
+                    working_cwd,
+                    f"autopilot({card.id}): {card.title}",
+                )
+                has_progress = created or self._git_branch_has_progress(
+                    working_cwd,
+                    base_branch=base_branch,
+                )
+                return created, has_progress
+
+            commit_created, branch_has_progress = await asyncio.to_thread(
+                _commit_and_check_progress
             )
             if not branch_has_progress:
                 no_changes_summary = "Agent produced no code changes to commit."
@@ -961,14 +988,17 @@ class RepoAutopilotStore:
                 )
 
             try:
-                self._git_push_branch(working_cwd, head_branch)
-                pr_info = self._upsert_pull_request(
-                    card,
-                    head_branch=head_branch,
-                    base_branch=base_branch,
-                    run_report_path=current_run_report,
-                    verification_report_path=current_verification_report,
-                )
+                def _push_and_upsert_pr() -> dict[str, Any]:
+                    self._git_push_branch(working_cwd, head_branch)
+                    return self._upsert_pull_request(
+                        card,
+                        head_branch=head_branch,
+                        base_branch=base_branch,
+                        run_report_path=current_run_report,
+                        verification_report_path=current_verification_report,
+                    )
+
+                pr_info = await asyncio.to_thread(_push_and_upsert_pr)
             except Exception as exc:
                 summary = f"Failed to push branch or upsert PR: {exc}"
                 self.update_status(
@@ -978,7 +1008,11 @@ class RepoAutopilotStore:
                     metadata_updates={"last_failure_stage": "github_pr_open_failed", "last_failure_summary": summary},
                 )
                 if issue_number is not None:
-                    self._comment_on_issue(issue_number, self._comment_terminal_failure(summary))
+                    await asyncio.to_thread(
+                        self._comment_on_issue,
+                        issue_number,
+                        self._comment_terminal_failure(summary),
+                    )
                 return RepoRunResult(
                     card_id=card.id,
                     status="failed",
@@ -1005,7 +1039,11 @@ class RepoAutopilotStore:
                     "verification_steps": [step.model_dump(mode="json") for step in verification_steps],
                 },
             )
-            self._comment_on_pr(linked_pr_number, self._comment_pr_opened(linked_pr_number, pr_url))
+            await asyncio.to_thread(
+                self._comment_on_pr,
+                linked_pr_number,
+                self._comment_pr_opened(linked_pr_number, pr_url),
+            )
 
             ci_state, ci_summary, pr_snapshot, checks = await self._wait_for_pr_ci(linked_pr_number, policies)
             self.update_status(
@@ -1037,7 +1075,11 @@ class RepoAutopilotStore:
                         task_id=card.id,
                         metadata={"pr_number": linked_pr_number, "attempt_count": attempt_count},
                     )
-                    self._comment_on_pr(linked_pr_number, self._comment_ci_failed(attempt_count, ci_summary))
+                    await asyncio.to_thread(
+                        self._comment_on_pr,
+                        linked_pr_number,
+                        self._comment_ci_failed(attempt_count, ci_summary),
+                    )
                     prior_failure_stage = "remote_ci_failed"
                     prior_failure_summary = ci_summary
                     continue
@@ -1051,9 +1093,17 @@ class RepoAutopilotStore:
                         "last_failure_summary": ci_summary,
                     },
                 )
-                self._comment_on_pr(linked_pr_number, self._comment_terminal_failure(ci_summary))
+                await asyncio.to_thread(
+                    self._comment_on_pr,
+                    linked_pr_number,
+                    self._comment_terminal_failure(ci_summary),
+                )
                 if issue_number is not None:
-                    self._comment_on_issue(issue_number, self._comment_terminal_failure(ci_summary))
+                    await asyncio.to_thread(
+                        self._comment_on_issue,
+                        issue_number,
+                        self._comment_terminal_failure(ci_summary),
+                    )
                 return RepoRunResult(
                     card_id=card.id,
                     status="failed",
@@ -1068,7 +1118,7 @@ class RepoAutopilotStore:
                 )
 
             if self._automerge_eligible(pr_snapshot, policies):
-                self._merge_pull_request(linked_pr_number)
+                await asyncio.to_thread(self._merge_pull_request, linked_pr_number)
                 self.update_status(
                     card.id,
                     status="merged",
@@ -1081,9 +1131,17 @@ class RepoAutopilotStore:
                     task_id=card.id,
                     metadata={"pr_number": linked_pr_number},
                 )
-                self._comment_on_pr(linked_pr_number, self._comment_merged(linked_pr_number))
+                await asyncio.to_thread(
+                    self._comment_on_pr,
+                    linked_pr_number,
+                    self._comment_merged(linked_pr_number),
+                )
                 if issue_number is not None:
-                    self._comment_on_issue(issue_number, self._comment_merged(linked_pr_number))
+                    await asyncio.to_thread(
+                        self._comment_on_issue,
+                        issue_number,
+                        self._comment_merged(linked_pr_number),
+                    )
                 if use_worktree:
                     await worktree_manager.remove_worktree(self._worktree_slug(card))
                 return RepoRunResult(
@@ -1115,9 +1173,17 @@ class RepoAutopilotStore:
                 task_id=card.id,
                 metadata={"pr_number": linked_pr_number},
             )
-            self._comment_on_pr(linked_pr_number, self._comment_human_gate(linked_pr_number))
+            await asyncio.to_thread(
+                self._comment_on_pr,
+                linked_pr_number,
+                self._comment_human_gate(linked_pr_number),
+            )
             if issue_number is not None:
-                self._comment_on_issue(issue_number, self._comment_human_gate(linked_pr_number))
+                await asyncio.to_thread(
+                    self._comment_on_issue,
+                    issue_number,
+                    self._comment_human_gate(linked_pr_number),
+                )
             if use_worktree:
                 await worktree_manager.remove_worktree(self._worktree_slug(card))
             return RepoRunResult(
@@ -1158,7 +1224,7 @@ class RepoAutopilotStore:
         issue_limit: int = 10,
         pr_limit: int = 10,
     ) -> RepoRunResult | None:
-        self.scan_all_sources(issue_limit=issue_limit, pr_limit=pr_limit)
+        await asyncio.to_thread(self.scan_all_sources, issue_limit=issue_limit, pr_limit=pr_limit)
         if any(card.status in {"preparing", "running", "verifying", "waiting_ci", "repairing"} for card in self.list_cards()):
             self.append_journal(kind="tick_skip", summary="Skipped run-next because another card is active")
             return None
@@ -1555,7 +1621,7 @@ class RepoAutopilotStore:
         no_checks_deadline = time.time() + max(no_checks_grace_seconds, poll_interval, 5)
         checks_seen_at: float | None = None
         while True:
-            snapshot = self._pr_status_snapshot(pr_number)
+            snapshot = await asyncio.to_thread(self._pr_status_snapshot, pr_number)
             state, summary, checks = self._ci_rollup(snapshot)
             now = time.time()
             if checks and checks_seen_at is None:
@@ -1653,7 +1719,11 @@ class RepoAutopilotStore:
                     "last_failure_summary": ci_summary,
                 },
             )
-            self._comment_on_pr(pr_number, self._comment_terminal_failure(ci_summary))
+            await asyncio.to_thread(
+                self._comment_on_pr,
+                pr_number,
+                self._comment_terminal_failure(ci_summary),
+            )
             return RepoRunResult(
                 card_id=card.id,
                 status="failed",
@@ -1663,14 +1733,18 @@ class RepoAutopilotStore:
                 pr_url=pr_url,
             )
         if self._automerge_eligible(pr_snapshot, policies):
-            self._merge_pull_request(pr_number)
+            await asyncio.to_thread(self._merge_pull_request, pr_number)
             self.update_status(
                 card.id,
                 status="merged",
                 note=f"existing PR #{pr_number} merged automatically",
                 metadata_updates={"linked_pr_number": pr_number, "linked_pr_url": pr_url},
             )
-            self._comment_on_pr(pr_number, self._comment_merged(pr_number))
+            await asyncio.to_thread(
+                self._comment_on_pr,
+                pr_number,
+                self._comment_merged(pr_number),
+            )
             return RepoRunResult(
                 card_id=card.id,
                 status="merged",
@@ -1689,7 +1763,11 @@ class RepoAutopilotStore:
                 "human_gate_pending": True,
             },
         )
-        self._comment_on_pr(pr_number, self._comment_human_gate(pr_number))
+        await asyncio.to_thread(
+            self._comment_on_pr,
+            pr_number,
+            self._comment_human_gate(pr_number),
+        )
         return RepoRunResult(
             card_id=card.id,
             status="completed",

@@ -2622,6 +2622,58 @@ async def test_runtime_pool_logs_session_lifecycle(tmp_path, monkeypatch, caplog
     assert "ohmo runtime processing complete" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_runtime_pool_evicts_least_recent_session_when_limit_exceeded(tmp_path, monkeypatch):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_gateway_config(GatewayConfig(provider_profile="codex", max_active_sessions=1), workspace)
+
+    created: list[str] = []
+    closed: list[str] = []
+
+    async def fake_build_runtime(**kwargs):
+        session_id = f"session-{len(created) + 1}"
+        created.append(session_id)
+
+        class FakeEngine:
+            messages = [ConversationMessage.from_user_text(session_id)]
+            total_usage = UsageSnapshot()
+            tool_metadata = {}
+
+            def set_system_prompt(self, prompt):
+                return None
+
+        return SimpleNamespace(
+            engine=FakeEngine(),
+            session_id=session_id,
+            current_settings=lambda: SimpleNamespace(model="gpt-5.4"),
+            commands=SimpleNamespace(lookup=lambda raw: None),
+            cwd=str(tmp_path),
+            extra_skill_dirs=(),
+            extra_plugin_roots=(),
+            tool_registry=None,
+        )
+
+    async def fake_start_runtime(bundle):
+        return None
+
+    async def fake_close_runtime(bundle):
+        closed.append(bundle.session_id)
+
+    monkeypatch.setattr("ohmo.gateway.runtime.build_runtime", fake_build_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.start_runtime", fake_start_runtime)
+    monkeypatch.setattr("ohmo.gateway.runtime.close_runtime", fake_close_runtime)
+
+    pool = OhmoSessionRuntimePool(cwd=tmp_path, workspace=workspace, provider_profile="codex")
+    first = await pool.get_bundle("feishu:first")
+    second = await pool.get_bundle("feishu:second")
+
+    assert first.session_id == "session-1"
+    assert second.session_id == "session-2"
+    assert pool.active_sessions == 1
+    assert closed == ["session-1"]
+
+
 def test_gateway_provider_command_uses_ohmo_gateway_profile(tmp_path, monkeypatch):
     workspace = initialize_workspace(tmp_path / ".ohmo-home")
     save_gateway_config(GatewayConfig(provider_profile="kimi-anthropic"), workspace)

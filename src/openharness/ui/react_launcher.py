@@ -172,18 +172,11 @@ async def launch_react_tui(
     if not package_json.exists():
         raise RuntimeError(f"React terminal frontend is missing: {package_json}")
 
-    npm = _resolve_npm()
-
     if not (frontend_dir / "node_modules").exists():
-        install = await asyncio.create_subprocess_exec(
-            npm,
-            "install",
-            "--no-fund",
-            "--no-audit",
-            cwd=str(frontend_dir),
+        raise RuntimeError(
+            "React terminal frontend dependencies are missing. "
+            f"Run `npm install --prefix {frontend_dir}` before launching the terminal UI."
         )
-        if await install.wait() != 0:
-            raise RuntimeError("Failed to install React terminal frontend dependencies")
 
     env = os.environ.copy()
     env["OPENHARNESS_FRONTEND_CONFIG"] = json.dumps(

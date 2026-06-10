@@ -4,7 +4,7 @@ from pathlib import Path
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage
 
-from ohmo.session_storage import OhmoSessionBackend, get_session_dir
+from ohmo.session_storage import OhmoSessionBackend, get_session_dir, list_snapshots, save_session_snapshot
 from ohmo.workspace import initialize_workspace
 
 
@@ -52,6 +52,38 @@ def test_ohmo_session_backend_loads_latest_for_session_key(tmp_path: Path):
     assert loaded["session_id"] == "abc123"
     assert loaded["session_key"] == "feishu:chat-1"
     assert loaded["tool_metadata"]["task_focus_state"]["goal"] == "Continue the same Feishu task"
+
+
+def test_ohmo_list_snapshots_merges_index_with_legacy_files(tmp_path: Path):
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    session_dir = get_session_dir(workspace)
+    (session_dir / "session-legacy-session.json").write_text(
+        json.dumps(
+            {
+                "session_id": "legacy-session",
+                "summary": "legacy",
+                "message_count": 1,
+                "model": "gpt-legacy",
+                "created_at": 1.0,
+                "messages": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    save_session_snapshot(
+        cwd=tmp_path,
+        workspace=workspace,
+        model="gpt-5.4",
+        system_prompt="system",
+        messages=[ConversationMessage.from_user_text("indexed hello")],
+        usage=UsageSnapshot(),
+        session_id="indexed-session",
+    )
+
+    session_ids = {item["session_id"] for item in list_snapshots(workspace, limit=10)}
+    assert session_ids == {"indexed-session", "legacy-session"}
 
 
 def test_ohmo_session_backend_sanitizes_legacy_empty_assistant_messages(tmp_path: Path):

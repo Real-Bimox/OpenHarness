@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Literal, get_args, Iterab
 
 import pyperclip
 
-from openharness.autopilot import RepoAutopilotStore
 from openharness.auth.manager import AuthManager
 from openharness.config.paths import (
     get_config_dir,
@@ -2049,6 +2048,8 @@ def create_default_command_registry(
         )
 
     async def _autopilot_handler(args: str, context: CommandContext) -> CommandResult:
+        from openharness.autopilot import RepoAutopilotStore
+
         store = RepoAutopilotStore(context.cwd)
         tokens = args.split()
         action = tokens[0].lower() if tokens else "status"
@@ -2294,6 +2295,8 @@ def create_default_command_registry(
         )
 
     async def _ship_handler(args: str, context: CommandContext) -> CommandResult:
+        from openharness.autopilot import RepoAutopilotStore
+
         raw = args.strip()
         if not raw:
             return CommandResult(message="Usage: /ship TITLE :: DETAILS")

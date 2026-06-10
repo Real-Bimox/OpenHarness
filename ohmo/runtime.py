@@ -12,7 +12,7 @@ from openharness.api.client import SupportsStreamingMessages
 from openharness.engine.stream_events import AssistantTextDelta, AssistantTurnComplete, CompactProgressEvent, ErrorEvent, StatusEvent
 from openharness.ui.backend_host import run_backend_host
 from openharness.ui.runtime import build_runtime, close_runtime, handle_line, start_runtime
-from openharness.ui.react_launcher import _resolve_npm, _resolve_tsx, get_frontend_dir
+from openharness.ui.react_launcher import _resolve_tsx, get_frontend_dir
 
 from ohmo.memory import create_memory_command_backend
 from ohmo.prompts import build_ohmo_system_prompt
@@ -103,17 +103,11 @@ async def launch_ohmo_react_tui(
     if not package_json.exists():
         raise RuntimeError(f"React terminal frontend is missing: {package_json}")
 
-    npm = _resolve_npm()
     if not (frontend_dir / "node_modules").exists():
-        install = await asyncio.create_subprocess_exec(
-            npm,
-            "install",
-            "--no-fund",
-            "--no-audit",
-            cwd=str(frontend_dir),
+        raise RuntimeError(
+            "React terminal frontend dependencies are missing. "
+            f"Run `npm install --prefix {frontend_dir}` before launching ohmo."
         )
-        if await install.wait() != 0:
-            raise RuntimeError("Failed to install React terminal frontend dependencies")
 
     cwd_path = str(Path(cwd or Path.cwd()).resolve())
     workspace_root = initialize_workspace(workspace)

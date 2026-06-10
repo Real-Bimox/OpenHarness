@@ -10,6 +10,7 @@ from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.services.session_storage import (
     export_session_markdown,
     get_project_session_dir,
+    list_session_snapshots,
     load_session_snapshot,
     save_session_snapshot,
 )
@@ -39,6 +40,59 @@ def test_save_and_load_session_snapshot(tmp_path: Path, monkeypatch):
     assert snapshot["usage"]["output_tokens"] == 2
     assert snapshot["tool_metadata"]["task_focus_state"]["goal"] == "Fix compact carry-over"
     assert snapshot["tool_metadata"]["recent_verified_work"] == ["Focused session storage test passed"]
+
+
+def test_save_session_snapshot_updates_listing_index(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    save_session_snapshot(
+        cwd=project,
+        model="claude-test",
+        system_prompt="system",
+        session_id="indexed-session",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="indexed hello")])],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=2),
+    )
+
+    session_dir = get_project_session_dir(project)
+    index_path = session_dir / "sessions-index.json"
+    assert index_path.exists()
+    assert list_session_snapshots(project, limit=1)[0]["session_id"] == "indexed-session"
+
+
+def test_list_session_snapshots_merges_index_with_legacy_files(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    session_dir = get_project_session_dir(project)
+    (session_dir / "session-legacy-session.json").write_text(
+        json.dumps(
+            {
+                "session_id": "legacy-session",
+                "summary": "legacy",
+                "message_count": 1,
+                "model": "claude-legacy",
+                "created_at": 1.0,
+                "messages": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    save_session_snapshot(
+        cwd=project,
+        model="claude-test",
+        system_prompt="system",
+        session_id="indexed-session",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="indexed hello")])],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=2),
+    )
+
+    session_ids = {item["session_id"] for item in list_session_snapshots(project, limit=10)}
+    assert session_ids == {"indexed-session", "legacy-session"}
 
 
 def test_export_session_markdown(tmp_path: Path, monkeypatch):

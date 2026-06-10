@@ -244,6 +244,7 @@ class OhmoGatewayService:
                 restart_notice_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await restart_notice_task
+            await self._runtime_pool.close_all()
             await self._manager.stop_all()
             self.write_state(running=False)
             self.pid_file.unlink(missing_ok=True)

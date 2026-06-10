@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openharness.config.paths import get_data_dir
 from openharness.bridge.session_runner import SessionHandle, spawn_session
+from openharness.utils.fs import read_text_tail
 
 
 @dataclass(frozen=True)
@@ -71,10 +72,7 @@ class BridgeSessionManager:
         path = self._output_paths.get(session_id)
         if path is None or not path.exists():
             return ""
-        content = path.read_text(encoding="utf-8", errors="replace")
-        if len(content) > max_bytes:
-            return content[-max_bytes:]
-        return content
+        return read_text_tail(path, max_bytes=max_bytes)
 
     async def stop(self, session_id: str) -> None:
         handle = self._sessions.get(session_id)
@@ -103,4 +101,3 @@ def get_bridge_manager() -> BridgeSessionManager:
     if _DEFAULT_MANAGER is None:
         _DEFAULT_MANAGER = BridgeSessionManager()
     return _DEFAULT_MANAGER
-

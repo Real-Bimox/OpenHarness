@@ -33,7 +33,7 @@ import stat
 import tempfile
 from pathlib import Path
 
-__all__ = ["atomic_write_bytes", "atomic_write_text"]
+__all__ = ["atomic_write_bytes", "atomic_write_text", "read_text_tail"]
 
 
 def atomic_write_bytes(path: str | os.PathLike[str], data: bytes, *, mode: int | None = None) -> None:
@@ -75,6 +75,23 @@ def atomic_write_text(
 ) -> None:
     """Text variant of :func:`atomic_write_bytes`."""
     atomic_write_bytes(path, data.encode(encoding), mode=mode)
+
+
+def read_text_tail(
+    path: str | os.PathLike[str],
+    *,
+    max_bytes: int,
+    encoding: str = "utf-8",
+) -> str:
+    """Return up to ``max_bytes`` from the end of a text file."""
+    if max_bytes <= 0:
+        return ""
+    src = Path(path)
+    with src.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+        return handle.read(max_bytes).decode(encoding, errors="replace")
 
 
 def _resolve_target_mode(path: Path, explicit_mode: int | None) -> int:

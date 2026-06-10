@@ -6,33 +6,12 @@ import asyncio
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
-from openharness.auth.manager import AuthManager
-from openharness.config import load_settings
-
-from ohmo.gateway.config import load_gateway_config, save_gateway_config
-from ohmo.gateway.models import GatewayConfig
-from ohmo.gateway.service import (
-    OhmoGatewayService,
-    gateway_status,
-    start_gateway_process,
-    stop_gateway_process,
-)
-from ohmo.memory import add_memory_entry, list_memory_files, remove_memory_entry
-from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
-from ohmo.session_storage import OhmoSessionBackend
-from ohmo.workspace import (
-    get_gateway_config_path,
-    get_logs_dir,
-    get_workspace_root,
-    get_soul_path,
-    get_state_path,
-    get_user_path,
-    initialize_workspace,
-    workspace_health,
-)
+if TYPE_CHECKING:
+    from ohmo.gateway.models import GatewayConfig
 
 
 app = typer.Typer(
@@ -53,6 +32,24 @@ app.add_typer(gateway_app)
 
 _INTERACTIVE_CHANNELS = ("telegram", "slack", "discord", "feishu")
 _WORKSPACE_HELP = "Path to the ohmo workspace (defaults to ~/.ohmo)"
+
+
+def gateway_status(cwd: str | Path | None = None, workspace: str | Path | None = None):
+    from ohmo.gateway.service import gateway_status as _gateway_status
+
+    return _gateway_status(cwd, workspace)
+
+
+def start_gateway_process(cwd: str | Path | None = None, workspace: str | Path | None = None) -> int:
+    from ohmo.gateway.service import start_gateway_process as _start_gateway_process
+
+    return _start_gateway_process(cwd, workspace)
+
+
+def stop_gateway_process(cwd: str | Path | None = None, workspace: str | Path | None = None) -> bool:
+    from ohmo.gateway.service import stop_gateway_process as _stop_gateway_process
+
+    return _stop_gateway_process(cwd, workspace)
 
 
 def _can_use_questionary() -> bool:
@@ -146,6 +143,10 @@ def _format_provider_profile_label(info: dict[str, object]) -> str:
 
 
 def _prompt_provider_profile(workspace: str | Path) -> str:
+    from openharness.auth.manager import AuthManager
+    from openharness.config import load_settings
+    from ohmo.gateway.config import load_gateway_config
+
     settings = load_settings()
     statuses = AuthManager(settings).get_profile_statuses()
     default_value = load_gateway_config(workspace).provider_profile
@@ -327,6 +328,8 @@ def _prompt_channels(existing: GatewayConfig) -> tuple[list[str], dict[str, dict
 
 def _run_gateway_config_wizard(workspace: str | Path) -> GatewayConfig:
     """Interactive flow for provider/channel setup."""
+    from ohmo.gateway.config import load_gateway_config, save_gateway_config
+
     existing = load_gateway_config(workspace)
     provider_profile = _prompt_provider_profile(workspace)
     enabled_channels, channel_configs = _prompt_channels(existing)
@@ -415,6 +418,8 @@ def _configure_gateway_logging(
     log_file: bool = True,
 ) -> None:
     """Configure foreground gateway logging."""
+    from ohmo.gateway.config import load_gateway_config
+
     config = load_gateway_config(workspace)
     level_name = str(config.log_level or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -434,6 +439,8 @@ def _build_gateway_logging_handlers(
     log_file: bool,
 ) -> list[logging.Handler]:
     """Build gateway log handlers for foreground and daemon modes."""
+    from ohmo.workspace import get_logs_dir
+
     handlers: list[logging.Handler] = []
     if console:
         handlers.append(logging.StreamHandler())
@@ -460,6 +467,10 @@ def main(
     """Launch the ohmo app or invoke a subcommand."""
     if ctx.invoked_subcommand is not None:
         return
+
+    from ohmo.runtime import launch_ohmo_react_tui, run_ohmo_backend, run_ohmo_print_mode
+    from ohmo.session_storage import OhmoSessionBackend
+    from ohmo.workspace import initialize_workspace
 
     cwd_path = str(Path(cwd).resolve())
     workspace_root = initialize_workspace(workspace)
@@ -534,6 +545,8 @@ def init_cmd(
     ),
 ) -> None:
     """Initialize the .ohmo workspace."""
+    from ohmo.workspace import get_gateway_config_path, get_workspace_root, initialize_workspace
+
     root_path = get_workspace_root(workspace)
     already_exists = root_path.exists()
     root = initialize_workspace(root_path)
@@ -558,6 +571,8 @@ def config_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     """Configure provider profile and gateway channels."""
+    from ohmo.workspace import get_gateway_config_path, initialize_workspace
+
     cwd_path = str(Path(cwd).resolve())
     workspace_root = initialize_workspace(workspace)
     config = _run_gateway_config_wizard(workspace_root)
@@ -572,6 +587,15 @@ def doctor_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
     """Check .ohmo workspace and provider readiness."""
+    from openharness.auth.manager import AuthManager
+    from openharness.config import load_settings
+    from ohmo.workspace import (
+        get_gateway_config_path,
+        get_state_path,
+        initialize_workspace,
+        workspace_health,
+    )
+
     cwd_path = str(Path(cwd).resolve())
     workspace_root = initialize_workspace(workspace)
     health = workspace_health(workspace_root)
@@ -594,6 +618,8 @@ def doctor_cmd(
 
 @memory_app.command("list")
 def memory_list_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+    from ohmo.memory import list_memory_files
+
     for path in list_memory_files(workspace):
         print(path.name)
 
@@ -604,6 +630,8 @@ def memory_add_cmd(
     content: str = typer.Argument(...),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
+    from ohmo.memory import add_memory_entry
+
     path = add_memory_entry(workspace, title, content)
     print(f"Added memory entry {path.name}")
 
@@ -613,6 +641,8 @@ def memory_remove_cmd(
     name: str = typer.Argument(...),
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
 ) -> None:
+    from ohmo.memory import remove_memory_entry
+
     if remove_memory_entry(workspace, name):
         print(f"Removed memory entry {name}")
         return
@@ -634,6 +664,8 @@ def _show_or_edit(path: Path, set_text: str | None) -> None:
 
 @soul_app.command("show")
 def soul_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+    from ohmo.workspace import get_soul_path
+
     _show_or_edit(get_soul_path(workspace), None)
 
 
@@ -642,11 +674,15 @@ def soul_edit_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     set_text: str | None = typer.Option(None, "--set", help="Replace soul.md with this text"),
 ) -> None:
+    from ohmo.workspace import get_soul_path
+
     _show_or_edit(get_soul_path(workspace), set_text)
 
 
 @user_app.command("show")
 def user_show_cmd(workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP)) -> None:
+    from ohmo.workspace import get_user_path
+
     _show_or_edit(get_user_path(workspace), None)
 
 
@@ -655,6 +691,8 @@ def user_edit_cmd(
     workspace: str | None = typer.Option(None, "--workspace", help=_WORKSPACE_HELP),
     set_text: str | None = typer.Option(None, "--set", help="Replace user.md with this text"),
 ) -> None:
+    from ohmo.workspace import get_user_path
+
     _show_or_edit(get_user_path(workspace), set_text)
 
 
@@ -666,6 +704,8 @@ def gateway_run_cmd(
     log_file: bool = typer.Option(True, "--log-file/--no-log-file", hidden=True),
 ) -> None:
     """Run the ohmo gateway in the foreground."""
+    from ohmo.gateway.service import OhmoGatewayService
+
     _configure_gateway_logging(workspace, console=console_log, log_file=log_file)
     service = OhmoGatewayService(cwd, workspace)
     raise SystemExit(asyncio.run(service.run_foreground()))

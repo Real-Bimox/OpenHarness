@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from openharness.config.paths import get_tasks_dir
 from openharness.tasks.types import TaskRecord, TaskStatus, TaskType
+from openharness.utils.fs import read_text_tail
 from openharness.utils.shell import create_shell_subprocess
 
 log = logging.getLogger(__name__)
@@ -231,10 +232,7 @@ class BackgroundTaskManager:
     def read_task_output(self, task_id: str, *, max_bytes: int = 12000) -> str:
         """Return the tail of a task's output file."""
         task = self._require_task(task_id)
-        content = task.output_file.read_text(encoding="utf-8", errors="replace")
-        if len(content) > max_bytes:
-            return content[-max_bytes:]
-        return content
+        return read_text_tail(task.output_file, max_bytes=max_bytes)
 
     def register_completion_listener(self, listener: CompletionListener) -> Callable[[], None]:
         """Register a callback fired whenever a task reaches a terminal state."""

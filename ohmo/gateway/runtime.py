@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import hashlib
 import logging
@@ -11,6 +12,7 @@ import json
 import os
 import re
 import string
+import time
 
 from openharness.channels.bus.events import InboundMessage
 from openharness.commands import CommandContext, CommandResult, lookup_skill_slash_command
@@ -119,10 +121,71 @@ class OhmoSessionRuntimePool:
         self._gateway_config = load_gateway_config(self._workspace)
         self._session_backend = OhmoSessionBackend(self._workspace)
         self._bundles: dict[str, RuntimeBundle] = {}
+        self._last_used_at: dict[str, float] = {}
+        self._max_active_sessions = max(1, int(self._gateway_config.max_active_sessions))
+        self._idle_session_ttl_seconds = max(60, int(self._gateway_config.idle_session_ttl_seconds))
 
     @property
     def active_sessions(self) -> int:
         return len(self._bundles)
+
+    async def close_all(self) -> None:
+        """Close all cached runtime bundles."""
+        for session_key, bundle in list(self._bundles.items()):
+            await self._close_cached_bundle(session_key, bundle, reason="gateway shutdown")
+        self._bundles.clear()
+        self._last_used_at.clear()
+
+    async def _evict_idle_bundles(self) -> None:
+        now = time.monotonic()
+        idle_keys = [
+            session_key
+            for session_key, last_used_at in self._last_used_at.items()
+            if now - last_used_at >= self._idle_session_ttl_seconds
+        ]
+        for session_key in idle_keys:
+            bundle = self._bundles.get(session_key)
+            if bundle is not None:
+                await self._close_cached_bundle(session_key, bundle, reason="idle timeout")
+
+    async def _evict_excess_bundles(self, *, protected_session_key: str) -> None:
+        while len(self._bundles) > self._max_active_sessions:
+            candidates = [
+                (last_used_at, session_key)
+                for session_key, last_used_at in self._last_used_at.items()
+                if session_key != protected_session_key and session_key in self._bundles
+            ]
+            if not candidates:
+                return
+            _, session_key = min(candidates)
+            bundle = self._bundles.get(session_key)
+            if bundle is None:
+                self._last_used_at.pop(session_key, None)
+                continue
+            await self._close_cached_bundle(session_key, bundle, reason="session limit")
+
+    async def _close_cached_bundle(
+        self,
+        session_key: str,
+        bundle: RuntimeBundle,
+        *,
+        reason: str,
+    ) -> None:
+        try:
+            await self._save_snapshot(bundle, session_key, _last_user_text(bundle.engine.messages))
+        except Exception:
+            logger.exception("ohmo runtime failed to save snapshot before closing session_key=%s", session_key)
+        try:
+            await close_runtime(bundle)
+        finally:
+            self._bundles.pop(session_key, None)
+            self._last_used_at.pop(session_key, None)
+        logger.info(
+            "ohmo runtime closed cached session session_key=%s session_id=%s reason=%s",
+            session_key,
+            getattr(bundle, "session_id", ""),
+            reason,
+        )
 
     def _remote_admin_allowed(self, command) -> bool:
         if not getattr(command, "remote_admin_opt_in", False):
@@ -156,6 +219,7 @@ class OhmoSessionRuntimePool:
         cwd: str | Path | None = None,
     ) -> RuntimeBundle:
         """Return an existing bundle or create a new one."""
+        await self._evict_idle_bundles()
         session_cwd = str(Path(cwd or self._cwd).expanduser().resolve())
         bundle = self._bundles.get(session_key)
         if bundle is not None:
@@ -169,6 +233,7 @@ class OhmoSessionRuntimePool:
                 )
                 await close_runtime(bundle)
                 self._bundles.pop(session_key, None)
+                self._last_used_at.pop(session_key, None)
             else:
                 logger.info(
                     "ohmo runtime reusing session session_key=%s session_id=%s prompt=%r",
@@ -177,6 +242,7 @@ class OhmoSessionRuntimePool:
                     _content_snippet(latest_user_prompt or ""),
                 )
                 bundle.engine.set_system_prompt(self._runtime_system_prompt(bundle, latest_user_prompt))
+                self._last_used_at[session_key] = time.monotonic()
                 return bundle
 
         snapshot = self._session_backend.load_latest_for_session_key(session_key)
@@ -219,6 +285,8 @@ class OhmoSessionRuntimePool:
             len(snapshot.get("messages") or []) if snapshot else 0,
         )
         self._bundles[session_key] = bundle
+        self._last_used_at[session_key] = time.monotonic()
+        await self._evict_excess_bundles(protected_session_key=session_key)
         return bundle
 
     async def stream_message(self, message: InboundMessage, session_key: str):
@@ -630,7 +698,8 @@ class OhmoSessionRuntimePool:
                 bundle.engine.load_messages(messages)
             else:
                 bundle.engine.messages = messages
-        self._session_backend.save_snapshot(
+        await asyncio.to_thread(
+            self._session_backend.save_snapshot,
             cwd=getattr(bundle, "cwd", self._cwd),
             model=bundle.current_settings().model,
             system_prompt=self._runtime_system_prompt(bundle, user_prompt),
@@ -646,6 +715,8 @@ class OhmoSessionRuntimePool:
             bundle.session_id,
             len(bundle.engine.messages),
         )
+        if session_key in self._bundles:
+            self._last_used_at[session_key] = time.monotonic()
 
     async def _refresh_bundle(
         self,
@@ -683,6 +754,7 @@ class OhmoSessionRuntimePool:
         await start_runtime(refreshed)
         refreshed.engine.set_system_prompt(self._runtime_system_prompt(refreshed, latest_user_prompt))
         self._bundles[session_key] = refreshed
+        self._last_used_at[session_key] = time.monotonic()
         logger.info(
             "ohmo runtime refreshed session_key=%s session_id=%s message_count=%s",
             session_key,

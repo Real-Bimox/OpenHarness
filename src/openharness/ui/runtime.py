@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from dataclasses import dataclass, field
@@ -532,6 +533,25 @@ async def close_runtime(bundle: RuntimeBundle) -> None:
         await close_api_client()
 
 
+async def save_runtime_snapshot(
+    bundle: RuntimeBundle,
+    *,
+    system_prompt: str,
+    model: str | None = None,
+) -> None:
+    """Persist a runtime snapshot without blocking the event loop."""
+    await asyncio.to_thread(
+        bundle.session_backend.save_snapshot,
+        cwd=bundle.cwd,
+        model=model or bundle.engine.model,
+        system_prompt=system_prompt,
+        messages=bundle.engine.messages,
+        usage=bundle.engine.total_usage,
+        session_id=bundle.session_id,
+        tool_metadata=bundle.engine.tool_metadata,
+    )
+
+
 def _last_user_text(messages: list[ConversationMessage]) -> str:
     for msg in reversed(messages):
         if msg.role == "user" and msg.text.strip():
@@ -720,14 +740,10 @@ async def handle_line(
             finally:
                 if result.submit_model:
                     bundle.engine.set_model(original_model)
-            bundle.session_backend.save_snapshot(
-                cwd=bundle.cwd,
-                model=bundle.engine.model,
+            await save_runtime_snapshot(
+                bundle,
                 system_prompt=system_prompt,
-                messages=bundle.engine.messages,
-                usage=bundle.engine.total_usage,
-                session_id=bundle.session_id,
-                tool_metadata=bundle.engine.tool_metadata,
+                model=bundle.engine.model,
             )
         if result.continue_pending:
             settings = bundle.current_settings()
@@ -751,15 +767,7 @@ async def handle_line(
                 pending = _format_pending_tool_results(bundle.engine.messages)
                 if pending:
                     await print_system(pending)
-            bundle.session_backend.save_snapshot(
-                cwd=bundle.cwd,
-                model=settings.model,
-                system_prompt=system_prompt,
-                messages=bundle.engine.messages,
-                usage=bundle.engine.total_usage,
-                session_id=bundle.session_id,
-                tool_metadata=bundle.engine.tool_metadata,
-            )
+            await save_runtime_snapshot(bundle, system_prompt=system_prompt, model=settings.model)
         sync_app_state(bundle)
         return not result.should_exit
 
@@ -784,26 +792,10 @@ async def handle_line(
         pending = _format_pending_tool_results(bundle.engine.messages)
         if pending:
             await print_system(pending)
-        bundle.session_backend.save_snapshot(
-            cwd=bundle.cwd,
-            model=settings.model,
-            system_prompt=system_prompt,
-            messages=bundle.engine.messages,
-            usage=bundle.engine.total_usage,
-            session_id=bundle.session_id,
-            tool_metadata=bundle.engine.tool_metadata,
-        )
+        await save_runtime_snapshot(bundle, system_prompt=system_prompt, model=settings.model)
         sync_app_state(bundle)
         return True
-    bundle.session_backend.save_snapshot(
-        cwd=bundle.cwd,
-        model=settings.model,
-        system_prompt=system_prompt,
-        messages=bundle.engine.messages,
-        usage=bundle.engine.total_usage,
-        session_id=bundle.session_id,
-        tool_metadata=bundle.engine.tool_metadata,
-    )
+    await save_runtime_snapshot(bundle, system_prompt=system_prompt, model=settings.model)
     sync_app_state(bundle)
     return True
 

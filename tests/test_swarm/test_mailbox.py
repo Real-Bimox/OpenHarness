@@ -130,6 +130,9 @@ async def test_mark_read_updates_flag(mailbox):
     await mailbox.mark_read(msg.id)
     all_msgs = await mailbox.read_all(unread_only=False)
     assert all_msgs[0].read is True
+    assert await mailbox.read_all(unread_only=True) == []
+    assert not list(mailbox.get_mailbox_dir().glob("*.json"))
+    assert list((mailbox.get_mailbox_dir() / "read").glob("*.json"))
 
 
 async def test_mark_read_nonexistent_id_is_noop(mailbox):

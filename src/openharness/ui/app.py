@@ -26,7 +26,13 @@ from openharness.ui.backend_host import run_backend_host
 from openharness.ui.coordinator_drain import drain_coordinator_async_agents
 from openharness.ui.headless_protocol import HEADLESS_PROTOCOL_VERSION, HeadlessRequest
 from openharness.ui.react_launcher import launch_react_tui
-from openharness.ui.runtime import build_runtime, close_runtime, handle_line, start_runtime
+from openharness.ui.runtime import (
+    build_runtime,
+    close_runtime,
+    handle_line,
+    save_runtime_snapshot,
+    start_runtime,
+)
 
 
 _VALID_PRINT_OUTPUT_FORMATS = {"text", "json", "stream-json"}
@@ -658,20 +664,12 @@ async def run_headless_control(
             payload["usage"] = usage.model_dump()
         return payload
 
-    def _save_interrupt_snapshot() -> None:
+    async def _save_interrupt_snapshot() -> None:
         """Persist the session after a cancelled turn so resume keeps the exchange."""
         if bundle is None:
             return
         try:
-            bundle.session_backend.save_snapshot(
-                cwd=bundle.cwd,
-                model=bundle.engine.model,
-                system_prompt=bundle.engine.system_prompt,
-                messages=bundle.engine.messages,
-                usage=bundle.engine.total_usage,
-                session_id=bundle.session_id,
-                tool_metadata=bundle.engine.tool_metadata,
-            )
+            await save_runtime_snapshot(bundle, system_prompt=bundle.engine.system_prompt)
         except Exception:
             pass
 
@@ -733,7 +731,7 @@ async def run_headless_control(
             payload = {"type": "interrupted"}
             if bundle is not None:
                 payload["session_id"] = bundle.session_id
-                _save_interrupt_snapshot()
+                await _save_interrupt_snapshot()
             await _emit(payload, request_id=request_id)
             if bundle is not None:
                 await _emit(_line_complete_payload(), request_id=request_id)

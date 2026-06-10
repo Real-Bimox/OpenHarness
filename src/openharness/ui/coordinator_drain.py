@@ -123,7 +123,7 @@ async def submit_follow_up(
     print_system,
     render_event,
 ) -> None:
-    from openharness.ui.runtime import _format_pending_tool_results
+    from openharness.ui.runtime import _format_pending_tool_results, save_runtime_snapshot
 
     settings = bundle.current_settings()
     if bundle.enforce_max_turns:
@@ -145,15 +145,7 @@ async def submit_follow_up(
         pending = _format_pending_tool_results(bundle.engine.messages)
         if pending:
             await print_system(pending)
-    bundle.session_backend.save_snapshot(
-        cwd=bundle.cwd,
-        model=settings.model,
-        system_prompt=system_prompt,
-        messages=bundle.engine.messages,
-        usage=bundle.engine.total_usage,
-        session_id=bundle.session_id,
-        tool_metadata=bundle.engine.tool_metadata,
-    )
+    await save_runtime_snapshot(bundle, system_prompt=system_prompt, model=settings.model)
 
 
 async def drain_coordinator_async_agents(

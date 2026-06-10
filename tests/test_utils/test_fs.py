@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from openharness.utils.fs import atomic_write_bytes, atomic_write_text
+from openharness.utils.fs import atomic_write_bytes, atomic_write_text, read_text_tail
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +50,15 @@ def test_atomic_write_does_not_leave_tempfiles(tmp_path: Path) -> None:
     assert path.exists()
     leftover = [p for p in tmp_path.iterdir() if p != path]
     assert leftover == []
+
+
+def test_read_text_tail_reads_from_end(tmp_path: Path) -> None:
+    path = tmp_path / "log.txt"
+    path.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    assert read_text_tail(path, max_bytes=6) == "gamma\n"
+    assert read_text_tail(path, max_bytes=100) == "alpha\nbeta\ngamma\n"
+    assert read_text_tail(path, max_bytes=0) == ""
 
 
 # ---------------------------------------------------------------------------
