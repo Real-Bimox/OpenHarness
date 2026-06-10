@@ -4,15 +4,28 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
-## [Unreleased]
+## [0.1.10] - 2026-06-10
 
 ### Added
 
+- `oh --headless` runs a local JSONL control protocol over stdin/stdout with `submit`, `resume`, `continue`, `list_sessions`, `status`, `interrupt`, and `shutdown` requests. Requests are processed FIFO; `status`/`list_sessions`/`interrupt` are answered immediately even while a turn is active.
+- Headless `shutdown` is graceful by default (the active turn and requests queued ahead of it finish first); requests queued behind any shutdown are rejected with explicit `error` events. `{"type":"shutdown","force":true}` additionally cancels the active turn (including a follow-up turn of an in-flight `resume`/`continue`). Closing stdin is equivalent to a graceful shutdown.
+- Headless events now carry token usage: `assistant_complete.usage` (per-turn) plus `line_complete.usage` and `state_snapshot.usage` (cumulative).
+- A headless `submit` carrying a `session_id` is validated against the active session and rejected with an `error` event on mismatch.
+- `oh -p --output-format json` results now include `is_error`, `errors`, `permission_denials`, `system_messages` (e.g. the max-turns truncation notice), and `usage`; `oh -p` exits non-zero when an engine error occurred (all output formats), and `stream-json`'s `line_complete` includes `usage`.
+- An interrupted headless turn is persisted to the session snapshot before `interrupted` is emitted, so `resume` keeps the interrupted exchange.
 - Hooks now support a `priority` field (default `0`). Within an event, hooks run highest-priority first, and hooks sharing a priority keep their registration order. This lets users order, for example, a security-check hook ahead of a logging hook regardless of where each is declared in settings or contributed by plugins.
 - `edit_file` and `write_file` in the React TUI now preview a unified diff before applying file changes, let users approve once or for the rest of the session, and skip the extra prompt automatically in `full_auto` mode.
 
 ### Fixed
 
+- `oh --headless` no longer cancels an in-flight turn when a `shutdown` request arrives on stdin, so piping a `submit` + `shutdown` batch returns the full response.
+- Headless `resume`/`continue` failures (missing or corrupt snapshot, runtime build errors) now emit a recoverable `error` event instead of crashing the control process, and the stdin reader survives request-handling exceptions.
+- Explicit CLI `--model` now wins over the model stored in a session snapshot for `-p --resume/--continue`, headless `resume`/`continue`, and interactive resume.
+- Conflicting mode flags now error instead of resolving silently: `--headless` with `--task-worker`, `--backend-only`, or `--output-format`, and `--dry-run` with `--headless`.
+- `--bare` combined with `--mcp-config` now prints a warning that MCP stays disabled, and the `--bare` help text lists everything it disables.
+- `--max-turns` is now honored when resuming an interactive session with `--continue`/`--resume`.
+- Inline/file `--settings` sources no longer overwrite a user-supplied `profiles` entry or explicit `active_profile` when synthesizing a profile from flat fields.
 - Codex subscription requests now pass reasoning effort separately, enabling `gpt-5.5` with `xhigh` effort instead of treating `gpt-5.5 xhigh` as an unsupported model name.
 - Telegram channel now delivers replies again under `ohmo init --no-interactive` and other configs that do not write a `reply_to_message` field. `TelegramConfig` declares `reply_to_message: bool = True` so the attribute access in `TelegramChannel.send` no longer raises `AttributeError` and outbound progress/tool-hint/final messages are sent as expected. See issue #243.
 

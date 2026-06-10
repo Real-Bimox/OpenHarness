@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import typer
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 _PREVIEW_STOPWORDS = {
     "a",
@@ -2371,7 +2371,7 @@ def main(
     settings_file: str | None = typer.Option(
         None,
         "--settings",
-        help="Path to a JSON settings file or inline JSON string",
+        help="Path to a JSON settings file or inline JSON string (env vars still override values from this source)",
         rich_help_panel="System & Context",
     ),
     base_url: str | None = typer.Option(
@@ -2390,7 +2390,7 @@ def main(
     bare: bool = typer.Option(
         False,
         "--bare",
-        help="Minimal mode: skip hooks, plugins, MCP, and auto-discovery",
+        help="Minimal mode: skip hooks, plugins, MCP, network/image tools, and project-memory auto-discovery",
         rich_help_panel="System & Context",
     ),
     api_format: str | None = typer.Option(
@@ -2463,6 +2463,11 @@ def main(
     denied_tool_names = _parse_tool_filter(disallowed_tools)
     _validate_settings_source(settings_file)
     runtime_mcp_configs = _load_cli_mcp_configs(mcp_config)
+    if bare and mcp_config:
+        print(
+            "Warning: --bare disables MCP, so --mcp-config is ignored for this process.",
+            file=sys.stderr,
+        )
 
     # Apply --theme override to settings
     if theme:
@@ -2476,6 +2481,9 @@ def main(
 
     if dry_run and (continue_session or resume is not None):
         print("Error: --dry-run does not support --continue/--resume yet.", file=sys.stderr)
+        raise typer.Exit(1)
+    if dry_run and headless:
+        print("Error: --dry-run cannot be combined with --headless.", file=sys.stderr)
         raise typer.Exit(1)
 
     if dry_run:
@@ -2523,6 +2531,18 @@ def main(
         if continue_session or resume is not None:
             print(
                 "Error: --headless accepts resume and continue as JSONL requests, not CLI picker flags.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        if task_worker or backend_only:
+            print(
+                "Error: --headless cannot be combined with --task-worker or --backend-only.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        if output_format is not None:
+            print(
+                "Error: --headless always emits JSONL; --output-format only applies to -p/--print.",
                 file=sys.stderr,
             )
             raise typer.Exit(1)
@@ -2584,12 +2604,12 @@ def main(
                     print(f"Session not found: {resume}", file=sys.stderr)
                     raise typer.Exit(1)
 
-        asyncio.run(
+        exit_code = asyncio.run(
             run_print_mode(
                 prompt=prompt,
                 output_format=output_format or "text",
                 cwd=cwd,
-                model=(session_data.get("model") if session_data else None) or model,
+                model=model or (session_data.get("model") if session_data else None),
                 base_url=base_url,
                 system_prompt=system_prompt,
                 append_system_prompt=append_system_prompt,
@@ -2608,6 +2628,8 @@ def main(
                 bare=bare,
             )
         )
+        if isinstance(exit_code, int) and exit_code != 0:
+            raise typer.Exit(exit_code)
         return
 
     # Handle --continue and --resume flags
@@ -2658,7 +2680,8 @@ def main(
             run_repl(
                 prompt=None,
                 cwd=cwd,
-                model=session_data.get("model") or model,
+                model=model or session_data.get("model"),
+                max_turns=max_turns,
                 backend_only=backend_only,
                 base_url=base_url,
                 system_prompt=system_prompt,

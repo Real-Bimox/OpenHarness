@@ -53,16 +53,41 @@ Out of scope:
 
 `oh --headless` reads one JSON object per stdin line.
 
+Semantics:
+
+- Requests are processed sequentially in FIFO order. Queued `submit` requests
+  run one after another; there is no busy rejection.
+- `status`, `list_sessions`, and `interrupt` are answered immediately by the
+  stdin reader, even while a turn is active.
+- The process hosts at most one live session at a time. `resume`/`continue`
+  close the current session and restore the requested one. Orchestrators that
+  need concurrent sessions should spawn one `oh --headless` process each.
+- A `submit` carrying `session_id` is validated against the active session and
+  rejected with an `error` event on mismatch (or when no session is active).
+- `shutdown` is graceful: the active turn finishes and requests queued ahead of
+  the shutdown complete first. Requests queued behind a shutdown (graceful or
+  forced) are rejected with an `error` event each, so every `request_id` gets a
+  response. `{"type":"shutdown","force":true}` additionally cancels the active
+  turn immediately; a force shutdown arriving while a `resume`/`continue`
+  rebuild is in flight prevents (or cancels) the follow-up turn.
+- Closing stdin (EOF) is equivalent to a graceful `shutdown`.
+- An interrupted turn is persisted to the session snapshot before the
+  `interrupted` event is emitted, so `resume` keeps the interrupted exchange.
+- When resuming, an explicit CLI `--model` wins over the model stored in the
+  snapshot.
+- `submit_line` is accepted as an alias of `submit`; `id` is accepted as an
+  alias of `request_id`; `line`/`text` are accepted as aliases of `prompt`.
+
 Requests:
 
 ```json
-{"type":"submit","prompt":"inspect this repo","request_id":"optional"}
+{"type":"submit","prompt":"inspect this repo","request_id":"optional","session_id":"optional guard"}
 {"type":"resume","session_id":"abc123","prompt":"optional follow-up","request_id":"optional"}
 {"type":"continue","session_id":"optional","prompt":"optional follow-up","request_id":"optional"}
 {"type":"list_sessions","request_id":"optional"}
 {"type":"status","request_id":"optional"}
 {"type":"interrupt","request_id":"optional"}
-{"type":"shutdown","request_id":"optional"}
+{"type":"shutdown","request_id":"optional","force":false}
 ```
 
 `permission_response` is intentionally reserved for a later interactive-approval
@@ -74,22 +99,51 @@ Events:
 
 ```json
 {"type":"process_ready","protocol_version":1}
-{"type":"ready","session_id":"abc123","request_id":"optional"}
+{"type":"ready","protocol_version":1,"session_id":"abc123","request_id":"optional","resumed":true}
 {"type":"sessions","request_id":"optional","sessions":[]}
-{"type":"state_snapshot","session_id":"abc123","request_id":"optional","state":{},"busy":false}
+{"type":"state_snapshot","protocol_version":1,"session_id":"abc123","request_id":"optional","state":{},"busy":false,"usage":{}}
+{"type":"system","session_id":"abc123","request_id":"optional","message":"..."}
+{"type":"clear_transcript","session_id":"abc123","request_id":"optional"}
+{"type":"status","session_id":"abc123","request_id":"optional","message":"..."}
+{"type":"compact_progress","session_id":"abc123","request_id":"optional","phase":"...","trigger":"...","attempt":1,"message":"..."}
 {"type":"assistant_delta","session_id":"abc123","request_id":"optional","text":"..."}
-{"type":"assistant_complete","session_id":"abc123","request_id":"optional","text":"..."}
+{"type":"assistant_complete","session_id":"abc123","request_id":"optional","text":"...","usage":{}}
 {"type":"tool_started","session_id":"abc123","request_id":"optional","tool_name":"read_file","tool_input":{}}
 {"type":"tool_completed","session_id":"abc123","request_id":"optional","tool_name":"read_file","output":"...","is_error":false}
 {"type":"permission_denied","session_id":"abc123","request_id":"optional","tool_name":"write_file","reason":"..."}
 {"type":"interrupting","request_id":"optional","active":true,"active_request_id":"submit-1"}
 {"type":"interrupted","session_id":"abc123","request_id":"optional"}
-{"type":"line_complete","session_id":"abc123","request_id":"optional"}
+{"type":"interrupted","active":false,"request_id":"optional"}
+{"type":"line_complete","session_id":"abc123","request_id":"optional","usage":{}}
 {"type":"error","request_id":"optional","message":"...","recoverable":true}
 {"type":"shutdown","session_id":"abc123","request_id":"optional"}
 ```
 
+Notes:
+
+- `ready.resumed` is present (true) only when a session was restored.
+- `interrupted` with `"active": false` is the response to an `interrupt`
+  request when no turn is running.
+- `usage` objects carry cumulative token usage for the session
+  (`assistant_complete.usage` is the per-turn snapshot from the provider).
+- `error` with a `question` field is emitted when the model calls `ask_user`,
+  which is unavailable in headless mode.
+
 This protocol intentionally mirrors the current `stream-json` and React backend event vocabulary so the implementation stays small.
+
+## Print Mode Result Contract
+
+`oh -p --output-format json` emits a single result object:
+
+```json
+{"type":"result","session_id":"abc123","text":"...","is_error":false,"errors":[],"permission_denials":[{"tool_name":"bash","reason":"..."}],"system_messages":[],"usage":{}}
+```
+
+`oh -p` exits non-zero when any engine error occurred, in every output format.
+`system_messages` carries runtime notices that would otherwise go to stderr,
+such as the max-turns truncation notice, so json consumers can detect a
+truncated run. `stream-json` includes `session_id` on every event and `usage`
+on `line_complete`.
 
 ## Acceptance Criteria
 

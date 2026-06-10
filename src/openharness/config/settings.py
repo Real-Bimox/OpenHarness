@@ -1081,10 +1081,15 @@ def load_settings(config_path: Path | None = None) -> Settings:
         env_profile = os.environ.get("OPENHARNESS_PROFILE")
         if env_profile:
             settings = settings.model_copy(update={"active_profile": env_profile.strip()})
-        if "profiles" not in raw or "active_profile" not in raw:
+        if "active_profile" not in raw:
+            # No explicit profile selection: synthesize one from the flat
+            # fields so legacy flat configs keep working. Never overwrite a
+            # user-supplied profiles entry of the same name; an explicit
+            # active_profile always wins over flat fields.
             profile_name, profile = _profile_from_flat_settings(settings)
             merged_profiles = settings.merged_profiles()
-            merged_profiles[profile_name] = profile
+            if profile_name not in (raw.get("profiles") or {}):
+                merged_profiles[profile_name] = profile
             settings = settings.model_copy(
                 update={
                     "active_profile": profile_name,
@@ -1113,10 +1118,15 @@ def load_settings_from_source(source: str | None = None) -> Settings:
         env_profile = os.environ.get("OPENHARNESS_PROFILE")
         if env_profile:
             settings = settings.model_copy(update={"active_profile": env_profile.strip()})
-        if "profiles" not in raw or "active_profile" not in raw:
+        if "active_profile" not in raw:
+            # No explicit profile selection: synthesize one from the flat
+            # fields so flat inline JSON keeps working. Never overwrite a
+            # user-supplied profiles entry of the same name; an explicit
+            # active_profile always wins over flat fields.
             profile_name, profile = _profile_from_flat_settings(settings)
             merged_profiles = settings.merged_profiles()
-            merged_profiles[profile_name] = profile
+            if profile_name not in (raw.get("profiles") or {}):
+                merged_profiles[profile_name] = profile
             settings = settings.model_copy(
                 update={
                     "active_profile": profile_name,

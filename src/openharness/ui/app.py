@@ -64,7 +64,14 @@ def _stream_event_payload(event: StreamEvent, *, session_id: str | None = None) 
     if isinstance(event, AssistantTextDelta):
         return _attach_session({"type": "assistant_delta", "text": event.text}, session_id)
     if isinstance(event, AssistantTurnComplete):
-        return _attach_session({"type": "assistant_complete", "text": event.message.text.strip()}, session_id)
+        return _attach_session(
+            {
+                "type": "assistant_complete",
+                "text": event.message.text.strip(),
+                "usage": event.usage.model_dump(),
+            },
+            session_id,
+        )
     if isinstance(event, ToolExecutionStarted):
         return _attach_session(
             {"type": "tool_started", "tool_name": event.tool_name, "tool_input": event.tool_input},
@@ -315,18 +322,26 @@ async def run_print_mode(
     settings_source: str | None = None,
     mcp_server_configs: dict[str, object] | None = None,
     bare: bool = False,
-) -> None:
-    """Non-interactive mode: submit prompt, stream output, exit."""
+) -> int:
+    """Non-interactive mode: submit prompt, stream output, exit.
+
+    Returns a process exit code: 0 on success, 1 when any engine error
+    occurred, so local orchestrators can rely on exit status.
+    """
     if output_format not in _VALID_PRINT_OUTPUT_FORMATS:
         raise ValueError("output_format must be text, json, or stream-json")
 
     collected_text = ""
     events_list: list[dict] = []
+    errors: list[str] = []
+    permission_denials: list[dict[str, str]] = []
+    system_messages: list[str] = []
     session_ref = {"session_id": session_id or ""}
 
     async def _noninteractive_permission(tool_name: str, reason: str) -> bool:
         if _headless_permission_allowed(permission_mode):
             return True
+        permission_denials.append({"tool_name": tool_name, "reason": reason})
         obj = _attach_session(
             {"type": "permission_denied", "tool_name": tool_name, "reason": reason},
             session_ref["session_id"],
@@ -375,6 +390,7 @@ async def run_print_mode(
 
     try:
         async def _print_system(message: str) -> None:
+            system_messages.append(message)
             if output_format == "text":
                 print(message, file=sys.stderr)
             elif output_format == "stream-json":
@@ -418,6 +434,7 @@ async def run_print_mode(
                     _write_jsonl(sys.stdout, obj)
                     events_list.append(obj)
             elif isinstance(event, ErrorEvent):
+                errors.append(event.message)
                 if output_format == "text":
                     print(event.message, file=sys.stderr)
                 elif output_format == "stream-json":
@@ -462,14 +479,28 @@ async def run_print_mode(
             )
 
         if output_format == "stream-json":
-            obj = {"type": "line_complete", "session_id": bundle.session_id}
+            obj = {
+                "type": "line_complete",
+                "session_id": bundle.session_id,
+                "usage": bundle.engine.total_usage.model_dump(),
+            }
             _write_jsonl(sys.stdout, obj)
             events_list.append(obj)
         if output_format == "json":
-            result = {"type": "result", "session_id": bundle.session_id, "text": collected_text.strip()}
+            result = {
+                "type": "result",
+                "session_id": bundle.session_id,
+                "text": collected_text.strip(),
+                "is_error": bool(errors),
+                "errors": errors,
+                "permission_denials": permission_denials,
+                "system_messages": system_messages,
+                "usage": bundle.engine.total_usage.model_dump(),
+            }
             print(json.dumps(result))
     finally:
         await close_runtime(bundle)
+    return 1 if errors else 0
 
 
 async def run_headless_control(
@@ -493,7 +524,13 @@ async def run_headless_control(
     mcp_server_configs: dict[str, object] | None = None,
     bare: bool = False,
 ) -> None:
-    """Run the local JSONL headless control protocol over stdin/stdout."""
+    """Run the local JSONL headless control protocol over stdin/stdout.
+
+    Requests are processed sequentially in FIFO order; ``status``,
+    ``list_sessions``, and ``interrupt`` are answered immediately by the stdin
+    reader even while a turn is active. The process hosts at most one live
+    session at a time: ``resume``/``continue`` replace the active session.
+    """
     from openharness.services.session_storage import (
         list_session_snapshots,
         load_session_by_id,
@@ -508,6 +545,8 @@ async def run_headless_control(
     current_request_id: str | None = None
     active_request_id: str | None = None
     active_request_task: asyncio.Task[bool] | None = None
+    rebuilding = False
+    force_shutdown = False
 
     async def _emit(payload: dict[str, Any], *, request_id: str | None = None) -> None:
         if request_id:
@@ -549,7 +588,8 @@ async def run_headless_control(
     ) -> None:
         nonlocal bundle
         if bundle is not None:
-            await close_runtime(bundle)
+            previous, bundle = bundle, None
+            await close_runtime(previous)
         session_id = None
         restore_messages = None
         restore_tool_metadata = None
@@ -558,7 +598,8 @@ async def run_headless_control(
             session_id = snapshot.get("session_id")
             restore_messages = snapshot.get("messages")
             restore_tool_metadata = snapshot.get("tool_metadata")
-            resolved_model = snapshot.get("model") or model
+            # Explicit CLI --model wins over the model stored in the snapshot.
+            resolved_model = model or snapshot.get("model")
         bundle = await build_runtime(
             cwd=cwd,
             model=resolved_model,
@@ -610,6 +651,30 @@ async def run_headless_control(
             payload["session_id"] = bundle.session_id
         await _emit(payload, request_id=current_request_id)
 
+    def _line_complete_payload() -> dict[str, Any]:
+        payload: dict[str, Any] = {"type": "line_complete", "session_id": bundle.session_id}
+        usage = getattr(bundle.engine, "total_usage", None)
+        if usage is not None:
+            payload["usage"] = usage.model_dump()
+        return payload
+
+    def _save_interrupt_snapshot() -> None:
+        """Persist the session after a cancelled turn so resume keeps the exchange."""
+        if bundle is None:
+            return
+        try:
+            bundle.session_backend.save_snapshot(
+                cwd=bundle.cwd,
+                model=bundle.engine.model,
+                system_prompt=bundle.engine.system_prompt,
+                messages=bundle.engine.messages,
+                usage=bundle.engine.total_usage,
+                session_id=bundle.session_id,
+                tool_metadata=bundle.engine.tool_metadata,
+            )
+        except Exception:
+            pass
+
     async def _submit(line: str, *, request_id: str | None) -> bool:
         if bundle is None:
             await _start_bundle(request_id=request_id)
@@ -623,7 +688,7 @@ async def run_headless_control(
             render_event=_render_event,
             clear_output=_clear_output,
         )
-        await _emit({"type": "line_complete", "session_id": bundle.session_id}, request_id=request_id)
+        await _emit(_line_complete_payload(), request_id=request_id)
         if not should_continue:
             await _emit({"type": "shutdown", "session_id": bundle.session_id}, request_id=request_id)
         return should_continue
@@ -632,29 +697,24 @@ async def run_headless_control(
         sessions = list_session_snapshots(_session_lookup_cwd(), limit=20)
         await _emit({"type": "sessions", "sessions": sessions}, request_id=request_id)
 
+    def _is_busy() -> bool:
+        return rebuilding or (active_request_task is not None and not active_request_task.done())
+
     async def _emit_status(request_id: str | None) -> None:
-        if bundle is None:
-            await _emit(
-                {
-                    "type": "state_snapshot",
-                    "protocol_version": HEADLESS_PROTOCOL_VERSION,
-                    "session_id": None,
-                    "state": None,
-                    "busy": active_request_task is not None and not active_request_task.done(),
-                },
-                request_id=request_id,
-            )
-            return
-        await _emit(
-            {
-                "type": "state_snapshot",
-                "protocol_version": HEADLESS_PROTOCOL_VERSION,
-                "session_id": bundle.session_id,
-                "state": _app_state_payload(bundle),
-                "busy": active_request_task is not None and not active_request_task.done(),
-            },
-            request_id=request_id,
-        )
+        payload: dict[str, Any] = {
+            "type": "state_snapshot",
+            "protocol_version": HEADLESS_PROTOCOL_VERSION,
+            "session_id": None,
+            "state": None,
+            "busy": _is_busy(),
+        }
+        if bundle is not None:
+            payload["session_id"] = bundle.session_id
+            payload["state"] = _app_state_payload(bundle)
+            usage = getattr(bundle.engine, "total_usage", None)
+            if usage is not None:
+                payload["usage"] = usage.model_dump()
+        await _emit(payload, request_id=request_id)
 
     async def _run_active_request(awaitable, *, request_id: str | None) -> bool:
         nonlocal active_request_id, active_request_task, current_request_id
@@ -665,12 +725,18 @@ async def run_headless_control(
         try:
             return await task
         except asyncio.CancelledError:
+            if not task.cancelled():
+                # run_headless_control itself was cancelled (e.g. SIGINT
+                # teardown); propagate instead of treating it as an interrupt.
+                task.cancel()
+                raise
             payload = {"type": "interrupted"}
             if bundle is not None:
                 payload["session_id"] = bundle.session_id
+                _save_interrupt_snapshot()
             await _emit(payload, request_id=request_id)
             if bundle is not None:
-                await _emit({"type": "line_complete", "session_id": bundle.session_id}, request_id=request_id)
+                await _emit(_line_complete_payload(), request_id=request_id)
             return True
         finally:
             if active_request_task is task:
@@ -688,9 +754,45 @@ async def run_headless_control(
             request_id=request_id,
         )
 
+    async def _restore_session(request: HeadlessRequest, *, request_id: str | None) -> bool:
+        """Load a snapshot and rebuild the runtime; returns True on success."""
+        nonlocal rebuilding
+        session_id = (request.session_id or "").strip()
+        if request.type == "resume" and not session_id:
+            await _error("resume requires a non-empty session_id", request_id=request_id)
+            return False
+        rebuilding = True
+        try:
+            if session_id:
+                snapshot = load_session_by_id(_session_lookup_cwd(), session_id)
+            else:
+                snapshot = load_session_snapshot(_session_lookup_cwd())
+            if snapshot is None:
+                message = (
+                    f"Session not found: {session_id}"
+                    if session_id
+                    else "No previous session found in this directory."
+                )
+                await _error(message, request_id=request_id)
+                return False
+            await _start_bundle(snapshot, request_id=request_id)
+            return True
+        except Exception as exc:
+            await _error(f"Failed to restore session: {exc}", request_id=request_id)
+            return False
+        finally:
+            rebuilding = False
+
     async def _read_requests() -> None:
+        nonlocal force_shutdown
         while True:
-            raw = await asyncio.to_thread(input_stream.readline)
+            try:
+                raw = await asyncio.to_thread(input_stream.readline)
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    await _error(f"stdin read failed: {exc}", recoverable=False)
+                await request_queue.put(HeadlessRequest(type="shutdown"))
+                return
             if raw == "":
                 await request_queue.put(HeadlessRequest(type="shutdown"))
                 return
@@ -702,17 +804,29 @@ async def run_headless_control(
             except Exception as exc:
                 await _error(f"Invalid request: {exc}", recoverable=True)
                 continue
-            if request.type == "list_sessions":
-                await _emit_sessions(request.correlation_id)
+            # Answer read-only and interrupt requests immediately, even while a
+            # turn is active; everything else is queued FIFO. Guard so a
+            # handling failure can never silently kill stdin processing.
+            try:
+                if request.type == "list_sessions":
+                    await _emit_sessions(request.correlation_id)
+                    continue
+                if request.type == "status":
+                    await _emit_status(request.correlation_id)
+                    continue
+                if request.type == "interrupt":
+                    await _interrupt_active_request(request.correlation_id)
+                    continue
+                if request.type == "shutdown" and request.force:
+                    # Forced shutdown cancels active work; plain shutdown
+                    # drains the queue and lets the active turn finish.
+                    force_shutdown = True
+                    if active_request_task is not None and not active_request_task.done():
+                        active_request_task.cancel()
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    await _error(f"Request handling failed: {exc}", request_id=request.correlation_id)
                 continue
-            if request.type == "status":
-                await _emit_status(request.correlation_id)
-                continue
-            if request.type == "interrupt":
-                await _interrupt_active_request(request.correlation_id)
-                continue
-            if request.type == "shutdown" and active_request_task is not None and not active_request_task.done():
-                active_request_task.cancel()
             await request_queue.put(request)
 
     await _emit({"type": "process_ready", "protocol_version": HEADLESS_PROTOCOL_VERSION})
@@ -721,60 +835,57 @@ async def run_headless_control(
         while True:
             request = await request_queue.get()
             request_id = request.correlation_id
+            if force_shutdown and request.type != "shutdown":
+                await _error("Process is shutting down", request_id=request_id, recoverable=False)
+                continue
             if request.type in {"submit", "submit_line"}:
                 line = request.submitted_text
                 if not line:
                     await _error("submit requires a non-empty prompt or line", request_id=request_id)
                     continue
-                if active_request_task is not None and not active_request_task.done():
-                    await _error("Session is busy", request_id=request_id)
-                    continue
+                requested_session = (request.session_id or "").strip()
+                if requested_session:
+                    if bundle is None:
+                        await _error(
+                            f"No active session; send a resume request for {requested_session} first",
+                            request_id=request_id,
+                        )
+                        continue
+                    if requested_session != bundle.session_id:
+                        await _error(
+                            f"session_id mismatch: active session is {bundle.session_id}",
+                            request_id=request_id,
+                        )
+                        continue
                 if not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
                     break
-            elif request.type == "resume":
-                session_id = request.session_id
-                if not isinstance(session_id, str) or not session_id.strip():
-                    await _error("resume requires a non-empty session_id", request_id=request_id)
+            elif request.type in {"resume", "continue"}:
+                if not await _restore_session(request, request_id=request_id):
                     continue
-                if active_request_task is not None and not active_request_task.done():
-                    await _error("Session is busy", request_id=request_id)
+                # A force shutdown may have arrived while the runtime was
+                # rebuilding; do not start a new turn afterwards.
+                if force_shutdown:
+                    await _error("Process is shutting down", request_id=request_id, recoverable=False)
                     continue
-                snapshot = load_session_by_id(_session_lookup_cwd(), session_id.strip())
-                if snapshot is None:
-                    await _error(f"Session not found: {session_id}", request_id=request_id)
-                    continue
-                await _start_bundle(snapshot, request_id=request_id)
                 line = request.submitted_text
                 if line and not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
                     break
-            elif request.type == "continue":
-                session_id = request.session_id
-                if active_request_task is not None and not active_request_task.done():
-                    await _error("Session is busy", request_id=request_id)
-                    continue
-                if isinstance(session_id, str) and session_id.strip():
-                    snapshot = load_session_by_id(_session_lookup_cwd(), session_id.strip())
-                else:
-                    snapshot = load_session_snapshot(_session_lookup_cwd())
-                if snapshot is None:
-                    await _error("No previous session found in this directory.", request_id=request_id)
-                    continue
-                await _start_bundle(snapshot, request_id=request_id)
-                line = request.submitted_text
-                if line and not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
-                    break
-            elif request.type == "list_sessions":
-                await _emit_sessions(request_id)
-            elif request.type == "status":
-                await _emit_status(request_id)
-            elif request.type == "interrupt":
-                await _interrupt_active_request(request_id)
             elif request.type == "permission_response":
                 await _error(
                     "permission_response is not used by this deterministic headless mode",
                     request_id=request_id,
                 )
             elif request.type == "shutdown":
+                # Reject anything still queued behind the shutdown so every
+                # request_id gets a response instead of silently vanishing.
+                while not request_queue.empty():
+                    pending = request_queue.get_nowait()
+                    if pending.type != "shutdown":
+                        await _error(
+                            "Process is shutting down",
+                            request_id=pending.correlation_id,
+                            recoverable=False,
+                        )
                 await _emit(
                     {"type": "shutdown", "session_id": bundle.session_id if bundle is not None else ""},
                     request_id=request_id,

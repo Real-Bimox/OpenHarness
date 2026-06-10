@@ -27,6 +27,7 @@ class HeadlessRequest(BaseModel):
     line: str | None = None
     text: str | None = None
     session_id: str | None = None
+    force: bool = False
 
     @property
     def correlation_id(self) -> str | None:

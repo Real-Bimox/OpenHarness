@@ -28,7 +28,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/React+Ink-TUI-61DAFB?logo=react&logoColor=white" alt="React">
-  <img src="https://img.shields.io/badge/pytest-114_pass-brightgreen" alt="Pytest">
+  <img src="https://img.shields.io/badge/pytest-1185_pass-brightgreen" alt="Pytest">
   <img src="https://img.shields.io/badge/E2E-6_suites-orange" alt="E2E">
   <img src="https://img.shields.io/badge/output-text_|_json_|_stream--json-blueviolet" alt="Output">
   <a href="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml"><img src="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -153,7 +153,12 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
-- **Unreleased** 🔍 **Dry-run safe preview**:
+- **2026-06-10** 🤖 **v0.1.10** — Local headless control API:
+  - `oh --headless` runs a local JSONL control protocol over stdin/stdout: `submit`, `resume`, `continue`, `list_sessions`, `status`, `interrupt`, and `shutdown` requests with structured events back, designed for local orchestrators that integrate OpenHarness without a TUI or network service.
+  - `oh -p` now resumes sessions headlessly (`--resume <id>` / `--continue`), returns `session_id`, token `usage`, `errors`, and `permission_denials` in `--output-format json`, and exits non-zero on engine errors.
+  - `shutdown` is graceful by default; `{"type":"shutdown","force":true}` cancels the active turn. Interrupted turns are persisted so resume keeps the exchange.
+  - Full protocol reference: [docs/proposals/headless-local-control-api.md](docs/proposals/headless-local-control-api.md).
+- **v0.1.10** 🔍 **Dry-run safe preview**:
   - `oh --dry-run` previews resolved runtime settings, auth state, skills, commands, tools, and configured MCP servers without executing the model, tools, or subagents.
   - Dry-run now reports a `ready` / `warning` / `blocked` readiness verdict with concrete next-step suggestions such as fixing auth, fixing MCP config, or running the prompt directly.
   - Prompt previews include likely matching skills and tools, while slash-command previews show whether the command is mostly read-only or stateful.
@@ -263,7 +268,26 @@ oh -p "List all functions in main.py" --output-format json
 
 # Stream JSON events in real-time
 oh -p "Fix the bug" --output-format stream-json
+
+# Resume a previous session headlessly
+oh -p "Continue where we left off" --resume <session_id> --output-format json
+oh -p "One more thing" --continue
 ```
+
+The `json` result includes `session_id`, `is_error`, `errors`, `permission_denials`, `system_messages`, and token `usage`, and `oh -p` exits non-zero when an engine error occurred — so scripts can rely on exit status.
+
+### Headless Control Protocol (Local Orchestrators)
+
+`oh --headless` exposes a session-aware JSONL control loop over stdin/stdout for local integrations that need more than one-shot prompts — session discovery, resume, status snapshots, and active-turn interruption — without a TUI, HTTP server, or new dependencies:
+
+```bash
+printf '%s\n' \
+  '{"type":"submit","prompt":"inspect this repo","request_id":"s-1"}' \
+  '{"type":"shutdown","request_id":"d-1"}' \
+  | oh --headless --permission-mode full_auto
+```
+
+Key semantics: requests run FIFO; `status`/`list_sessions`/`interrupt` are answered immediately even mid-turn; `shutdown` is graceful by default while `{"type":"shutdown","force":true}` cancels the active turn; events carry token `usage`; interrupted turns are persisted for resume. Full request/event reference: [docs/proposals/headless-local-control-api.md](docs/proposals/headless-local-control-api.md).
 
 ### Dry Run (Safe Preview)
 
@@ -652,7 +676,7 @@ oh [OPTIONS] COMMAND [ARGS]
 
 Session:     -c/--continue, -r/--resume, -n/--name
 Model:       -m/--model, --effort, --max-turns
-Output:      -p/--print, --output-format text|json|stream-json
+Output:      -p/--print, --output-format text|json|stream-json, --headless
 Permissions: --permission-mode, --dangerously-skip-permissions
 Context:     -s/--system-prompt, --append-system-prompt, --settings
 Advanced:    -d/--debug, --mcp-config, --bare
@@ -731,7 +755,7 @@ Currently `ohmo init` / `ohmo config` can guide channel setup for:
 
 ```bash
 # Run all tests
-uv run pytest -q                           # 114 unit/integration
+uv run pytest -q                           # 1185 unit/integration
 python scripts/test_harness_features.py     # Harness E2E
 python scripts/test_real_skills_plugins.py  # Real plugins E2E
 ```
