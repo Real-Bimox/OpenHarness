@@ -13,10 +13,18 @@ from openharness.skills._frontmatter import (
 from openharness.skills.types import SkillDefinition
 
 _CONTENT_DIR = Path(__file__).parent / "content"
+_BUNDLED_CACHE: list[SkillDefinition] | None = None
 
 
 def get_bundled_skills() -> list[SkillDefinition]:
-    """Load all bundled skills from the content/ directory."""
+    """Load all bundled skills from the content/ directory.
+
+    Bundled content ships with the package and cannot change at runtime, so
+    the parse happens once per process.
+    """
+    global _BUNDLED_CACHE
+    if _BUNDLED_CACHE is not None:
+        return list(_BUNDLED_CACHE)
     skills: list[SkillDefinition] = []
     if not _CONTENT_DIR.exists():
         return skills
@@ -40,7 +48,8 @@ def get_bundled_skills() -> list[SkillDefinition]:
                 argument_hint=metadata["argument_hint"],
             )
         )
-    return skills
+    _BUNDLED_CACHE = skills
+    return list(skills)
 
 
 def _parse_frontmatter(default_name: str, content: str) -> tuple[str, str]:

@@ -42,9 +42,18 @@ def get_user_plugins_dir() -> Path:
 
 def get_project_plugins_dir(cwd: str | Path) -> Path:
     """Return the project plugin directory."""
-    path = Path(cwd).resolve() / ".openharness" / "plugins"
+    path = _project_plugins_dir(cwd)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _project_plugins_dir(cwd: str | Path) -> Path:
+    """Project plugin directory without creating it.
+
+    Discovery runs on every submitted line; it must not mkdir inside the
+    user's project tree as a side effect.
+    """
+    return Path(cwd).resolve() / ".openharness" / "plugins"
 
 
 def _find_manifest(plugin_dir: Path) -> Path | None:
@@ -60,7 +69,7 @@ def _find_manifest(plugin_dir: Path) -> Path | None:
 
 def discover_plugin_paths(cwd: str | Path, extra_roots: Iterable[str | Path] | None = None) -> list[Path]:
     """Find plugin directories from user and project locations."""
-    roots = [get_user_plugins_dir(), get_project_plugins_dir(cwd)]
+    roots = [get_user_plugins_dir(), _project_plugins_dir(cwd)]
     if extra_roots:
         for root in extra_roots:
             path = Path(root).expanduser().resolve()
@@ -86,7 +95,7 @@ def discover_plugin_paths_for_settings(
     """Find plugin directories that are permitted by the active settings."""
     roots = [get_user_plugins_dir()]
     if getattr(settings, "allow_project_plugins", False):
-        roots.append(get_project_plugins_dir(cwd))
+        roots.append(_project_plugins_dir(cwd))
     if extra_roots:
         for root in extra_roots:
             path = Path(root).expanduser().resolve()
@@ -104,10 +113,35 @@ def discover_plugin_paths_for_settings(
     return paths
 
 
+def _plugin_dirs_fingerprint(plugin_dirs: list[Path]) -> tuple:
+    """Stat-based fingerprint covering every file of every plugin directory."""
+    parts: list[object] = []
+    for plugin_dir in plugin_dirs:
+        entry: list[object] = [str(plugin_dir)]
+        try:
+            for file in sorted(plugin_dir.rglob("*")):
+                try:
+                    stat = file.stat()
+                except OSError:
+                    continue
+                if file.is_file():
+                    entry.append((str(file), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            pass
+        parts.append(tuple(entry))
+    return tuple(parts)
+
+
+# Loaded plugins keyed on (cwd, extra_roots); valid while the settings bits
+# and the stat fingerprint match. Re-parsing every manifest/SKILL.md/command
+# on each submitted line is what this avoids.
+_PLUGINS_CACHE: dict[tuple[str, tuple[str, ...]], tuple[tuple, tuple, list[LoadedPlugin]]] = {}
+
+
 def load_plugins(settings, cwd: str | Path, extra_roots: Iterable[str | Path] | None = None) -> list[LoadedPlugin]:
-    """Load plugins from disk."""
-    project_plugins_dir = get_project_plugins_dir(cwd)
-    if not getattr(settings, "allow_project_plugins", False) and any(
+    """Load plugins from disk, cached on a per-file stat fingerprint."""
+    project_plugins_dir = _project_plugins_dir(cwd)
+    if not getattr(settings, "allow_project_plugins", False) and project_plugins_dir.is_dir() and any(
         path.is_dir() and _find_manifest(path) is not None for path in sorted(project_plugins_dir.iterdir())
     ):
         logger.warning(
@@ -115,12 +149,30 @@ def load_plugins(settings, cwd: str | Path, extra_roots: Iterable[str | Path] | 
             "Set allow_project_plugins=true if you trust this workspace.",
             project_plugins_dir,
         )
+
+    plugin_dirs = discover_plugin_paths_for_settings(settings, cwd, extra_roots=extra_roots)
+    cache_key = (
+        str(Path(cwd).resolve()),
+        tuple(str(Path(root).expanduser().resolve()) for root in (extra_roots or ())),
+    )
+    settings_bits = (
+        tuple(sorted((getattr(settings, "enabled_plugins", {}) or {}).items())),
+        bool(getattr(settings, "allow_project_plugins", False)),
+    )
+    fingerprint = _plugin_dirs_fingerprint(plugin_dirs)
+    cached = _PLUGINS_CACHE.get(cache_key)
+    if cached is not None and cached[0] == settings_bits and cached[1] == fingerprint:
+        return list(cached[2])
+
     plugins: list[LoadedPlugin] = []
-    for path in discover_plugin_paths_for_settings(settings, cwd, extra_roots=extra_roots):
+    for path in plugin_dirs:
         plugin = load_plugin(path, settings.enabled_plugins)
         if plugin is not None:
             plugins.append(plugin)
-    return plugins
+    if len(_PLUGINS_CACHE) > 16:
+        _PLUGINS_CACHE.clear()
+    _PLUGINS_CACHE[cache_key] = (settings_bits, fingerprint, plugins)
+    return list(plugins)
 
 
 def load_plugin(path: Path, enabled_plugins: dict[str, bool]) -> LoadedPlugin | None:

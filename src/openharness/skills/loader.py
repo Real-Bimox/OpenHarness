@@ -39,6 +39,30 @@ def get_user_skill_dirs() -> list[Path]:
     return [get_user_skills_dir(), *(Path.home().joinpath(*parts) for parts in _USER_COMPAT_SKILL_DIRS)]
 
 
+def _skill_dirs_fingerprint(directories: Iterable[Path]) -> tuple:
+    """Stat-based fingerprint over the markdown files of skill directories."""
+    parts: list[object] = []
+    for directory in directories:
+        entry: list[object] = [str(directory)]
+        try:
+            for file in sorted(Path(directory).rglob("*.md")):
+                try:
+                    stat = file.stat()
+                except OSError:
+                    continue
+                entry.append((str(file), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            pass
+        parts.append(tuple(entry))
+    return tuple(parts)
+
+
+# Registry instances keyed on (cwd, extra dirs/roots); valid while the skill
+# file fingerprint, settings bits, and cached plugin identities match. The
+# registry is treated as immutable by all consumers.
+_SKILL_REGISTRY_CACHE: dict[tuple, tuple[tuple, SkillRegistry]] = {}
+
+
 def load_skill_registry(
     cwd: str | Path | None = None,
     *,
@@ -47,31 +71,57 @@ def load_skill_registry(
     settings=None,
 ) -> SkillRegistry:
     """Load bundled, user-defined, project, and plugin skills."""
-    registry = SkillRegistry()
-    for skill in get_bundled_skills():
-        registry.register(skill)
-    for skill in load_user_skills():
-        registry.register(skill)
-    for skill in load_skills_from_dirs(extra_skill_dirs, source="user"):
-        registry.register(skill)
-
     resolved_settings = settings or load_settings()
+
+    user_dirs = get_user_skill_dirs()
+    extra_dirs = [Path(d).expanduser().resolve() for d in (extra_skill_dirs or ())]
+    project_dirs: list[Path] = []
     if cwd is not None and getattr(resolved_settings, "allow_project_skills", True):
         project_dirs = discover_project_skill_dirs(
             cwd,
             getattr(resolved_settings, "project_skill_dirs", list(_DEFAULT_PROJECT_SKILL_DIRS)),
         )
-        for skill in load_skills_from_dirs(project_dirs, source="project", create_missing=False):
-            registry.register(skill)
 
+    plugins = []
     if cwd is not None:
         from openharness.plugins.loader import load_plugins
 
-        for plugin in load_plugins(resolved_settings, cwd, extra_roots=extra_plugin_roots):
-            if not plugin.enabled:
-                continue
-            for skill in plugin.skills:
-                registry.register(skill)
+        plugins = load_plugins(resolved_settings, cwd, extra_roots=extra_plugin_roots)
+
+    cache_key = (
+        str(Path(cwd).resolve()) if cwd is not None else None,
+        tuple(str(d) for d in extra_dirs),
+        tuple(str(Path(r).expanduser().resolve()) for r in (extra_plugin_roots or ())),
+    )
+    fingerprint = (
+        _skill_dirs_fingerprint([*user_dirs, *extra_dirs, *project_dirs]),
+        bool(getattr(resolved_settings, "allow_project_skills", True)),
+        tuple(getattr(resolved_settings, "project_skill_dirs", ()) or ()),
+        # Cached plugin lists return the same objects while unchanged, so
+        # identity doubles as a change signal for plugin-provided skills.
+        tuple(id(plugin) for plugin in plugins),
+    )
+    cached = _SKILL_REGISTRY_CACHE.get(cache_key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+
+    registry = SkillRegistry()
+    for skill in get_bundled_skills():
+        registry.register(skill)
+    for skill in load_user_skills():
+        registry.register(skill)
+    for skill in load_skills_from_dirs(extra_dirs, source="user"):
+        registry.register(skill)
+    for skill in load_skills_from_dirs(project_dirs, source="project", create_missing=False):
+        registry.register(skill)
+    for plugin in plugins:
+        if not plugin.enabled:
+            continue
+        for skill in plugin.skills:
+            registry.register(skill)
+    if len(_SKILL_REGISTRY_CACHE) > 16:
+        _SKILL_REGISTRY_CACHE.clear()
+    _SKILL_REGISTRY_CACHE[cache_key] = (fingerprint, registry)
     return registry
 
 

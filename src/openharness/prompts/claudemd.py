@@ -33,11 +33,30 @@ def discover_claude_md_files(cwd: str | Path) -> list[Path]:
     return results
 
 
+# Assembled prompt sections keyed on (cwd, limit); valid while the stat
+# fingerprint of the discovered files matches. Discovery itself stays live
+# (it is stat-only), so new/removed files are picked up immediately.
+_CLAUDE_MD_CACHE: dict[tuple[str, int], tuple[tuple, str | None]] = {}
+
+
 def load_claude_md_prompt(cwd: str | Path, *, max_chars_per_file: int = 12000) -> str | None:
     """Load discovered instruction files into one prompt section."""
     files = discover_claude_md_files(cwd)
     if not files:
         return None
+
+    fingerprint_parts: list[tuple[str, int, int]] = []
+    for path in files:
+        try:
+            stat = path.stat()
+            fingerprint_parts.append((str(path), stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            fingerprint_parts.append((str(path), -1, -1))
+    fingerprint = tuple(fingerprint_parts)
+    key = (str(Path(cwd).resolve()), max_chars_per_file)
+    cached = _CLAUDE_MD_CACHE.get(key)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
 
     lines = ["# Project Instructions"]
     for path in files:
@@ -45,4 +64,8 @@ def load_claude_md_prompt(cwd: str | Path, *, max_chars_per_file: int = 12000) -
         if len(content) > max_chars_per_file:
             content = content[:max_chars_per_file] + "\n...[truncated]..."
         lines.extend(["", f"## {path}", "```md", content.strip(), "```"])
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if len(_CLAUDE_MD_CACHE) > 16:
+        _CLAUDE_MD_CACHE.clear()
+    _CLAUDE_MD_CACHE[key] = (fingerprint, result)
+    return result
