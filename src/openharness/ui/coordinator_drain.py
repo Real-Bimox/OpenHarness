@@ -12,6 +12,7 @@ backends can share the same logic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 from openharness.coordinator.coordinator_mode import (
     TaskNotification,
@@ -62,28 +63,47 @@ def _build_async_task_summary(
 async def wait_for_completed_async_agent_entries(
     tool_metadata: dict[str, object] | None,
     *,
-    poll_interval_seconds: float = 0.1,
+    poll_interval_seconds: float = 0.5,
 ) -> list[dict[str, object]]:
+    """Wait for any tracked async agent task to reach a terminal state.
+
+    Wakes on the task manager's completion listener; the poll interval is
+    only a fallback heartbeat for state changes the listener cannot observe
+    (e.g. tasks that disappeared from the manager, or embedders whose task
+    manager does not implement completion listeners).
+    """
     manager = get_task_manager()
-    while True:
-        pending = pending_async_agent_entries(tool_metadata)
-        if not pending:
-            return []
-        completed: list[dict[str, object]] = []
-        for entry in pending:
-            task_id = str(entry.get("task_id") or "").strip()
-            task = manager.get_task(task_id)
-            if task is None:
-                entry["notification_sent"] = True
-                entry["status"] = "missing"
-                continue
-            entry["status"] = task.status
-            if task.status in _TERMINAL_TASK_STATUSES:
-                entry["return_code"] = task.return_code
-                completed.append(entry)
-        if completed:
-            return completed
-        await asyncio.sleep(poll_interval_seconds)
+    wake = asyncio.Event()
+
+    async def _on_completion(_task) -> None:
+        wake.set()
+
+    register = getattr(manager, "register_completion_listener", None)
+    unregister = register(_on_completion) if callable(register) else (lambda: None)
+    try:
+        while True:
+            pending = pending_async_agent_entries(tool_metadata)
+            if not pending:
+                return []
+            completed: list[dict[str, object]] = []
+            for entry in pending:
+                task_id = str(entry.get("task_id") or "").strip()
+                task = manager.get_task(task_id)
+                if task is None:
+                    entry["notification_sent"] = True
+                    entry["status"] = "missing"
+                    continue
+                entry["status"] = task.status
+                if task.status in _TERMINAL_TASK_STATUSES:
+                    entry["return_code"] = task.return_code
+                    completed.append(entry)
+            if completed:
+                return completed
+            wake.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(wake.wait(), timeout=poll_interval_seconds)
+    finally:
+        unregister()
 
 
 def format_completed_task_notifications(completed: list[dict[str, object]]) -> str:

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import sys
+import threading
 from dataclasses import asdict
 from typing import Any, TextIO
 
@@ -227,6 +229,12 @@ async def run_task_worker(
     This mode exists for subprocess teammates and other task-manager managed
     agent processes. It intentionally avoids the React TUI / Ink path so it
     can run without a controlling TTY.
+
+    The worker is persistent: it keeps serving stdin lines until EOF, an
+    idle timeout (``task_worker_idle_timeout_s``), or a terminating command.
+    When the task manager set ``OPENHARNESS_TASK_SESSION_ID``, conversation
+    state is restored from (and saved to) that session across restarts, so a
+    crashed or idle-reaped worker resumes with its context intact.
     """
 
     async def _noninteractive_permission(tool_name: str, reason: str) -> bool:
@@ -260,6 +268,21 @@ async def run_task_worker(
     async def _clear_output() -> None:
         return None
 
+    # Restore conversation state for managed workers so a restart resumes
+    # with full context instead of an empty conversation.
+    task_session_id = os.environ.get("OPENHARNESS_TASK_SESSION_ID", "").strip() or None
+    restore_messages: list[dict] | None = None
+    restore_tool_metadata: dict[str, object] | None = None
+    if task_session_id:
+        from openharness.services.session_storage import load_session_by_id
+
+        snapshot = load_session_by_id(cwd or ".", task_session_id)
+        if snapshot is not None:
+            raw_messages = snapshot.get("messages")
+            raw_metadata = snapshot.get("tool_metadata")
+            restore_messages = raw_messages if isinstance(raw_messages, list) else None
+            restore_tool_metadata = raw_metadata if isinstance(raw_metadata, dict) else None
+
     bundle = await build_runtime(
         cwd=cwd,
         model=model,
@@ -280,27 +303,54 @@ async def run_task_worker(
         settings_source=settings_source,
         mcp_server_configs=mcp_server_configs,
         bare=bare,
+        session_id=task_session_id,
+        restore_messages=restore_messages,
+        restore_tool_metadata=restore_tool_metadata,
     )
     await start_runtime(bundle)
+
+    idle_timeout = getattr(bundle.current_settings(), "task_worker_idle_timeout_s", 600.0)
+    line_queue: asyncio.Queue[str] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _stdin_reader() -> None:
+        # Daemon thread: a blocking readline must never keep the executor
+        # shutdown (and therefore process exit on idle timeout) waiting.
+        while True:
+            raw = sys.stdin.readline()
+            try:
+                loop.call_soon_threadsafe(line_queue.put_nowait, raw)
+            except RuntimeError:
+                return
+            if raw == "":
+                return
+
+    threading.Thread(target=_stdin_reader, name="task-worker-stdin", daemon=True).start()
     try:
         while True:
-            raw = await asyncio.to_thread(sys.stdin.readline)
+            try:
+                raw = await asyncio.wait_for(
+                    line_queue.get(),
+                    timeout=idle_timeout if idle_timeout and idle_timeout > 0 else None,
+                )
+            except asyncio.TimeoutError:
+                # Idle: exit cleanly. The task manager transparently restarts
+                # the worker (with restored context) on the next message.
+                break
             if raw == "":
                 break
             line = _decode_task_worker_line(raw)
             if not line:
                 continue
-            await handle_line(
+            should_continue = await handle_line(
                 bundle,
                 line,
                 print_system=_print_system,
                 render_event=_render_event,
                 clear_output=_clear_output,
             )
-            # Background agent tasks are one-shot workers. If the coordinator
-            # needs to send a follow-up later, BackgroundTaskManager already
-            # knows how to restart the task and write the next stdin payload.
-            break
+            if not should_continue:
+                break
     finally:
         await close_runtime(bundle)
 

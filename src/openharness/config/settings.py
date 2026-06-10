@@ -581,6 +581,9 @@ class Settings(BaseModel):
     active_profile: str = "claude-api"
     profiles: dict[str, ProviderProfile] = Field(default_factory=default_provider_profiles)
     max_turns: int = 200
+    # Idle seconds before a persistent --task-worker process exits and waits
+    # to be restarted by the task manager on the next message. <= 0 disables.
+    task_worker_idle_timeout_s: float = 600.0
 
     # Behavior
     system_prompt: str | None = None

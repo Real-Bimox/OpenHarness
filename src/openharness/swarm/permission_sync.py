@@ -1040,9 +1040,9 @@ async def poll_permission_response(
 ) -> SwarmPermissionResponse | None:
     """Poll the worker's own mailbox until a matching ``permission_response`` arrives.
 
-    Checks every 0.5 s up to *timeout* seconds.  When a response matching
-    *request_id* is found, the message is marked read and the decoded
-    :class:`SwarmPermissionResponse` is returned.
+    Polls with backoff (0.2 s growing to 2 s) up to *timeout* seconds.  When
+    a response matching *request_id* is found, the message is marked read and
+    the decoded :class:`SwarmPermissionResponse` is returned.
 
     Args:
         team_name: The swarm team name.
@@ -1056,6 +1056,10 @@ async def poll_permission_response(
     worker_mailbox = TeammateMailbox(team_name, worker_id)
     deadline = time.monotonic() + timeout
 
+    # Back off from quick first checks toward a slower steady-state: the
+    # human/leader side usually answers within seconds, but each poll is a
+    # directory scan, so don't pay 2 scans/second for a minute-long wait.
+    delay = 0.2
     while time.monotonic() < deadline:
         messages = await worker_mailbox.read_all(unread_only=True)
         for msg in messages:
@@ -1069,7 +1073,8 @@ async def poll_permission_response(
                         feedback=payload.get("feedback"),
                         updated_rules=payload.get("updated_rules", []),
                     )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(min(delay, max(0.05, deadline - time.monotonic())))
+        delay = min(delay * 1.5, 2.0)
 
     return None
 
