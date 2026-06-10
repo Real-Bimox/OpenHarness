@@ -1112,6 +1112,9 @@ def create_default_command_registry(
         )
 
     async def _reload_plugins_handler(_: str, context: CommandContext) -> CommandResult:
+        from openharness.plugins.loader import invalidate_plugin_cache
+
+        invalidate_plugin_cache()
         settings = load_settings()
         plugins = load_plugins(settings, context.cwd, extra_roots=context.extra_plugin_roots)
         if not plugins:

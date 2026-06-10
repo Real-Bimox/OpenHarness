@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import json
 import logging
+import time
 import os
 import sys
 from pathlib import Path
@@ -135,7 +136,18 @@ def _plugin_dirs_fingerprint(plugin_dirs: list[Path]) -> tuple:
 # Loaded plugins keyed on (cwd, extra_roots); valid while the settings bits
 # and the stat fingerprint match. Re-parsing every manifest/SKILL.md/command
 # on each submitted line is what this avoids.
-_PLUGINS_CACHE: dict[tuple[str, tuple[str, ...]], tuple[tuple, tuple, list[LoadedPlugin]]] = {}
+_PLUGINS_CACHE: dict[tuple[str, tuple[str, ...]], tuple[tuple, tuple, list[LoadedPlugin], float]] = {}
+# Re-verify the stat fingerprint at most once per second: the walk itself is
+# the per-line cost, and sub-second staleness on plugin edits is invisible.
+_PLUGINS_REVALIDATE_SECONDS = 1.0
+
+
+def invalidate_plugin_cache() -> None:
+    """Drop cached plugin loads (call after install/uninstall/reload)."""
+    _PLUGINS_CACHE.clear()
+    from openharness.skills.loader import invalidate_skill_registry_cache
+
+    invalidate_skill_registry_cache()
 
 
 def load_plugins(settings, cwd: str | Path, extra_roots: Iterable[str | Path] | None = None) -> list[LoadedPlugin]:
@@ -150,7 +162,6 @@ def load_plugins(settings, cwd: str | Path, extra_roots: Iterable[str | Path] | 
             project_plugins_dir,
         )
 
-    plugin_dirs = discover_plugin_paths_for_settings(settings, cwd, extra_roots=extra_roots)
     cache_key = (
         str(Path(cwd).resolve()),
         tuple(str(Path(root).expanduser().resolve()) for root in (extra_roots or ())),
@@ -159,9 +170,19 @@ def load_plugins(settings, cwd: str | Path, extra_roots: Iterable[str | Path] | 
         tuple(sorted((getattr(settings, "enabled_plugins", {}) or {}).items())),
         bool(getattr(settings, "allow_project_plugins", False)),
     )
-    fingerprint = _plugin_dirs_fingerprint(plugin_dirs)
+    now = time.monotonic()
     cached = _PLUGINS_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and cached[0] == settings_bits
+        and now - cached[3] < _PLUGINS_REVALIDATE_SECONDS
+    ):
+        return list(cached[2])
+
+    plugin_dirs = discover_plugin_paths_for_settings(settings, cwd, extra_roots=extra_roots)
+    fingerprint = _plugin_dirs_fingerprint(plugin_dirs)
     if cached is not None and cached[0] == settings_bits and cached[1] == fingerprint:
+        _PLUGINS_CACHE[cache_key] = (settings_bits, fingerprint, cached[2], now)
         return list(cached[2])
 
     plugins: list[LoadedPlugin] = []
@@ -171,7 +192,7 @@ def load_plugins(settings, cwd: str | Path, extra_roots: Iterable[str | Path] | 
             plugins.append(plugin)
     if len(_PLUGINS_CACHE) > 16:
         _PLUGINS_CACHE.clear()
-    _PLUGINS_CACHE[cache_key] = (settings_bits, fingerprint, plugins)
+    _PLUGINS_CACHE[cache_key] = (settings_bits, fingerprint, plugins, now)
     return list(plugins)
 
 

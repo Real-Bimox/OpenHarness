@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -60,7 +61,14 @@ def _skill_dirs_fingerprint(directories: Iterable[Path]) -> tuple:
 # Registry instances keyed on (cwd, extra dirs/roots); valid while the skill
 # file fingerprint, settings bits, and cached plugin identities match. The
 # registry is treated as immutable by all consumers.
-_SKILL_REGISTRY_CACHE: dict[tuple, tuple[tuple, SkillRegistry]] = {}
+_SKILL_REGISTRY_CACHE: dict[tuple, tuple[tuple, SkillRegistry, float]] = {}
+# Re-verify the stat fingerprint at most once per second (see plugins loader).
+_SKILLS_REVALIDATE_SECONDS = 1.0
+
+
+def invalidate_skill_registry_cache() -> None:
+    """Drop cached skill registries (call after skill/plugin mutations)."""
+    _SKILL_REGISTRY_CACHE.clear()
 
 
 def load_skill_registry(
@@ -93,6 +101,9 @@ def load_skill_registry(
         tuple(str(d) for d in extra_dirs),
         tuple(str(Path(r).expanduser().resolve()) for r in (extra_plugin_roots or ())),
     )
+    ttl_hit = _SKILL_REGISTRY_CACHE.get(cache_key)
+    if ttl_hit is not None and time.monotonic() - ttl_hit[2] < _SKILLS_REVALIDATE_SECONDS:
+        return ttl_hit[1]
     fingerprint = (
         _skill_dirs_fingerprint([*user_dirs, *extra_dirs, *project_dirs]),
         bool(getattr(resolved_settings, "allow_project_skills", True)),
@@ -102,7 +113,9 @@ def load_skill_registry(
         tuple(id(plugin) for plugin in plugins),
     )
     cached = _SKILL_REGISTRY_CACHE.get(cache_key)
+    now = time.monotonic()
     if cached is not None and cached[0] == fingerprint:
+        _SKILL_REGISTRY_CACHE[cache_key] = (fingerprint, cached[1], now)
         return cached[1]
 
     registry = SkillRegistry()
@@ -121,7 +134,7 @@ def load_skill_registry(
             registry.register(skill)
     if len(_SKILL_REGISTRY_CACHE) > 16:
         _SKILL_REGISTRY_CACHE.clear()
-    _SKILL_REGISTRY_CACHE[cache_key] = (fingerprint, registry)
+    _SKILL_REGISTRY_CACHE[cache_key] = (fingerprint, registry, now)
     return registry
 
 

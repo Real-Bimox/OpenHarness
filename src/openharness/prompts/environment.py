@@ -139,11 +139,32 @@ def _detect_git_info_uncached(cwd: str) -> tuple[bool, str | None]:
     return True, branch
 
 
+# Snapshots keyed per cwd, validated by the git HEAD fingerprint and the
+# UTC date (the only inputs that change while a session runs).
+_ENV_INFO_CACHE: dict[str, tuple[tuple, EnvironmentInfo]] = {}
+
+
 def get_environment_info(cwd: str | None = None) -> EnvironmentInfo:
     """Gather all environment information into an EnvironmentInfo snapshot."""
     if cwd is None:
         cwd = os.getcwd()
 
+    validator = (
+        _git_head_fingerprint(cwd),
+        datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+        os.environ.get("VIRTUAL_ENV"),
+    )
+    hit = _ENV_INFO_CACHE.get(cwd)
+    if hit is not None and hit[0] == validator:
+        return hit[1]
+    info = _get_environment_info_uncached(cwd)
+    if len(_ENV_INFO_CACHE) > 16:
+        _ENV_INFO_CACHE.clear()
+    _ENV_INFO_CACHE[cwd] = (validator, info)
+    return info
+
+
+def _get_environment_info_uncached(cwd: str) -> EnvironmentInfo:
     python_executable = str(Path(sys.executable).resolve())
     virtual_env = os.environ.get("VIRTUAL_ENV")
     if not virtual_env:

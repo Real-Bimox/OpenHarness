@@ -36,7 +36,13 @@ from pathlib import Path
 __all__ = ["atomic_write_bytes", "atomic_write_text", "read_text_tail"]
 
 
-def atomic_write_bytes(path: str | os.PathLike[str], data: bytes, *, mode: int | None = None) -> None:
+def atomic_write_bytes(
+    path: str | os.PathLike[str],
+    data: bytes,
+    *,
+    mode: int | None = None,
+    fsync: bool = True,
+) -> None:
     """Write ``data`` to ``path`` atomically.
 
     When ``mode`` is given, the final file is created with that POSIX mode
@@ -44,6 +50,11 @@ def atomic_write_bytes(path: str | os.PathLike[str], data: bytes, *, mode: int |
     existing file's mode is preserved; for new files the current umask
     determines the mode, matching the historical behaviour of
     :meth:`pathlib.Path.write_text`.
+
+    ``fsync=False`` keeps the rename atomicity (readers never observe a
+    partial file) but skips flushing to stable storage. Use it for
+    high-frequency state that is recreated from memory on the next write,
+    where a crash losing the newest version is acceptable.
     """
     dst = Path(path)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -57,7 +68,8 @@ def atomic_write_bytes(path: str | os.PathLike[str], data: bytes, *, mode: int |
         with os.fdopen(fd, "wb") as tmp_file:
             tmp_file.write(data)
             tmp_file.flush()
-            os.fsync(tmp_file.fileno())
+            if fsync:
+                os.fsync(tmp_file.fileno())
         _apply_mode(tmp_path, target_mode)
         os.replace(tmp_path, dst)
     except BaseException:
@@ -72,9 +84,10 @@ def atomic_write_text(
     *,
     encoding: str = "utf-8",
     mode: int | None = None,
+    fsync: bool = True,
 ) -> None:
     """Text variant of :func:`atomic_write_bytes`."""
-    atomic_write_bytes(path, data.encode(encoding), mode=mode)
+    atomic_write_bytes(path, data.encode(encoding), mode=mode, fsync=fsync)
 
 
 def read_text_tail(

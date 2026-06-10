@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from openharness.commands import (
     create_default_command_registry,
     lookup_skill_slash_command,
 )
-from openharness.config import load_settings_from_source
+from openharness.config import get_config_file_path, load_settings_from_source
 from openharness.engine import QueryEngine
 from openharness.engine.messages import (
     ConversationMessage,
@@ -140,6 +141,21 @@ class RuntimeBundle:
     memory_backend: MemoryCommandBackend | None = None
     include_project_memory: bool = True
     autodream_context: dict[str, object] | None = None
+    _settings_cache: tuple[tuple, Any] | None = field(default=None, repr=False)
+    _hook_registry_cache: tuple[tuple, Any] | None = field(default=None, repr=False)
+
+    def _settings_fingerprint(self) -> tuple:
+        """Cheap identity of the on-disk settings source plus profile env."""
+        source = self.settings_overrides.get("settings_source")
+        env_profile = (os.environ.get("OPENHARNESS_PROFILE") or "").strip()
+        if source and source.strip().startswith("{"):
+            return (source, env_profile)
+        path = Path(source).expanduser() if source else get_config_file_path()
+        try:
+            stat = path.stat()
+            return (str(path), stat.st_mtime_ns, stat.st_size, env_profile)
+        except OSError:
+            return (str(path), -1, -1, env_profile)
 
     def current_settings(self):
         """Return the effective settings for this session.
@@ -149,10 +165,34 @@ class RuntimeBundle:
         the lifetime of the running process. Without this overlay, issuing any
         slash command (e.g. ``/fast``) would refresh UI state from disk and
         "snap back" the model/provider to whatever is stored in the config file.
+
+        Called several times per submitted line; the merged result is cached
+        on the settings-source fingerprint so unchanged files cost one stat.
+        Consumers treat the returned instance as read-only.
         """
-        return load_settings_from_source(
+        fingerprint = self._settings_fingerprint()
+        if self._settings_cache is not None and self._settings_cache[0] == fingerprint:
+            return self._settings_cache[1]
+        settings = load_settings_from_source(
             self.settings_overrides.get("settings_source")
         ).merge_cli_overrides(**self.settings_overrides)
+        self._settings_cache = (fingerprint, settings)
+        return settings
+
+    def current_hook_registry(self) -> HookRegistry:
+        """Return the hook registry, rebuilt only when its inputs changed."""
+        if self.settings_overrides.get("bare"):
+            return HookRegistry()
+        settings = self.current_settings()
+        plugins = self.current_plugins()
+        # The cached plugin list returns identical objects while unchanged,
+        # and current_settings() returns the same instance per fingerprint.
+        key = (id(settings), tuple(id(plugin) for plugin in plugins))
+        if self._hook_registry_cache is not None and self._hook_registry_cache[0] == key:
+            return self._hook_registry_cache[1]
+        registry = load_hook_registry(settings, plugins)
+        self._hook_registry_cache = (key, registry)
+        return registry
 
     def current_plugins(self):
         """Return currently visible plugins for the working tree."""
@@ -168,7 +208,7 @@ class RuntimeBundle:
         """Return the current hook summary."""
         if self.settings_overrides.get("bare"):
             return "No hooks configured."
-        return load_hook_registry(self.current_settings(), self.current_plugins()).summary()
+        return self.current_hook_registry().summary()
 
     def plugin_summary(self) -> str:
         """Return the current plugin summary."""
@@ -705,12 +745,7 @@ async def handle_line(
 ) -> bool:
     """Handle one submitted line for either headless or TUI rendering."""
     if not bundle.external_api_client:
-        if bundle.settings_overrides.get("bare"):
-            bundle.hook_executor.update_registry(HookRegistry())
-        else:
-            bundle.hook_executor.update_registry(
-                load_hook_registry(bundle.current_settings(), bundle.current_plugins())
-            )
+        bundle.hook_executor.update_registry(bundle.current_hook_registry())
 
     command_context = CommandContext(
         engine=bundle.engine,

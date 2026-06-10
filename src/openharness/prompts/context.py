@@ -24,6 +24,11 @@ from openharness.prompts.system_prompt import build_system_prompt
 from openharness.skills.loader import load_skill_registry
 
 
+# Formatted section keyed by registry identity: the registry cache returns
+# the same object while skill files are unchanged.
+_SKILLS_SECTION_CACHE: dict[int, tuple[object, str | None]] = {}
+
+
 def _build_skills_section(
     cwd: str | Path,
     *,
@@ -38,6 +43,17 @@ def _build_skills_section(
         extra_plugin_roots=extra_plugin_roots,
         settings=settings,
     )
+    hit = _SKILLS_SECTION_CACHE.get(id(registry))
+    if hit is not None and hit[0] is registry:
+        return hit[1]
+    result = _format_skills_section(registry)
+    if len(_SKILLS_SECTION_CACHE) > 16:
+        _SKILLS_SECTION_CACHE.clear()
+    _SKILLS_SECTION_CACHE[id(registry)] = (registry, result)
+    return result
+
+
+def _format_skills_section(registry) -> str | None:
     skills = [skill for skill in registry.list_skills() if not skill.disable_model_invocation]
     if not skills:
         return None
