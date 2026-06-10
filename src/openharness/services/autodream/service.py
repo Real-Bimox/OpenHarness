@@ -229,7 +229,12 @@ async def start_dream_now(
     )
 
     async def _mark_changed_on_completion(done: TaskRecord) -> None:
-        if done.id != task.id or done.status != "completed":
+        if done.id != task.id:
+            return
+        # This dream task is terminal either way; drop the listener so they
+        # do not accumulate across dream runs for the process lifetime.
+        unregister()
+        if done.status != "completed":
             return
         changed = _files_changed_since(resolved_memory_dir, before)
         if backup_dir is not None:
@@ -241,7 +246,7 @@ async def start_dream_now(
             done.metadata["phase"] = "updating"
             done.metadata["files_touched"] = "\n".join(changed)
 
-    get_task_manager().register_completion_listener(_mark_changed_on_completion)
+    unregister = get_task_manager().register_completion_listener(_mark_changed_on_completion)
     return task
 
 
@@ -303,6 +308,9 @@ async def execute_auto_dream(
     )
 
 
+_scheduled_dream_tasks: set[asyncio.Task[object]] = set()
+
+
 def schedule_auto_dream(**kwargs: object) -> None:
     """Fire-and-forget auto-dream scheduling."""
 
@@ -310,4 +318,8 @@ def schedule_auto_dream(**kwargs: object) -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return
-    loop.create_task(execute_auto_dream(**kwargs))  # type: ignore[arg-type]
+    # Hold a reference until completion; bare create_task results can be
+    # garbage-collected mid-flight.
+    task = loop.create_task(execute_auto_dream(**kwargs))  # type: ignore[arg-type]
+    _scheduled_dream_tasks.add(task)
+    task.add_done_callback(_scheduled_dream_tasks.discard)

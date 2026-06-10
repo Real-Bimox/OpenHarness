@@ -68,6 +68,8 @@ class MemorySettings(BaseModel):
     auto_compact_threshold_tokens: int | None = None
     auto_extract_enabled: bool = False
     auto_extract_max_records: int = 3
+    # Model for the background memory-extraction pass; empty = session model.
+    extract_model: str = ""
     session_memory_enabled: bool = True
     auto_dream_enabled: bool = False
     auto_dream_min_hours: float = 24.0
