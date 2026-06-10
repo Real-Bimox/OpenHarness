@@ -13,7 +13,7 @@
 
 **OpenHarness** delivers core lightweight agent infrastructure: tool-use, skills, memory, and multi-agent coordination.
 
-**ohmo** is a personal AI agent built on OpenHarness — not another chatbot, but an assistant that actually works for you over long sessions. Chat with ohmo in Feishu / Slack / Telegram / Discord, and it forks branches, writes code, runs tests, and opens PRs on its own. ohmo runs on your existing Claude Code or Codex subscription — no extra API key needed.
+**ohmo** is a personal AI agent built on OpenHarness — not another chatbot, but an assistant that actually works for you over long sessions. Chat with ohmo in Feishu / Slack / Telegram / Discord, and it forks branches, writes code, runs tests, and opens PRs on its own using your configured OpenHarness runtime.
 
 **Join the community**: contribute **Harness** for open agent development.
 
@@ -28,12 +28,12 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/React+Ink-TUI-61DAFB?logo=react&logoColor=white" alt="React">
-  <img src="https://img.shields.io/badge/pytest-114_pass-brightgreen" alt="Pytest">
+  <img src="https://img.shields.io/badge/pytest-1185_pass-brightgreen" alt="Pytest">
   <img src="https://img.shields.io/badge/E2E-6_suites-orange" alt="E2E">
   <img src="https://img.shields.io/badge/output-text_|_json_|_stream--json-blueviolet" alt="Output">
-  <a href="https://github.com/HKUDS/OpenHarness/actions/workflows/ci.yml"><img src="https://github.com/HKUDS/OpenHarness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/HKUDS/.github/blob/main/profile/README.md"><img src="https://img.shields.io/badge/Feishu-Group-E9DBFC?style=flat&logo=feishu&logoColor=white" alt="Feishu"></a>
-  <a href="https://github.com/HKUDS/.github/blob/main/profile/README.md"><img src="https://img.shields.io/badge/WeChat-Group-C5EAB4?style=flat&logo=wechat&logoColor=white" alt="WeChat"></a>
+  <a href="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml"><img src="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Real-Bimox/OpenHarness"><img src="https://img.shields.io/badge/Project-OpenHarness-E9DBFC?style=flat" alt="OpenHarness"></a>
+  <a href="https://github.com/Real-Bimox/OpenHarness"><img src="https://img.shields.io/badge/Fork-Real--Bimox-C5EAB4?style=flat" alt="Real-Bimox"></a>
 </p>
 
 One Command (**oh**) to Launch **OpenHarness** and Unlock All Agent Harnesses. 
@@ -126,7 +126,7 @@ Supports CLI agent integration including OpenClaw, nanobot, Cursor, and more.
 <p align="center"><strong>• Subagent Spawning & Delegation</strong></p>
 <p align="center"><strong>• Team Registry & Task Management</strong></p>
 <p align="center"><strong>• Background Task Lifecycle</strong></p>
-<p align="center"><strong>• <a href="https://github.com/HKUDS/ClawTeam">ClawTeam</a> Integration (Roadmap)</strong></p>
+<p align="center"><strong>• Multi-agent Team Integration (Roadmap)</strong></p>
 
 </td>
 </tr>
@@ -153,7 +153,12 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
-- **Unreleased** 🔍 **Dry-run safe preview**:
+- **2026-06-10** 🤖 **v0.1.10** — Local headless control API:
+  - `oh --headless` runs a local JSONL control protocol over stdin/stdout: `submit`, `resume`, `continue`, `list_sessions`, `status`, `interrupt`, and `shutdown` requests with structured events back, designed for local orchestrators that integrate OpenHarness without a TUI or network service.
+  - `oh -p` now resumes sessions headlessly (`--resume <id>` / `--continue`), returns `session_id`, token `usage`, `errors`, and `permission_denials` in `--output-format json`, and exits non-zero on engine errors.
+  - `shutdown` is graceful by default; `{"type":"shutdown","force":true}` cancels the active turn. Interrupted turns are persisted so resume keeps the exchange.
+  - Full protocol reference: [docs/proposals/headless-local-control-api.md](docs/proposals/headless-local-control-api.md).
+- **v0.1.10** 🔍 **Dry-run safe preview**:
   - `oh --dry-run` previews resolved runtime settings, auth state, skills, commands, tools, and configured MCP servers without executing the model, tools, or subagents.
   - Dry-run now reports a `ready` / `warning` / `blocked` readiness verdict with concrete next-step suggestions such as fixing auth, fixing MCP config, or running the prompt directly.
   - Prompt previews include likely matching skills and tools, while slash-command previews show whether the command is mostly read-only or stateful.
@@ -202,7 +207,7 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ```bash
 # One-click install
-curl -fsSL https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Real-Bimox/OpenHarness/main/scripts/install.sh | bash
 
 # Or via pip
 pip install openharness-ai
@@ -212,7 +217,7 @@ pip install openharness-ai
 
 ```powershell
 # One-click install (PowerShell)
-iex (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.ps1')
+iex (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Real-Bimox/OpenHarness/main/scripts/install.ps1')
 
 # Or via pip
 pip install openharness-ai
@@ -250,7 +255,7 @@ ohmo config           # configure channels and provider
 ohmo gateway start    # start the gateway — ohmo is now live in your chat app
 ```
 
-ohmo runs on your existing **Claude Code subscription** or **Codex subscription** — no extra API key needed.
+ohmo runs through the configured **OpenHarness runtime**.
 
 ### Non-Interactive Mode (Pipes & Scripts)
 
@@ -263,7 +268,26 @@ oh -p "List all functions in main.py" --output-format json
 
 # Stream JSON events in real-time
 oh -p "Fix the bug" --output-format stream-json
+
+# Resume a previous session headlessly
+oh -p "Continue where we left off" --resume <session_id> --output-format json
+oh -p "One more thing" --continue
 ```
+
+The `json` result includes `session_id`, `is_error`, `errors`, `permission_denials`, `system_messages`, and token `usage`, and `oh -p` exits non-zero when an engine error occurred — so scripts can rely on exit status.
+
+### Headless Control Protocol (Local Orchestrators)
+
+`oh --headless` exposes a session-aware JSONL control loop over stdin/stdout for local integrations that need more than one-shot prompts — session discovery, resume, status snapshots, and active-turn interruption — without a TUI, HTTP server, or new dependencies:
+
+```bash
+printf '%s\n' \
+  '{"type":"submit","prompt":"inspect this repo","request_id":"s-1"}' \
+  '{"type":"shutdown","request_id":"d-1"}' \
+  | oh --headless --permission-mode full_auto
+```
+
+Key semantics: requests run FIFO; `status`/`list_sessions`/`interrupt` are answered immediately even mid-turn; `shutdown` is graceful by default while `{"type":"shutdown","force":true}` cancels the active turn; events carry token `usage`; interrupted turns are persisted for resume. Full request/event reference: [docs/proposals/headless-local-control-api.md](docs/proposals/headless-local-control-api.md).
 
 ### Dry Run (Safe Preview)
 
@@ -609,7 +633,7 @@ OpenHarness is useful as a lightweight harness layer around Claude-style tooling
 
 - **OpenClaw-oriented workflows** can reuse Markdown-first knowledge and command-driven collaboration patterns.
 - **Claude-style plugins and skills** stay portable because OpenHarness keeps those formats familiar.
-- **ClawTeam-style multi-agent work** maps well onto the built-in team, task, and background execution primitives.
+- **Multi-agent work** maps well onto the built-in team, task, and background execution primitives.
 
 For concrete usage ideas instead of generic claims, see [`docs/SHOWCASE.md`](docs/SHOWCASE.md).
 
@@ -652,7 +676,7 @@ oh [OPTIONS] COMMAND [ARGS]
 
 Session:     -c/--continue, -r/--resume, -n/--name
 Model:       -m/--model, --effort, --max-turns
-Output:      -p/--print, --output-format text|json|stream-json
+Output:      -p/--print, --output-format text|json|stream-json, --headless
 Permissions: --permission-mode, --dangerously-skip-permissions
 Context:     -s/--system-prompt, --append-system-prompt, --settings
 Advanced:    -d/--debug, --mcp-config, --bare
@@ -731,7 +755,7 @@ Currently `ohmo init` / `ohmo config` can guide channel setup for:
 
 ```bash
 # Run all tests
-uv run pytest -q                           # 114 unit/integration
+uv run pytest -q                           # 1185 unit/integration
 python scripts/test_harness_features.py     # Harness E2E
 python scripts/test_real_skills_plugins.py  # Real plugins E2E
 ```
@@ -825,7 +849,7 @@ OpenHarness is a **community-driven research project**. We welcome contributions
 
 ```bash
 # Development setup
-git clone https://github.com/HKUDS/OpenHarness.git
+git clone https://github.com/Real-Bimox/OpenHarness.git
 cd OpenHarness
 uv sync --extra dev
 uv run pytest -q  # Verify everything works
@@ -864,16 +888,16 @@ MIT — see [LICENSE](LICENSE).
 </p>
 
 <div align="center">
-  <a href="https://star-history.com/#HKUDS/OpenHarness&Date">
+  <a href="https://star-history.com/#Real-Bimox/OpenHarness&Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=HKUDS/OpenHarness&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=HKUDS/OpenHarness&type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=HKUDS/OpenHarness&type=Date" style="border-radius: 15px; box-shadow: 0 0 30px rgba(0, 217, 255, 0.3);" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=Real-Bimox/OpenHarness&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=Real-Bimox/OpenHarness&type=Date" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=Real-Bimox/OpenHarness&type=Date" style="border-radius: 15px; box-shadow: 0 0 30px rgba(0, 217, 255, 0.3);" />
     </picture>
   </a>
 </div>
 
 <p align="center">
   <em> Thanks for visiting ✨ OpenHarness!</em><br><br>
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=HKUDS.OpenHarness&style=for-the-badge&color=00d4ff" alt="Views">
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=Real-Bimox.OpenHarness&style=for-the-badge&color=00d4ff" alt="Views">
 </p>

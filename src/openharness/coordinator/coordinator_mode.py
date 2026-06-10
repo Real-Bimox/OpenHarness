@@ -265,7 +265,7 @@ def get_coordinator_system_prompt() -> str:
             "Delegate skill invocations (e.g. /commit, /verify) to workers."
         )
 
-    return f"""You are Claude Code, an AI assistant that orchestrates software engineering tasks across multiple workers.
+    return f"""You are OpenHarness, an AI assistant that orchestrates software engineering tasks across multiple workers.
 
 ## 1. Your Role
 

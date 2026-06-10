@@ -594,9 +594,9 @@ async def test_runtime_pool_uses_managed_group_cwd_binding(tmp_path, monkeypatch
         channel="feishu",
         chat_id="oc_group",
         owner_open_id="ou_user",
-        name="HKUDS/OpenHarness",
+        name="Real-Bimox/OpenHarness",
         cwd=str(project),
-        repo="HKUDS/OpenHarness",
+        repo="Real-Bimox/OpenHarness",
         binding_status="bound",
     )
 
@@ -2230,7 +2230,7 @@ async def test_gateway_bridge_group_command_routes_to_agent_tool_prompt():
                 channel="feishu",
                 sender_id="ou_user",
                 chat_id="ou_user",
-                content="/group 帮我创建一个群聊专门处理HKUDS/OpenHarness的问题吧，绑定cwd就在~/OpenHarness-new",
+                content="/group 帮我创建一个群聊专门处理Real-Bimox/OpenHarness的问题吧，绑定cwd就在~/OpenHarness-new",
                 metadata={"chat_type": "p2p", "sender_display_name": "Tang"},
             )
         )
@@ -2246,7 +2246,7 @@ async def test_gateway_bridge_group_command_routes_to_agent_tool_prompt():
     message, session_key = captured[0]
     assert session_key == "feishu:ou_user"
     assert "ohmo_create_feishu_group" in message.content
-    assert "HKUDS/OpenHarness" in message.content
+    assert "Real-Bimox/OpenHarness" in message.content
     assert "~/OpenHarness-new" in message.content
     assert message.metadata["_ohmo_group_command"] is True
     assert message.metadata["_ohmo_group_raw_request"].startswith("帮我创建一个群聊")
@@ -2273,9 +2273,9 @@ async def test_ohmo_create_feishu_group_tool_creates_and_binds_metadata(tmp_path
     )
     result = await tool.execute(
         OhmoCreateFeishuGroupInput(
-            name="HKUDS/OpenHarness",
+            name="Real-Bimox/OpenHarness",
             cwd=str(project),
-            repo="HKUDS/OpenHarness",
+            repo="Real-Bimox/OpenHarness",
             reason="The request names the repo and cwd directly.",
         ),
         ToolExecutionContext(
@@ -2296,7 +2296,7 @@ async def test_ohmo_create_feishu_group_tool_creates_and_binds_metadata(tmp_path
     )
 
     assert result.is_error is False
-    assert created == [("ou_user", "HKUDS/OpenHarness")]
+    assert created == [("ou_user", "Real-Bimox/OpenHarness")]
     assert len(welcomes) == 1
     assert welcomes[0][0] == "oc_project_group"
     assert welcomes[0][2] == "ou_user"
@@ -2304,15 +2304,15 @@ async def test_ohmo_create_feishu_group_tool_creates_and_binds_metadata(tmp_path
     record = load_managed_group_record(workspace=tmp_path, channel="feishu", chat_id="oc_project_group")
     assert record is not None
     assert record["owner_open_id"] == "ou_user"
-    assert record["name"] == "HKUDS/OpenHarness"
+    assert record["name"] == "Real-Bimox/OpenHarness"
     assert record["cwd"] == str(project.resolve())
-    assert record["repo"] == "HKUDS/OpenHarness"
+    assert record["repo"] == "Real-Bimox/OpenHarness"
     assert record["binding_status"] == "bound"
 
 
 @pytest.mark.asyncio
 async def test_agent_loop_can_create_group_via_ohmo_group_tool(tmp_path):
-    project = tmp_path / "ClawTeam"
+    project = tmp_path / "SampleProject"
     project.mkdir()
     created: list[tuple[str, str]] = []
 
@@ -2327,17 +2327,17 @@ async def test_agent_loop_can_create_group_via_ohmo_group_tool(tmp_path):
                             id="toolu_group",
                             name="ohmo_create_feishu_group",
                             input={
-                                "name": "HKUDS/ClawTeam",
+                                "name": "Real-Bimox/SampleProject",
                                 "cwd": str(project),
-                                "repo": "HKUDS/ClawTeam",
-                                "reason": "The user asked for a ClawTeam project group.",
+                                "repo": "Real-Bimox/SampleProject",
+                                "reason": "The user asked for a SampleProject project group.",
                             },
                         )
                     ],
                 ),
                 ConversationMessage(
                     role="assistant",
-                    content=[TextBlock(text="已创建 HKUDS/ClawTeam 群。")],
+                    content=[TextBlock(text="已创建 Real-Bimox/SampleProject 群。")],
                 ),
             ]
 
@@ -2370,7 +2370,7 @@ async def test_agent_loop_can_create_group_via_ohmo_group_tool(tmp_path):
                 "sender_id": "ou_user",
                 "source_chat_id": "ou_user",
                 "source_session_key": "feishu:ou_user",
-                "raw_request": "帮我创建一个群聊专门处理HKUDS/ClawTeam的问题吧",
+                "raw_request": "帮我创建一个群聊专门处理Real-Bimox/SampleProject的问题吧",
                 "used": False,
             }
         },
@@ -2382,12 +2382,12 @@ async def test_agent_loop_can_create_group_via_ohmo_group_tool(tmp_path):
     assert len(completed) == 1
     assert completed[0].tool_name == "ohmo_create_feishu_group"
     assert completed[0].is_error is False
-    assert created == [("ou_user", "HKUDS/ClawTeam")]
+    assert created == [("ou_user", "Real-Bimox/SampleProject")]
     assert "ohmo_create_feishu_group" in {tool["name"] for tool in client.requests[0].tools}
     record = load_managed_group_record(workspace=tmp_path, channel="feishu", chat_id="oc_clawteam")
     assert record is not None
     assert record["cwd"] == str(project.resolve())
-    assert record["repo"] == "HKUDS/ClawTeam"
+    assert record["repo"] == "Real-Bimox/SampleProject"
 
 
 @pytest.mark.asyncio
@@ -2397,7 +2397,7 @@ async def test_ohmo_create_feishu_group_tool_rejects_without_slash_group_context
 
     tool = OhmoCreateFeishuGroupTool(workspace=tmp_path, create_group=fake_create_group)
     result = await tool.execute(
-        OhmoCreateFeishuGroupInput(name="HKUDS/OpenHarness"),
+        OhmoCreateFeishuGroupInput(name="Real-Bimox/OpenHarness"),
         ToolExecutionContext(cwd=tmp_path, metadata={}),
     )
 

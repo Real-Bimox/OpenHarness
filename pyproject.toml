@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "openharness-ai"
-version = "0.1.9"
-description = "Open-source Python port of Claude Code - an AI-powered CLI coding assistant"
+version = "0.1.10"
+description = "Local-first AI harness for interactive and headless coding workflows"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [
-    { name = "novix-science" },
+    { name = "Real-Bimox" },
 ]
 
 dependencies = [

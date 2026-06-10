@@ -30,6 +30,17 @@ from openharness.tools.tool_search_tool import ToolSearchTool, ToolSearchToolInp
 from openharness.tools import create_default_tool_registry
 
 
+def test_default_tool_registry_can_exclude_network_tools():
+    registry = create_default_tool_registry(include_network_tools=False)
+
+    assert registry.get("web_fetch") is None
+    assert registry.get("web_search") is None
+    assert registry.get("image_to_text") is None
+    assert registry.get("image_generation") is None
+    assert registry.get("read_file") is not None
+    assert registry.get("bash") is not None
+
+
 @pytest.mark.asyncio
 async def test_file_write_read_and_edit(tmp_path: Path):
     context = ToolExecutionContext(cwd=tmp_path)

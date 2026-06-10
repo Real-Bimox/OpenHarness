@@ -32,7 +32,7 @@ try:
     from nio.exceptions import EncryptionError
 except ImportError as e:
     raise ImportError(
-        "Matrix dependencies not installed. Run: pip install nanobot-ai[matrix]"
+        "Matrix dependencies not installed. Install the Matrix channel dependencies first."
     ) from e
 
 from openharness.channels.bus.events import OutboundMessage

@@ -1,5 +1,5 @@
 # OpenHarness Windows Installer (PowerShell)
-# Usage: iex (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/HKUDS/OpenHarness/main/scripts/install.ps1')
+# Usage: iex (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Real-Bimox/OpenHarness/main/scripts/install.ps1')
 #        or: powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 
 param(
@@ -126,7 +126,7 @@ if ($NodePath) {
 # ---------------------------------------------------------------------------
 Write-Step "Installing OpenHarness"
 
-$RepoUrl = "https://github.com/HKUDS/OpenHarness.git"
+$RepoUrl = "https://github.com/Real-Bimox/OpenHarness.git"
 $InstallDir = "$env:USERPROFILE\.openharness-src"
 $VenvDir = "$env:USERPROFILE\.openharness-venv"
 
@@ -325,5 +325,5 @@ if ($Launcher -eq "openharness") {
     Write-Host "       Note: 'oh' may collide with the built-in Out-Host alias in PowerShell."
 }
 Write-Host "    4. Launch ohmo:             ohmo"
-Write-Host "    5. Docs:                    https://github.com/HKUDS/OpenHarness"
+Write-Host "    5. Docs:                    https://github.com/Real-Bimox/OpenHarness"
 Write-Host ""

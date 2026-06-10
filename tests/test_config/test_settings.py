@@ -80,6 +80,20 @@ class TestSettings:
         assert updated.permission.mode == "full_auto"
         assert s.permission.mode == "default"
 
+    def test_merge_cli_overrides_applies_permission_lists_and_appended_prompt(self):
+        s = Settings(system_prompt="base")
+        updated = s.merge_cli_overrides(
+            permission_mode="full_auto",
+            allowed_tools=["read_file"],
+            denied_tools=["bash"],
+            append_system_prompt="extra",
+        )
+
+        assert updated.permission.mode.value == "full_auto"
+        assert updated.permission.allowed_tools == ["read_file"]
+        assert updated.permission.denied_tools == ["bash"]
+        assert updated.system_prompt == "base\n\nextra"
+
     def test_web_settings_env_overrides(self, monkeypatch):
         monkeypatch.setenv("OPENHARNESS_WEB_PROXY", "http://proxy.example.com:7890")
         monkeypatch.setenv("OPENHARNESS_WEB_RESOLUTION_MODE", "synthetic_dns")
@@ -912,3 +926,91 @@ class TestModelScopeProvider:
         assert materialized.model == "deepseek-ai/DeepSeek-V4-Flash"
         assert materialized.provider == "modelscope"
         assert materialized.api_format == "openai"
+
+
+class TestProfileSynthesisFromFlatFields:
+    def test_flat_only_config_synthesizes_profile(self):
+        from openharness.config.settings import load_settings_from_source
+
+        settings = load_settings_from_source(
+            json.dumps({"model": "my-model", "api_format": "openai", "api_key": "sk-flat", "base_url": "https://proxy/v1"})
+        )
+        assert settings.model == "my-model"
+        assert settings.api_format == "openai"
+        assert settings.base_url == "https://proxy/v1"
+
+    def test_flat_fields_survive_user_profiles_without_active_profile(self):
+        from openharness.config.settings import load_settings_from_source
+
+        settings = load_settings_from_source(
+            json.dumps(
+                {
+                    "model": "my-model",
+                    "api_format": "openai",
+                    "api_key": "sk-flat",
+                    "base_url": "https://proxy/v1",
+                    "profiles": {
+                        "work": {
+                            "label": "Work",
+                            "provider": "openai_compatible",
+                            "api_format": "openai",
+                            "auth_source": "api_key",
+                            "default_model": "work-model",
+                        }
+                    },
+                }
+            )
+        )
+        # Flat fields are still honored when no active_profile is selected.
+        assert settings.model == "my-model"
+        assert settings.api_format == "openai"
+        assert settings.base_url == "https://proxy/v1"
+        # The user-supplied profile is preserved.
+        assert "work" in settings.profiles
+
+    def test_explicit_active_profile_wins_over_flat_fields(self):
+        from openharness.config.settings import load_settings_from_source
+
+        settings = load_settings_from_source(
+            json.dumps(
+                {
+                    "model": "flat-model",
+                    "active_profile": "work",
+                    "profiles": {
+                        "work": {
+                            "label": "Work",
+                            "provider": "openai_compatible",
+                            "api_format": "openai",
+                            "auth_source": "api_key",
+                            "default_model": "work-model",
+                            "base_url": "https://work/v1",
+                        }
+                    },
+                }
+            )
+        )
+        assert settings.active_profile == "work"
+        assert settings.model == "work-model"
+
+    def test_synthesis_does_not_clobber_same_named_user_profile(self):
+        from openharness.config.settings import load_settings_from_source, _profile_from_flat_settings
+
+        flat = {"model": "my-model", "api_key": "sk-flat"}
+        name, _ = _profile_from_flat_settings(Settings.model_validate(flat))
+        settings = load_settings_from_source(
+            json.dumps(
+                {
+                    **flat,
+                    "profiles": {
+                        name: {
+                            "label": "User Owned",
+                            "provider": "anthropic",
+                            "api_format": "anthropic",
+                            "auth_source": "api_key",
+                            "default_model": "user-model",
+                        }
+                    },
+                }
+            )
+        )
+        assert settings.profiles[name].label == "User Owned"

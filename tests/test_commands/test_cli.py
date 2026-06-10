@@ -9,9 +9,12 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 import openharness.cli as cli
+from openharness.api.usage import UsageSnapshot
 from openharness.config import load_settings
 from openharness.config.settings import Settings
+from openharness.engine.messages import ConversationMessage, TextBlock
 from openharness.mcp.types import McpStdioServerConfig
+from openharness.services.session_storage import save_session_snapshot
 
 
 app = cli.app
@@ -29,6 +32,39 @@ def test_cli_help():
     assert "Oh my Harness!" in plain_output
     assert "setup" in plain_output
     assert "--dry-run" in plain_output
+
+
+def test_print_mode_resume_dispatches_to_headless_print(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(
+        cwd=project,
+        model="saved-model",
+        system_prompt="system",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="earlier")])],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        session_id="saved123",
+    )
+    captured = {}
+
+    async def fake_run_print_mode(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("openharness.ui.app.run_print_mode", fake_run_print_mode)
+
+    result = runner.invoke(
+        app,
+        ["--cwd", str(project), "-p", "continue", "--resume", "saved123"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["prompt"] == "continue"
+    assert captured["model"] == "saved-model"
+    assert captured["session_id"] == "saved123"
+    assert captured["restore_messages"][0]["role"] == "user"
 
 
 def test_setup_flow_selects_profile_and_model(tmp_path: Path, monkeypatch):
@@ -356,13 +392,14 @@ def test_build_dry_run_preview_classifies_slash_command_and_flags_bad_mcp(monkey
             return []
 
     monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.config.settings.load_settings", lambda config_path=None: settings)
     monkeypatch.setattr(
         "openharness.api.provider.detect_provider",
         lambda settings: types.SimpleNamespace(name="anthropic"),
     )
     monkeypatch.setattr("openharness.api.provider.auth_status", lambda settings: "configured")
-    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd: [])
-    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd, settings=None: _FakeSkillRegistry())
+    monkeypatch.setattr("openharness.plugins.load_plugins", lambda *args, **kwargs: [])
+    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda *args, **kwargs: _FakeSkillRegistry())
     monkeypatch.setattr("openharness.prompts.context.build_runtime_system_prompt", lambda *args, **kwargs: "preview prompt")
     monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda settings: object())
 
@@ -377,6 +414,11 @@ def test_build_dry_run_preview_classifies_slash_command_and_flags_bad_mcp(monkey
         api_key=None,
         api_format=None,
         permission_mode=None,
+        allowed_tools=None,
+        denied_tools=None,
+        settings_source=None,
+        mcp_server_configs=None,
+        bare=False,
     )
 
     assert preview["entrypoint"]["kind"] == "slash_command"
@@ -397,13 +439,14 @@ def test_build_dry_run_preview_sets_blocked_when_model_prompt_lacks_auth(monkeyp
             return []
 
     monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.config.settings.load_settings", lambda config_path=None: settings)
     monkeypatch.setattr(
         "openharness.api.provider.detect_provider",
         lambda settings: types.SimpleNamespace(name="anthropic"),
     )
     monkeypatch.setattr("openharness.api.provider.auth_status", lambda settings: "missing")
-    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd: [])
-    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd, settings=None: _FakeSkillRegistry())
+    monkeypatch.setattr("openharness.plugins.load_plugins", lambda *args, **kwargs: [])
+    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda *args, **kwargs: _FakeSkillRegistry())
     monkeypatch.setattr("openharness.prompts.context.build_runtime_system_prompt", lambda *args, **kwargs: "preview prompt")
 
     def fake_resolve_api_client(settings):
@@ -422,6 +465,11 @@ def test_build_dry_run_preview_sets_blocked_when_model_prompt_lacks_auth(monkeyp
         api_key=None,
         api_format=None,
         permission_mode=None,
+        allowed_tools=None,
+        denied_tools=None,
+        settings_source=None,
+        mcp_server_configs=None,
+        bare=False,
     )
 
     assert preview["entrypoint"]["kind"] == "model_prompt"
@@ -466,14 +514,15 @@ def test_build_dry_run_preview_recommends_matching_skills_and_tools(monkeypatch,
             ]
 
     monkeypatch.setattr("openharness.config.load_settings", lambda: settings)
+    monkeypatch.setattr("openharness.config.settings.load_settings", lambda config_path=None: settings)
     monkeypatch.setattr(
         "openharness.api.provider.detect_provider",
         lambda settings: types.SimpleNamespace(name="anthropic"),
     )
     monkeypatch.setattr("openharness.api.provider.auth_status", lambda settings: "configured")
-    monkeypatch.setattr("openharness.plugins.load_plugins", lambda settings, cwd: [])
-    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda cwd, settings=None: _FakeSkillRegistry())
-    monkeypatch.setattr("openharness.tools.create_default_tool_registry", lambda: _FakeToolRegistry())
+    monkeypatch.setattr("openharness.plugins.load_plugins", lambda *args, **kwargs: [])
+    monkeypatch.setattr("openharness.skills.load_skill_registry", lambda *args, **kwargs: _FakeSkillRegistry())
+    monkeypatch.setattr("openharness.tools.create_default_tool_registry", lambda *args, **kwargs: _FakeToolRegistry())
     monkeypatch.setattr("openharness.prompts.context.build_runtime_system_prompt", lambda *args, **kwargs: "preview prompt")
     monkeypatch.setattr("openharness.ui.runtime._resolve_api_client_from_settings", lambda settings: object())
 
@@ -488,6 +537,11 @@ def test_build_dry_run_preview_recommends_matching_skills_and_tools(monkeypatch,
         api_key=None,
         api_format=None,
         permission_mode=None,
+        allowed_tools=None,
+        denied_tools=None,
+        settings_source=None,
+        mcp_server_configs=None,
+        bare=False,
     )
 
     recommended_skills = [entry["name"] for entry in preview["recommendations"]["skills"]]
@@ -557,3 +611,91 @@ def test_autopilot_export_dashboard_cli(monkeypatch, tmp_path: Path):
 
     assert result.exit_code == 0
     assert "Exported autopilot dashboard" in result.output
+
+
+def test_headless_flag_dispatches_to_control_loop(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    captured = {}
+
+    async def fake_run_headless_control(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("openharness.ui.app.run_headless_control", fake_run_headless_control)
+
+    result = runner.invoke(app, ["--cwd", str(tmp_path), "--headless", "--permission-mode", "full_auto"])
+
+    assert result.exit_code == 0
+    assert captured["cwd"] == str(tmp_path)
+    assert captured["permission_mode"] == "full_auto"
+
+
+def test_headless_flag_conflicts_exit_nonzero(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+
+    async def fail_if_called(**kwargs):
+        raise AssertionError("entry point should not run for conflicting flags")
+
+    monkeypatch.setattr("openharness.ui.app.run_headless_control", fail_if_called)
+    monkeypatch.setattr("openharness.ui.app.run_print_mode", fail_if_called)
+    monkeypatch.setattr("openharness.ui.app.run_task_worker", fail_if_called)
+
+    for args in (
+        ["--headless", "-p", "hi"],
+        ["--headless", "--continue"],
+        ["--headless", "--resume", "abc"],
+        ["--headless", "--task-worker"],
+        ["--headless", "--backend-only"],
+        ["--headless", "--output-format", "json"],
+        ["--dry-run", "--headless"],
+    ):
+        result = runner.invoke(app, ["--cwd", str(tmp_path), *args])
+        assert result.exit_code == 1, f"expected exit 1 for {args}"
+
+
+def test_print_mode_propagates_exit_code(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+
+    async def failing_run_print_mode(**kwargs):
+        return 1
+
+    monkeypatch.setattr("openharness.ui.app.run_print_mode", failing_run_print_mode)
+
+    result = runner.invoke(app, ["--cwd", str(tmp_path), "-p", "hello"])
+
+    assert result.exit_code == 1
+
+
+def test_print_mode_resume_explicit_model_wins(tmp_path: Path, monkeypatch):
+    runner = CliRunner()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(
+        cwd=project,
+        model="saved-model",
+        system_prompt="system",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="earlier")])],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        session_id="saved123",
+    )
+    captured = {}
+
+    async def fake_run_print_mode(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("openharness.ui.app.run_print_mode", fake_run_print_mode)
+
+    result = runner.invoke(
+        app,
+        ["--cwd", str(project), "-p", "continue", "--resume", "saved123", "--model", "cli-model"],
+    )
+
+    assert result.exit_code == 0
+    assert captured["model"] == "cli-model"

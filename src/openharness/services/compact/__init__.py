@@ -1,6 +1,6 @@
 """Conversation compaction — microcompact and full LLM-based summarization.
 
-Faithfully translated from Claude Code's compaction system:
+OpenHarness conversation compaction:
 - Microcompact: clear old tool result content to reduce token count cheaply
 - Full compact: call the LLM to produce a structured summary of older messages
 - Auto-compact: trigger compaction automatically when token count exceeds threshold
@@ -35,7 +35,7 @@ from openharness.services.token_estimation import estimate_tokens
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants (from Claude Code microCompact.ts / autoCompact.ts)
+# Constants used by manual and automatic compaction.
 # ---------------------------------------------------------------------------
 
 COMPACTABLE_TOOLS: frozenset[str] = frozenset({
@@ -97,7 +97,7 @@ class CompactAttachment:
 
 @dataclass
 class CompactionResult:
-    """Structured compaction result, inspired by Claude Code's result shape."""
+    """Structured compaction result."""
 
     trigger: CompactTrigger
     compact_kind: CompactionKind
@@ -456,7 +456,7 @@ def create_compact_boundary_message(metadata: dict[str, Any]) -> ConversationMes
 
 
 def build_post_compact_messages(result: CompactionResult) -> list[ConversationMessage]:
-    """Rebuild the post-compact message list in Claude Code's ordering."""
+    """Rebuild the post-compact message list in runtime ordering."""
     attachment_messages = [render_compact_attachment(attachment) for attachment in result.attachments]
     hook_messages = [render_compact_attachment(attachment) for attachment in result.hook_results]
     return [

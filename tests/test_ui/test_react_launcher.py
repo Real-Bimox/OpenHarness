@@ -26,6 +26,12 @@ def test_build_backend_command_includes_flags():
         base_url="https://api.moonshot.cn/anthropic",
         system_prompt="system",
         api_key="secret",
+        append_system_prompt="extra",
+        allowed_tools=["read_file"],
+        denied_tools=["bash"],
+        settings_source='{"model":"test-model"}',
+        bare=True,
+        resume_session_id="saved123",
     )
     assert command[:3] == [command[0], "-m", "openharness"]
     assert "--backend-only" in command
@@ -34,6 +40,13 @@ def test_build_backend_command_includes_flags():
     assert "--base-url" in command
     assert "--system-prompt" in command
     assert "--api-key" in command
+    assert "--append-system-prompt" in command
+    assert "--allowed-tools" in command
+    assert "--disallowed-tools" in command
+    assert "--settings" in command
+    assert "--bare" in command
+    assert "--resume" in command
+    assert "saved123" in command
 
 
 @pytest.mark.asyncio
@@ -63,6 +76,7 @@ async def test_run_print_mode_passes_cwd_to_build_runtime(monkeypatch):
             mcp_manager=SimpleNamespace(list_statuses=lambda: []),
             commands=SimpleNamespace(list_commands=lambda: []),
             events=_AsyncIterator(),
+            session_id="s1",
         )
 
     async def _start_runtime(_bundle):

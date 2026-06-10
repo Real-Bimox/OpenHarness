@@ -869,24 +869,41 @@ class Settings(BaseModel):
         """Return a new Settings with CLI overrides applied (non-None values only)."""
         updates = {k: v for k, v in overrides.items() if v is not None}
         permission_mode = updates.pop("permission_mode", None)
+        allowed_tools = updates.pop("allowed_tools", None)
+        denied_tools = updates.pop("denied_tools", None)
+        append_system_prompt = updates.pop("append_system_prompt", None)
+        updates.pop("settings_source", None)
+        updates.pop("bare", None)
 
-        def apply_permission_mode(settings: Settings) -> Settings:
-            if permission_mode is None:
-                return settings
-            return settings.model_copy(
-                update={
-                    "permission": settings.permission.model_copy(
-                        update={"mode": PermissionMode(str(permission_mode))}
-                    )
-                }
-            )
+        def apply_session_overrides(settings: Settings) -> Settings:
+            permission_updates: dict[str, Any] = {}
+            if permission_mode is not None:
+                permission_updates["mode"] = PermissionMode(str(permission_mode))
+            if allowed_tools is not None:
+                permission_updates["allowed_tools"] = list(allowed_tools)
+            if denied_tools is not None:
+                permission_updates["denied_tools"] = list(denied_tools)
+            if permission_updates:
+                settings = settings.model_copy(
+                    update={
+                        "permission": settings.permission.model_copy(update=permission_updates)
+                    }
+                )
+            if isinstance(append_system_prompt, str) and append_system_prompt.strip():
+                existing = settings.system_prompt or ""
+                settings = settings.model_copy(
+                    update={
+                        "system_prompt": f"{existing}\n\n{append_system_prompt.strip()}".strip()
+                    }
+                )
+            return settings
 
         # Strip ANSI escape sequences from model name if present
         if "model" in updates and isinstance(updates["model"], str):
             updates["model"] = strip_ansi_escape_sequences(updates["model"])
         if "effort" in updates and isinstance(updates["effort"], str):
             updates["effort"] = "xhigh" if updates["effort"].strip().lower() == "max" else updates["effort"].strip().lower()
-        merged = apply_permission_mode(self.model_copy(update=updates))
+        merged = apply_session_overrides(self.model_copy(update=updates))
         if not updates:
             return merged
         profile_keys = {
@@ -909,7 +926,7 @@ class Settings(BaseModel):
                 for key, value in updates.items()
                 if key not in profile_keys or key in {"active_profile", "profiles"}
             }
-            switched = apply_permission_mode(self.model_copy(update=switch_updates)).materialize_active_profile()
+            switched = apply_session_overrides(self.model_copy(update=switch_updates)).materialize_active_profile()
             remaining_profile_updates = {
                 key: value
                 for key, value in updates.items()
@@ -1064,10 +1081,15 @@ def load_settings(config_path: Path | None = None) -> Settings:
         env_profile = os.environ.get("OPENHARNESS_PROFILE")
         if env_profile:
             settings = settings.model_copy(update={"active_profile": env_profile.strip()})
-        if "profiles" not in raw or "active_profile" not in raw:
+        if "active_profile" not in raw:
+            # No explicit profile selection: synthesize one from the flat
+            # fields so legacy flat configs keep working. Never overwrite a
+            # user-supplied profiles entry of the same name; an explicit
+            # active_profile always wins over flat fields.
             profile_name, profile = _profile_from_flat_settings(settings)
             merged_profiles = settings.merged_profiles()
-            merged_profiles[profile_name] = profile
+            if profile_name not in (raw.get("profiles") or {}):
+                merged_profiles[profile_name] = profile
             settings = settings.model_copy(
                 update={
                     "active_profile": profile_name,
@@ -1081,6 +1103,41 @@ def load_settings(config_path: Path | None = None) -> Settings:
     if env_profile:
         settings = settings.model_copy(update={"active_profile": env_profile.strip()})
     return _apply_env_overrides(settings.materialize_active_profile())
+
+
+def load_settings_from_source(source: str | None = None) -> Settings:
+    """Load settings from the default config, a file path, or an inline JSON object."""
+    if source is None:
+        return load_settings()
+    stripped = source.strip()
+    if not stripped:
+        return load_settings()
+    if stripped.startswith("{"):
+        raw = json.loads(stripped)
+        settings = Settings.model_validate(raw)
+        env_profile = os.environ.get("OPENHARNESS_PROFILE")
+        if env_profile:
+            settings = settings.model_copy(update={"active_profile": env_profile.strip()})
+        if "active_profile" not in raw:
+            # No explicit profile selection: synthesize one from the flat
+            # fields so flat inline JSON keeps working. Never overwrite a
+            # user-supplied profiles entry of the same name; an explicit
+            # active_profile always wins over flat fields.
+            profile_name, profile = _profile_from_flat_settings(settings)
+            merged_profiles = settings.merged_profiles()
+            if profile_name not in (raw.get("profiles") or {}):
+                merged_profiles[profile_name] = profile
+            settings = settings.model_copy(
+                update={
+                    "active_profile": profile_name,
+                    "profiles": merged_profiles,
+                }
+            )
+        return _apply_env_overrides(settings.materialize_active_profile())
+    path = Path(stripped).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"settings file not found: {path}")
+    return load_settings(path)
 
 
 def save_settings(settings: Settings, config_path: Path | None = None) -> None:

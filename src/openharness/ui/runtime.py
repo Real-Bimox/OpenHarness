@@ -21,7 +21,7 @@ from openharness.commands import (
     create_default_command_registry,
     lookup_skill_slash_command,
 )
-from openharness.config import get_config_file_path, load_settings
+from openharness.config import get_config_file_path, load_settings_from_source
 from openharness.engine import QueryEngine
 from openharness.engine.messages import (
     ConversationMessage,
@@ -31,7 +31,7 @@ from openharness.engine.messages import (
 )
 from openharness.engine.query import MaxTurnsExceeded
 from openharness.engine.stream_events import StreamEvent
-from openharness.hooks import HookEvent, HookExecutionContext, HookExecutor, load_hook_registry
+from openharness.hooks import HookEvent, HookExecutionContext, HookExecutor, HookRegistry, load_hook_registry
 from openharness.hooks.hot_reload import HookReloader
 from openharness.mcp.client import McpClientManager
 from openharness.mcp.config import load_mcp_server_configs
@@ -149,10 +149,14 @@ class RuntimeBundle:
         slash command (e.g. ``/fast``) would refresh UI state from disk and
         "snap back" the model/provider to whatever is stored in the config file.
         """
-        return load_settings().merge_cli_overrides(**self.settings_overrides)
+        return load_settings_from_source(
+            self.settings_overrides.get("settings_source")
+        ).merge_cli_overrides(**self.settings_overrides)
 
     def current_plugins(self):
         """Return currently visible plugins for the working tree."""
+        if self.settings_overrides.get("bare"):
+            return []
         return load_plugins(
             self.current_settings(),
             self.cwd,
@@ -161,6 +165,8 @@ class RuntimeBundle:
 
     def hook_summary(self) -> str:
         """Return the current hook summary."""
+        if self.settings_overrides.get("bare"):
+            return "No hooks configured."
         return load_hook_registry(self.current_settings(), self.current_plugins()).summary()
 
     def plugin_summary(self) -> str:
@@ -289,6 +295,13 @@ async def build_runtime(
     edit_approval_prompt: EditApprovalPrompt | None = None,
     restore_messages: list[dict] | None = None,
     restore_tool_metadata: dict[str, object] | None = None,
+    session_id: str | None = None,
+    append_system_prompt: str | None = None,
+    allowed_tools: list[str] | None = None,
+    denied_tools: list[str] | None = None,
+    settings_source: str | None = None,
+    mcp_server_configs: dict[str, object] | None = None,
+    bare: bool = False,
     enforce_max_turns: bool = True,
     session_backend: SessionBackend | None = None,
     permission_mode: str | None = None,
@@ -309,19 +322,31 @@ async def build_runtime(
         "api_format": api_format,
         "active_profile": active_profile,
         "permission_mode": permission_mode,
+        "append_system_prompt": append_system_prompt,
+        "allowed_tools": allowed_tools,
+        "denied_tools": denied_tools,
+        "settings_source": settings_source,
+        "bare": bare,
     }
-    settings = load_settings().merge_cli_overrides(**settings_overrides)
+    settings = load_settings_from_source(settings_source).merge_cli_overrides(**settings_overrides)
     cwd = str(Path(cwd).expanduser().resolve()) if cwd else str(Path.cwd())
-    normalized_skill_dirs = tuple(str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ()))
-    normalized_plugin_roots = tuple(str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ()))
-    plugins = load_plugins(settings, cwd, extra_roots=normalized_plugin_roots)
+    normalized_skill_dirs = () if bare else tuple(str(Path(path).expanduser().resolve()) for path in (extra_skill_dirs or ()))
+    normalized_plugin_roots = () if bare else tuple(str(Path(path).expanduser().resolve()) for path in (extra_plugin_roots or ()))
+    include_project_memory = False if bare else include_project_memory
+    plugins = [] if bare else load_plugins(settings, cwd, extra_roots=normalized_plugin_roots)
     if api_client:
         resolved_api_client = api_client
     else:
         resolved_api_client = _resolve_api_client_from_settings(settings)
-    mcp_manager = McpClientManager(load_mcp_server_configs(settings, plugins))
+    runtime_mcp_configs = {} if bare else load_mcp_server_configs(settings, plugins)
+    if mcp_server_configs and not bare:
+        runtime_mcp_configs.update(mcp_server_configs)
+    mcp_manager = McpClientManager(runtime_mcp_configs)
     await mcp_manager.connect_all()
-    tool_registry = create_default_tool_registry(mcp_manager)
+    tool_registry = create_default_tool_registry(
+        mcp_manager,
+        include_network_tools=not bare,
+    )
     # Register plugin-provided tools
     for plugin in plugins:
         if plugin.enabled and plugin.tools:
@@ -354,9 +379,15 @@ async def build_runtime(
             keybindings=load_keybindings(),
         )
     )
-    hook_reloader = HookReloader(get_config_file_path())
+    hook_reloader = None if (bare or settings_source is not None) else HookReloader(get_config_file_path())
     hook_executor = HookExecutor(
-        hook_reloader.current_registry() if api_client is None else load_hook_registry(settings, plugins),
+        HookRegistry()
+        if bare
+        else load_hook_registry(settings, plugins)
+        if settings_source is not None
+        else hook_reloader.current_registry()
+        if api_client is None
+        else load_hook_registry(settings, plugins),
         HookExecutionContext(
             cwd=Path(cwd).resolve(),
             api_client=resolved_api_client,
@@ -374,7 +405,7 @@ async def build_runtime(
     )
     from uuid import uuid4
 
-    session_id = uuid4().hex[:12]
+    session_id = session_id or uuid4().hex[:12]
 
     restored_metadata = {
         "permission_mode": settings.permission.mode.value,
@@ -629,9 +660,12 @@ async def handle_line(
 ) -> bool:
     """Handle one submitted line for either headless or TUI rendering."""
     if not bundle.external_api_client:
-        bundle.hook_executor.update_registry(
-            load_hook_registry(bundle.current_settings(), bundle.current_plugins())
-        )
+        if bundle.settings_overrides.get("bare"):
+            bundle.hook_executor.update_registry(HookRegistry())
+        else:
+            bundle.hook_executor.update_registry(
+                load_hook_registry(bundle.current_settings(), bundle.current_plugins())
+            )
 
     command_context = CommandContext(
         engine=bundle.engine,

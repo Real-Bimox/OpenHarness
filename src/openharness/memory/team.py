@@ -27,7 +27,9 @@ SECRET_RULES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("github-token", "GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b")),
     ("openai-key", "OpenAI API key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
     ("anthropic-key", "Anthropic API key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
-    ("generic-secret", "secret assignment", re.compile(r"(?i)\b(secret|token|api[_-]?key|password)\s*[:=]\s*['\"]?[^'\"\s]{12,}")),
+    # Allow prefixed env-var style names (e.g. OPENAI_API_KEY=...) where the
+    # sensitive word is not preceded by a word boundary.
+    ("generic-secret", "secret assignment", re.compile(r"(?i)\b[\w-]*(secret|token|api[_-]?key|password)\s*[:=]\s*['\"]?[^'\"\s]{12,}")),
 )
 
 

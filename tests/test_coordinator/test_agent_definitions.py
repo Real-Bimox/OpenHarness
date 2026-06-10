@@ -100,19 +100,19 @@ def test_builtin_explore_does_not_hardcode_provider_model():
     )
 
 
-def test_builtin_claude_code_guide_does_not_hardcode_provider_model():
-    """claude-code-guide must not hard-code an Anthropic-only model alias."""
+def test_builtin_openharness_guide_does_not_hardcode_provider_model():
+    """openharness-guide must not hard-code an Anthropic-only model alias."""
     builtins = get_builtin_agent_definitions()
-    guide = next(a for a in builtins if a.name == "claude-code-guide")
+    guide = next(a for a in builtins if a.name == "openharness-guide")
     assert guide.model not in _PROVIDER_SPECIFIC_MODELS, (
-        f"claude-code-guide.model={guide.model!r} hard-codes a provider-specific model alias; "
+        f"openharness-guide.model={guide.model!r} hard-codes a provider-specific model alias; "
         "use 'inherit' so the agent works with non-Anthropic providers."
     )
 
 
 def test_builtin_provider_agnostic_agents_use_inherit_or_none():
-    """Plan, verification, Explore, and claude-code-guide must not override the model."""
-    agnostic_agents = {"Plan", "verification", "Explore", "claude-code-guide"}
+    """Plan, verification, Explore, and openharness-guide must not override the model."""
+    agnostic_agents = {"Plan", "verification", "Explore", "openharness-guide"}
     builtins = {a.name: a for a in get_builtin_agent_definitions()}
     for name in agnostic_agents:
         agent = builtins[name]
