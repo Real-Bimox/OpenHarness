@@ -14,9 +14,23 @@ def get_keybindings_path() -> Path:
     return get_config_dir() / "keybindings.json"
 
 
+_KEYBINDINGS_CACHE: tuple[tuple[str, int, int], dict[str, str]] | None = None
+
+
 def load_keybindings() -> dict[str, str]:
-    """Load and merge keybindings."""
+    """Load and merge keybindings, cached on the file's mtime/size."""
+    global _KEYBINDINGS_CACHE
     path = get_keybindings_path()
-    if not path.exists():
-        return resolve_keybindings()
-    return resolve_keybindings(parse_keybindings(path.read_text(encoding="utf-8")))
+    try:
+        stat = path.stat()
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        key = (str(path), -1, -1)
+    if _KEYBINDINGS_CACHE is not None and _KEYBINDINGS_CACHE[0] == key:
+        return dict(_KEYBINDINGS_CACHE[1])
+    if key[1] == -1:
+        result = resolve_keybindings()
+    else:
+        result = resolve_keybindings(parse_keybindings(path.read_text(encoding="utf-8")))
+    _KEYBINDINGS_CACHE = (key, result)
+    return dict(result)

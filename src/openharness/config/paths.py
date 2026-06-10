@@ -11,6 +11,19 @@ from pathlib import Path
 _DEFAULT_BASE_DIR = ".openharness"
 _CONFIG_FILE_NAME = "settings.json"
 
+# Directories already created this process. get_config_dir/get_data_dir run
+# on every settings load (i.e. every submitted line); skip the mkdir syscall
+# once a directory is known to exist.
+_ENSURED_DIRS: set[str] = set()
+
+
+def _ensure_dir(path: Path) -> Path:
+    key = str(path)
+    if key not in _ENSURED_DIRS:
+        path.mkdir(parents=True, exist_ok=True)
+        _ENSURED_DIRS.add(key)
+    return path
+
 
 def get_config_dir() -> Path:
     """Return the configuration directory, creating it if needed.
@@ -25,8 +38,7 @@ def get_config_dir() -> Path:
     else:
         config_dir = Path.home() / _DEFAULT_BASE_DIR
 
-    config_dir.mkdir(parents=True, exist_ok=True)
-    return config_dir
+    return _ensure_dir(config_dir)
 
 
 def get_config_file_path() -> Path:
@@ -47,8 +59,7 @@ def get_data_dir() -> Path:
     else:
         data_dir = get_config_dir() / "data"
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return data_dir
+    return _ensure_dir(data_dir)
 
 
 def get_logs_dir() -> Path:

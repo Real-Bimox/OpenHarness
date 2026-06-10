@@ -1081,26 +1081,7 @@ def load_settings(config_path: Path | None = None) -> Settings:
         config_path = get_config_file_path()
 
     if config_path.exists():
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
-        settings = Settings.model_validate(raw)
-        env_profile = os.environ.get("OPENHARNESS_PROFILE")
-        if env_profile:
-            settings = settings.model_copy(update={"active_profile": env_profile.strip()})
-        if "active_profile" not in raw:
-            # No explicit profile selection: synthesize one from the flat
-            # fields so legacy flat configs keep working. Never overwrite a
-            # user-supplied profiles entry of the same name; an explicit
-            # active_profile always wins over flat fields.
-            profile_name, profile = _profile_from_flat_settings(settings)
-            merged_profiles = settings.merged_profiles()
-            if profile_name not in (raw.get("profiles") or {}):
-                merged_profiles[profile_name] = profile
-            settings = settings.model_copy(
-                update={
-                    "active_profile": profile_name,
-                    "profiles": merged_profiles,
-                }
-            )
+        settings = _load_settings_file_cached(config_path)
         return _apply_env_overrides(settings.materialize_active_profile())
 
     settings = Settings()
@@ -1108,6 +1089,58 @@ def load_settings(config_path: Path | None = None) -> Settings:
     if env_profile:
         settings = settings.model_copy(update={"active_profile": env_profile.strip()})
     return _apply_env_overrides(settings.materialize_active_profile())
+
+
+# Parsed-and-validated settings keyed on (path, mtime_ns, size, profile env).
+# Settings are re-read on every submitted line for hot-reload semantics; the
+# cache makes the unchanged-file case a stat instead of a parse + validate.
+_SETTINGS_FILE_CACHE: dict[tuple[str, int, int, str], Settings] = {}
+_SETTINGS_FILE_CACHE_MAX = 8
+
+
+def _load_settings_file_cached(config_path: Path) -> Settings:
+    env_profile = (os.environ.get("OPENHARNESS_PROFILE") or "").strip()
+    key: tuple[str, int, int, str] | None
+    try:
+        stat = config_path.stat()
+        key = (str(config_path), stat.st_mtime_ns, stat.st_size, env_profile)
+    except OSError:
+        key = None
+    if key is not None:
+        cached = _SETTINGS_FILE_CACHE.get(key)
+        if cached is not None:
+            # Shallow copy so a caller mutating top-level fields cannot
+            # poison the cached instance.
+            return cached.model_copy()
+
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    settings = Settings.model_validate(raw)
+    if env_profile:
+        settings = settings.model_copy(update={"active_profile": env_profile})
+    if "active_profile" not in raw:
+        # No explicit profile selection: synthesize one from the flat
+        # fields so legacy flat configs keep working. Never overwrite a
+        # user-supplied profiles entry of the same name; an explicit
+        # active_profile always wins over flat fields.
+        profile_name, profile = _profile_from_flat_settings(settings)
+        merged_profiles = settings.merged_profiles()
+        if profile_name not in (raw.get("profiles") or {}):
+            merged_profiles[profile_name] = profile
+        settings = settings.model_copy(
+            update={
+                "active_profile": profile_name,
+                "profiles": merged_profiles,
+            }
+        )
+    if key is not None:
+        if len(_SETTINGS_FILE_CACHE) >= _SETTINGS_FILE_CACHE_MAX:
+            _SETTINGS_FILE_CACHE.clear()
+        _SETTINGS_FILE_CACHE[key] = settings
+        return settings.model_copy()
+    return settings
+
+
+_INLINE_SETTINGS_CACHE: dict[tuple[str, str], Settings] = {}
 
 
 def load_settings_from_source(source: str | None = None) -> Settings:
@@ -1118,11 +1151,15 @@ def load_settings_from_source(source: str | None = None) -> Settings:
     if not stripped:
         return load_settings()
     if stripped.startswith("{"):
+        env_profile = (os.environ.get("OPENHARNESS_PROFILE") or "").strip()
+        cache_key = (stripped, env_profile)
+        cached = _INLINE_SETTINGS_CACHE.get(cache_key)
+        if cached is not None:
+            return _apply_env_overrides(cached.model_copy().materialize_active_profile())
         raw = json.loads(stripped)
         settings = Settings.model_validate(raw)
-        env_profile = os.environ.get("OPENHARNESS_PROFILE")
         if env_profile:
-            settings = settings.model_copy(update={"active_profile": env_profile.strip()})
+            settings = settings.model_copy(update={"active_profile": env_profile})
         if "active_profile" not in raw:
             # No explicit profile selection: synthesize one from the flat
             # fields so flat inline JSON keeps working. Never overwrite a
@@ -1138,7 +1175,10 @@ def load_settings_from_source(source: str | None = None) -> Settings:
                     "profiles": merged_profiles,
                 }
             )
-        return _apply_env_overrides(settings.materialize_active_profile())
+        if len(_INLINE_SETTINGS_CACHE) >= _SETTINGS_FILE_CACHE_MAX:
+            _INLINE_SETTINGS_CACHE.clear()
+        _INLINE_SETTINGS_CACHE[cache_key] = settings
+        return _apply_env_overrides(settings.model_copy().materialize_active_profile())
     path = Path(stripped).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"settings file not found: {path}")
@@ -1164,3 +1204,5 @@ def save_settings(settings: Settings, config_path: Path | None = None) -> None:
             config_path,
             settings.model_dump_json(indent=2) + "\n",
         )
+    # Drop cached parses eagerly rather than relying on mtime granularity.
+    _SETTINGS_FILE_CACHE.clear()
