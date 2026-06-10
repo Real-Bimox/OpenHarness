@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
@@ -33,12 +35,11 @@ from openharness.engine.messages import (
 from openharness.engine.query import MaxTurnsExceeded
 from openharness.engine.stream_events import StreamEvent
 from openharness.hooks import HookEvent, HookExecutionContext, HookExecutor, HookRegistry, load_hook_registry
-from openharness.hooks.hot_reload import HookReloader
 from openharness.mcp.client import McpClientManager
 from openharness.mcp.config import load_mcp_server_configs
 from openharness.permissions import PermissionChecker
 from openharness.plugins import load_plugins
-from openharness.prompts import build_runtime_system_prompt
+from openharness.prompts import build_runtime_system_prompt_with_cache_boundary
 from openharness.state import AppState, AppStateStore
 from openharness.services.session_backend import DEFAULT_SESSION_BACKEND, SessionBackend
 from openharness.tools import ToolRegistry, create_default_tool_registry
@@ -140,6 +141,21 @@ class RuntimeBundle:
     memory_backend: MemoryCommandBackend | None = None
     include_project_memory: bool = True
     autodream_context: dict[str, object] | None = None
+    _settings_cache: tuple[tuple, Any] | None = field(default=None, repr=False)
+    _hook_registry_cache: tuple[tuple, Any] | None = field(default=None, repr=False)
+
+    def _settings_fingerprint(self) -> tuple:
+        """Cheap identity of the on-disk settings source plus profile env."""
+        source = self.settings_overrides.get("settings_source")
+        env_profile = (os.environ.get("OPENHARNESS_PROFILE") or "").strip()
+        if source and source.strip().startswith("{"):
+            return (source, env_profile)
+        path = Path(source).expanduser() if source else get_config_file_path()
+        try:
+            stat = path.stat()
+            return (str(path), stat.st_mtime_ns, stat.st_size, env_profile)
+        except OSError:
+            return (str(path), -1, -1, env_profile)
 
     def current_settings(self):
         """Return the effective settings for this session.
@@ -149,10 +165,34 @@ class RuntimeBundle:
         the lifetime of the running process. Without this overlay, issuing any
         slash command (e.g. ``/fast``) would refresh UI state from disk and
         "snap back" the model/provider to whatever is stored in the config file.
+
+        Called several times per submitted line; the merged result is cached
+        on the settings-source fingerprint so unchanged files cost one stat.
+        Consumers treat the returned instance as read-only.
         """
-        return load_settings_from_source(
+        fingerprint = self._settings_fingerprint()
+        if self._settings_cache is not None and self._settings_cache[0] == fingerprint:
+            return self._settings_cache[1]
+        settings = load_settings_from_source(
             self.settings_overrides.get("settings_source")
         ).merge_cli_overrides(**self.settings_overrides)
+        self._settings_cache = (fingerprint, settings)
+        return settings
+
+    def current_hook_registry(self) -> HookRegistry:
+        """Return the hook registry, rebuilt only when its inputs changed."""
+        if self.settings_overrides.get("bare"):
+            return HookRegistry()
+        settings = self.current_settings()
+        plugins = self.current_plugins()
+        # The cached plugin list returns identical objects while unchanged,
+        # and current_settings() returns the same instance per fingerprint.
+        key = (id(settings), tuple(id(plugin) for plugin in plugins))
+        if self._hook_registry_cache is not None and self._hook_registry_cache[0] == key:
+            return self._hook_registry_cache[1]
+        registry = load_hook_registry(settings, plugins)
+        self._hook_registry_cache = (key, registry)
+        return registry
 
     def current_plugins(self):
         """Return currently visible plugins for the working tree."""
@@ -168,7 +208,7 @@ class RuntimeBundle:
         """Return the current hook summary."""
         if self.settings_overrides.get("bare"):
             return "No hooks configured."
-        return load_hook_registry(self.current_settings(), self.current_plugins()).summary()
+        return self.current_hook_registry().summary()
 
     def plugin_summary(self) -> str:
         """Return the current plugin summary."""
@@ -230,6 +270,7 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
             base_url=settings.base_url,
             claude_oauth=True,
             auth_token_resolver=lambda: settings.resolve_auth().value,
+            prompt_caching=settings.prompt_caching_enabled,
         )
     if settings.api_format in ("openai", "openai_compat"):
         auth = _safe_resolve_auth()
@@ -242,6 +283,7 @@ def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
     return AnthropicApiClient(
         api_key=auth.value,
         base_url=settings.base_url,
+        prompt_caching=settings.prompt_caching_enabled,
     )
 
 
@@ -380,15 +422,11 @@ async def build_runtime(
             keybindings=load_keybindings(),
         )
     )
-    hook_reloader = None if (bare or settings_source is not None) else HookReloader(get_config_file_path())
+    # Hooks always load from the (cached) settings + plugins so plugin hooks
+    # are present from the first turn; the per-line refresh in handle_line
+    # keeps hot-reload semantics now that its inputs are stat-cached.
     hook_executor = HookExecutor(
-        HookRegistry()
-        if bare
-        else load_hook_registry(settings, plugins)
-        if settings_source is not None
-        else hook_reloader.current_registry()
-        if api_client is None
-        else load_hook_registry(settings, plugins),
+        HookRegistry() if bare else load_hook_registry(settings, plugins),
         HookExecutionContext(
             cwd=Path(cwd).resolve(),
             api_client=resolved_api_client,
@@ -396,7 +434,7 @@ async def build_runtime(
         ),
     )
     engine_max_turns = settings.max_turns if (enforce_max_turns or max_turns is not None) else None
-    system_prompt_text = build_runtime_system_prompt(
+    system_prompt_text, system_prompt_boundary = build_runtime_system_prompt_with_cache_boundary(
         settings,
         cwd=cwd,
         latest_user_prompt=prompt,
@@ -459,6 +497,7 @@ async def build_runtime(
             **restored_metadata,
         },
     )
+    engine.set_system_prompt(system_prompt_text, cache_stable_chars=system_prompt_boundary)
     if autodream_context is not None:
         engine.tool_metadata["autodream_context"] = autodream_context
     # Restore messages from a saved session if provided
@@ -615,6 +654,32 @@ def _format_pending_tool_results(messages: list[ConversationMessage]) -> str | N
     return "\n".join(lines)
 
 
+# auth_status() can hit the OS keyring (a D-Bus roundtrip on Linux) or even
+# refresh an OAuth token over the network; that must not run on every
+# submitted line. A short TTL keeps the status chip honest after external
+# logins; profile-identity changes refresh immediately via the key.
+_AUTH_STATUS_TTL_SECONDS = 30.0
+_AUTH_STATUS_CACHE: dict[tuple[str, str, str, bool], tuple[float, str]] = {}
+
+
+def _cached_auth_status(settings) -> str:
+    key = (
+        settings.active_profile or "",
+        settings.api_format or "",
+        settings.base_url or "",
+        bool(settings.api_key),
+    )
+    now = time.monotonic()
+    hit = _AUTH_STATUS_CACHE.get(key)
+    if hit is not None and now - hit[0] < _AUTH_STATUS_TTL_SECONDS:
+        return hit[1]
+    value = auth_status(settings)
+    if len(_AUTH_STATUS_CACHE) > 16:
+        _AUTH_STATUS_CACHE.clear()
+    _AUTH_STATUS_CACHE[key] = (now, value)
+    return value
+
+
 def sync_app_state(bundle: RuntimeBundle) -> None:
     """Refresh UI state from current settings and dynamic keybindings."""
     settings = bundle.current_settings()
@@ -627,7 +692,7 @@ def sync_app_state(bundle: RuntimeBundle) -> None:
         theme=settings.theme,
         cwd=bundle.cwd,
         provider=provider.name,
-        auth_status=auth_status(settings),
+        auth_status=_cached_auth_status(settings),
         base_url=settings.base_url or "",
         vim_enabled=settings.vim_mode,
         voice_enabled=settings.voice_mode,
@@ -646,6 +711,9 @@ def sync_app_state(bundle: RuntimeBundle) -> None:
 
 def refresh_runtime_client(bundle: RuntimeBundle) -> None:
     """Refresh the active runtime client after provider/auth/profile changes."""
+    # Auth state likely just changed; drop the TTL cache so the status chip
+    # reflects the new provider immediately.
+    _AUTH_STATUS_CACHE.clear()
     settings = bundle.current_settings()
     if not bundle.external_api_client:
         bundle.api_client = _resolve_api_client_from_settings(settings)
@@ -657,7 +725,7 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
     bundle.engine.set_model(settings.model)
     bundle.engine.set_effort(settings.effort)
     bundle.engine.set_permission_checker(PermissionChecker(settings.permission))
-    system_prompt = build_runtime_system_prompt(
+    system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
         settings,
         cwd=bundle.cwd,
         latest_user_prompt=_last_user_text(bundle.engine.messages),
@@ -665,7 +733,7 @@ def refresh_runtime_client(bundle: RuntimeBundle) -> None:
         extra_plugin_roots=bundle.extra_plugin_roots,
         include_project_memory=bundle.include_project_memory,
     )
-    bundle.engine.set_system_prompt(system_prompt)
+    bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
     sync_app_state(bundle)
 
 
@@ -680,18 +748,15 @@ async def handle_line(
 ) -> bool:
     """Handle one submitted line for either headless or TUI rendering."""
     if not bundle.external_api_client:
-        if bundle.settings_overrides.get("bare"):
-            bundle.hook_executor.update_registry(HookRegistry())
-        else:
-            bundle.hook_executor.update_registry(
-                load_hook_registry(bundle.current_settings(), bundle.current_plugins())
-            )
+        bundle.hook_executor.update_registry(bundle.current_hook_registry())
 
     command_context = CommandContext(
         engine=bundle.engine,
-        hooks_summary=bundle.hook_summary(),
-        mcp_summary=bundle.mcp_summary(),
-        plugin_summary=bundle.plugin_summary(),
+        # Bound methods, not values: plain prompts never pay for summary
+        # assembly; only commands that read a summary compute it.
+        hooks_summary=bundle.hook_summary,
+        mcp_summary=bundle.mcp_summary,
+        plugin_summary=bundle.plugin_summary,
         cwd=bundle.cwd,
         tool_registry=bundle.tool_registry,
         app_state=bundle.app_state,
@@ -720,7 +785,7 @@ async def handle_line(
                 bundle.engine.set_model(result.submit_model)
             settings = bundle.current_settings()
             submit_prompt = result.submit_prompt
-            system_prompt = build_runtime_system_prompt(
+            system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
                 settings,
                 cwd=bundle.cwd,
                 latest_user_prompt=submit_prompt,
@@ -728,7 +793,7 @@ async def handle_line(
                 extra_plugin_roots=bundle.extra_plugin_roots,
                 include_project_memory=bundle.include_project_memory,
             )
-            bundle.engine.set_system_prompt(system_prompt)
+            bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
             try:
                 async for event in bundle.engine.submit_message(submit_prompt):
                     await render_event(event)
@@ -749,7 +814,7 @@ async def handle_line(
             settings = bundle.current_settings()
             if bundle.enforce_max_turns:
                 bundle.engine.set_max_turns(settings.max_turns)
-            system_prompt = build_runtime_system_prompt(
+            system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
                 settings,
                 cwd=bundle.cwd,
                 latest_user_prompt=_last_user_text(bundle.engine.messages),
@@ -757,7 +822,7 @@ async def handle_line(
                 extra_plugin_roots=bundle.extra_plugin_roots,
                 include_project_memory=bundle.include_project_memory,
             )
-            bundle.engine.set_system_prompt(system_prompt)
+            bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
             turns = result.continue_turns if result.continue_turns is not None else bundle.engine.max_turns
             try:
                 async for event in bundle.engine.continue_pending(max_turns=turns):
@@ -775,7 +840,7 @@ async def handle_line(
     if bundle.enforce_max_turns:
         bundle.engine.set_max_turns(settings.max_turns)
     latest_user_prompt = line or (user_message.text if user_message is not None else "")
-    system_prompt = build_runtime_system_prompt(
+    system_prompt, _cache_boundary = build_runtime_system_prompt_with_cache_boundary(
         settings,
         cwd=bundle.cwd,
         latest_user_prompt=latest_user_prompt,
@@ -783,7 +848,7 @@ async def handle_line(
         extra_plugin_roots=bundle.extra_plugin_roots,
         include_project_memory=bundle.include_project_memory,
     )
-    bundle.engine.set_system_prompt(system_prompt)
+    bundle.engine.set_system_prompt(system_prompt, cache_stable_chars=_cache_boundary)
     try:
         async for event in bundle.engine.submit_message(user_message or line):
             await render_event(event)

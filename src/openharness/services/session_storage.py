@@ -94,6 +94,7 @@ def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> No
     atomic_write_text(
         _session_index_path(session_dir),
         json.dumps({"version": 1, "sessions": entries}, indent=2) + "\n",
+        fsync=False,
     )
 
 
@@ -148,11 +149,12 @@ def save_session_snapshot(
 
     # Save as latest
     latest_path = session_dir / "latest.json"
-    atomic_write_text(latest_path, data)
+    # Per-line state cache: rename-atomic, no fsync (see atomic_write_bytes).
+    atomic_write_text(latest_path, data, fsync=False)
 
     # Save by session ID
     session_path = session_dir / f"session-{sid}.json"
-    atomic_write_text(session_path, data)
+    atomic_write_text(session_path, data, fsync=False)
     _update_session_index(session_dir, _session_index_entry(payload, session_path))
 
     return latest_path

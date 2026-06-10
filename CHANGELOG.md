@@ -4,6 +4,23 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
+## [0.1.14] - 2026-06-10
+
+### Added
+
+- Anthropic prompt-caching breakpoints: `cache_control` on the stable system-prompt prefix, the tool array, and the previous turn's last block, so providers cache everything that does not change between requests. Per-line relevant-memories content stays outside the cached prefix via a stable-prefix boundary threaded through the engine. Gated by the new `prompt_caching_enabled` setting (default on); OpenAI-format and Codex clients unchanged.
+- `UsageSnapshot` (and therefore headless events, print-mode results, and state snapshots) carries `cache_creation_input_tokens` / `cache_read_input_tokens`.
+- `scripts/measure_per_line.py` gates the per-line assembly budget (< 5 ms, timeit-style minimum) added to release checks.
+
+### Changed (performance)
+
+- Per-line runtime assembly dropped from ~45-60 ms to ~4 ms intrinsic: settings files, inline `--settings` sources, keybindings, plugins, skill registries, CLAUDE.md chains, git environment info, the base system prompt, and the skills section are all cached behind stat/identity fingerprints with hot-reload semantics preserved (plugin/skill walks revalidate at most once per second; plugin install/uninstall/reload invalidate explicitly).
+- `current_settings()`/hook-registry rebuilds collapse to a stat via bundle-level identity caches; hooks always load with plugin hooks included (the plugin-less `HookReloader` path was removed).
+- Command-context hook/plugin/MCP summaries are computed lazily — plain prompts never pay for them (gateway included).
+- Auth status resolution moved off the line path behind a 30 s TTL cache, eliminating per-line keyring roundtrips and synchronous OAuth refreshes; provider/profile commands refresh immediately.
+- Memory relevance parses `usage_index.json` once per directory and records recall usage on the executor instead of blocking the prompt build.
+- Per-line state writes (session snapshot, session index, session-memory checkpoint) keep rename atomicity but no longer fsync; durable-write policy moves to the persistence workstream.
+
 ## [0.1.13] - 2026-06-10
 
 ### Added

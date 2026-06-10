@@ -129,12 +129,18 @@ class MemoryCommandBackend:
 
 @dataclass
 class CommandContext:
-    """Context available to command handlers."""
+    """Context available to command handlers.
+
+    The summary fields accept either a precomputed string or a zero-arg
+    callable; callables let hosts defer the (settings/plugin-scanning)
+    summary work until a command actually reads it. Handlers should use
+    the ``get_*_summary`` accessors.
+    """
 
     engine: QueryEngine
-    hooks_summary: str = ""
-    mcp_summary: str = ""
-    plugin_summary: str = ""
+    hooks_summary: str | Callable[[], str] = ""
+    mcp_summary: str | Callable[[], str] = ""
+    plugin_summary: str | Callable[[], str] = ""
     cwd: str = "."
     tool_registry: ToolRegistry | None = None
     app_state: AppStateStore | None = None
@@ -144,6 +150,15 @@ class CommandContext:
     extra_plugin_roots: Iterable[str | Path] | None = None
     memory_backend: MemoryCommandBackend | None = None
     include_project_memory: bool = True
+
+    def get_hooks_summary(self) -> str:
+        return self.hooks_summary() if callable(self.hooks_summary) else self.hooks_summary
+
+    def get_mcp_summary(self) -> str:
+        return self.mcp_summary() if callable(self.mcp_summary) else self.mcp_summary
+
+    def get_plugin_summary(self) -> str:
+        return self.plugin_summary() if callable(self.plugin_summary) else self.plugin_summary
 
 
 CommandHandler = Callable[[str, CommandContext], Awaitable[CommandResult]]
@@ -793,7 +808,7 @@ def create_default_command_registry(
         )
 
     async def _hooks_handler(_: str, context: CommandContext) -> CommandResult:
-        return CommandResult(message=context.hooks_summary or "No hooks configured.")
+        return CommandResult(message=context.get_hooks_summary() or "No hooks configured.")
 
     async def _resume_handler(args: str, context: CommandContext) -> CommandResult:
         tokens = args.strip().split()
@@ -1097,6 +1112,9 @@ def create_default_command_registry(
         )
 
     async def _reload_plugins_handler(_: str, context: CommandContext) -> CommandResult:
+        from openharness.plugins.loader import invalidate_plugin_cache
+
+        invalidate_plugin_cache()
         settings = load_settings()
         plugins = load_plugins(settings, context.cwd, extra_roots=context.extra_plugin_roots)
         if not plugins:
@@ -1441,13 +1459,13 @@ def create_default_command_registry(
                 return CommandResult(message=f"Server {server_name} does not support auth updates")
             save_settings(settings)
             return CommandResult(message=f"Saved MCP auth for {server_name}. Restart session to reconnect.")
-        return CommandResult(message=context.mcp_summary or "No MCP servers configured.")
+        return CommandResult(message=context.get_mcp_summary() or "No MCP servers configured.")
 
     async def _plugin_handler(args: str, context: CommandContext) -> CommandResult:
         settings = load_settings()
         tokens = args.split()
         if not tokens or tokens[0] == "list":
-            return CommandResult(message=context.plugin_summary or "No plugins discovered.")
+            return CommandResult(message=context.get_plugin_summary() or "No plugins discovered.")
         if tokens[0] == "enable" and len(tokens) == 2:
             settings.enabled_plugins[tokens[1]] = True
             save_settings(settings)
@@ -1469,7 +1487,7 @@ def create_default_command_registry(
             return CommandResult(message=f"Plugin '{tokens[1]}' not found")
         plugins = load_plugins(settings, context.cwd, extra_roots=context.extra_plugin_roots)
         if plugins:
-            return CommandResult(message=context.plugin_summary)
+            return CommandResult(message=context.get_plugin_summary())
         return CommandResult(message="Usage: /plugin [list|enable NAME|disable NAME|install PATH|uninstall NAME]")
 
     _MODE_LABELS = {"default": "Default", "plan": "Plan Mode", "full_auto": "Auto"}
@@ -1885,8 +1903,8 @@ def create_default_command_registry(
             f"- effort: {state.effort if state is not None else settings.effort}",
             f"- passes: {state.passes if state is not None else settings.passes}",
             f"- memory_dir: {memory_dir}",
-            f"- plugin_count: {max(len(context.plugin_summary.splitlines()) - 1, 0) if context.plugin_summary else 0}",
-            f"- mcp_configured: {'yes' if context.mcp_summary and 'No MCP' not in context.mcp_summary else 'no'}",
+            f"- plugin_count: {max(len(_ps.splitlines()) - 1, 0) if (_ps := context.get_plugin_summary()) else 0}",
+            f"- mcp_configured: {'yes' if (_ms := context.get_mcp_summary()) and 'No MCP' not in _ms else 'no'}",
             f"- auth_configured: {'yes' if manager.get_profile_statuses()[active_profile_name]['configured'] else 'no'}",
         ]
         return CommandResult(message="\n".join(lines))

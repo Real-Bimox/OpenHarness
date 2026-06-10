@@ -70,7 +70,7 @@ def update_session_memory_file(
 
     path = prepare_session_memory_metadata(cwd, tool_metadata or {}, session_id=session_id)
     body = build_session_memory_document(messages, tool_metadata=tool_metadata)
-    atomic_write_text(path, body)
+    atomic_write_text(path, body, fsync=False)
     return path
 
 

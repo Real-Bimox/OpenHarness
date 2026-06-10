@@ -103,7 +103,21 @@ def build_system_prompt(
     if env is None:
         env = get_environment_info(cwd=cwd)
 
+    # The env snapshot is cached upstream and returned by identity while
+    # unchanged, so identity doubles as the cache validator here.
+    key = (custom_prompt, cwd)
+    hit = _SYSTEM_PROMPT_CACHE.get(key)
+    if hit is not None and hit[0] is env:
+        return hit[1]
+
     base = custom_prompt if custom_prompt is not None else _BASE_SYSTEM_PROMPT
     env_section = _format_environment_section(env)
 
-    return f"{base}\n\n{env_section}"
+    result = f"{base}\n\n{env_section}"
+    if len(_SYSTEM_PROMPT_CACHE) > 16:
+        _SYSTEM_PROMPT_CACHE.clear()
+    _SYSTEM_PROMPT_CACHE[key] = (env, result)
+    return result
+
+
+_SYSTEM_PROMPT_CACHE: dict[tuple[str | None, str | None], tuple[EnvironmentInfo, str]] = {}

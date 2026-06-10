@@ -27,6 +27,9 @@ def install_plugin_from_path(source: str | Path) -> Path:
     if dest.exists():
         shutil.rmtree(dest)
     shutil.copytree(src, dest)
+    from openharness.plugins.loader import invalidate_plugin_cache
+
+    invalidate_plugin_cache()
     return dest
 
 
@@ -36,4 +39,7 @@ def uninstall_plugin(name: str) -> bool:
     if not path.exists():
         return False
     shutil.rmtree(path)
+    from openharness.plugins.loader import invalidate_plugin_cache
+
+    invalidate_plugin_cache()
     return True

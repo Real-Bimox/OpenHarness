@@ -67,8 +67,46 @@ def detect_shell() -> str:
     return "unknown"
 
 
+def _git_head_fingerprint(cwd: str) -> tuple[str, int] | None:
+    """Cheap stat-based key for git state: (.git/HEAD path, mtime_ns).
+
+    HEAD's mtime changes on branch switches and new commits, which is what
+    the prompt's git section reflects. Returns None when no .git is found
+    in cwd or its ancestors.
+    """
+    current = Path(cwd).resolve()
+    for candidate in (current, *current.parents):
+        head = candidate / ".git" / "HEAD"
+        try:
+            return (str(head), head.stat().st_mtime_ns)
+        except OSError:
+            continue
+    return None
+
+
+_GIT_INFO_CACHE: dict[str, tuple[tuple[str, int] | None, tuple[bool, str | None]]] = {}
+
+
 def detect_git_info(cwd: str) -> tuple[bool, str | None]:
-    """Check if cwd is inside a git repo and return (is_git_repo, branch_name)."""
+    """Check if cwd is inside a git repo and return (is_git_repo, branch_name).
+
+    Spawning git twice per call is too expensive for the per-line prompt
+    rebuild, so results are cached per cwd and invalidated by .git/HEAD's
+    mtime (branch switch / new commit). Non-repo results are cached on the
+    absence of any .git ancestor.
+    """
+    fingerprint = _git_head_fingerprint(cwd)
+    cached = _GIT_INFO_CACHE.get(cwd)
+    if cached is not None and cached[0] == fingerprint:
+        return cached[1]
+    result = _detect_git_info_uncached(cwd)
+    if len(_GIT_INFO_CACHE) > 64:
+        _GIT_INFO_CACHE.clear()
+    _GIT_INFO_CACHE[cwd] = (fingerprint, result)
+    return result
+
+
+def _detect_git_info_uncached(cwd: str) -> tuple[bool, str | None]:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
@@ -101,11 +139,32 @@ def detect_git_info(cwd: str) -> tuple[bool, str | None]:
     return True, branch
 
 
+# Snapshots keyed per cwd, validated by the git HEAD fingerprint and the
+# UTC date (the only inputs that change while a session runs).
+_ENV_INFO_CACHE: dict[str, tuple[tuple, EnvironmentInfo]] = {}
+
+
 def get_environment_info(cwd: str | None = None) -> EnvironmentInfo:
     """Gather all environment information into an EnvironmentInfo snapshot."""
     if cwd is None:
         cwd = os.getcwd()
 
+    validator = (
+        _git_head_fingerprint(cwd),
+        datetime.now(tz=timezone.utc).strftime("%Y-%m-%d"),
+        os.environ.get("VIRTUAL_ENV"),
+    )
+    hit = _ENV_INFO_CACHE.get(cwd)
+    if hit is not None and hit[0] == validator:
+        return hit[1]
+    info = _get_environment_info_uncached(cwd)
+    if len(_ENV_INFO_CACHE) > 16:
+        _ENV_INFO_CACHE.clear()
+    _ENV_INFO_CACHE[cwd] = (validator, info)
+    return info
+
+
+def _get_environment_info_uncached(cwd: str) -> EnvironmentInfo:
     python_executable = str(Path(sys.executable).resolve())
     virtual_env = os.environ.get("VIRTUAL_ENV")
     if not virtual_env:

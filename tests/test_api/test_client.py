@@ -188,6 +188,111 @@ def test_anthropic_client_refreshes_claude_token_on_request(monkeypatch):
         "user_id": '{"device_id":"openharness","session_id":"session-123","account_uuid":""}'
     }
     assert "oauth-2025-04-20" in client._client.beta.messages.last_params["betas"]
-    assert client._client.beta.messages.last_params["system"].startswith(
-        "x-anthropic-billing-header: cc_version=2.1.92; cc_entrypoint=cli;\n"
+    system_blocks = client._client.beta.messages.last_params["system"]
+    assert system_blocks[0]["text"].startswith(
+        "x-anthropic-billing-header: cc_version=2.1.92; cc_entrypoint=cli;"
     )
+    assert system_blocks[1]["text"] == "system prompt"
+    assert system_blocks[1]["cache_control"] == {"type": "ephemeral"}
+
+
+def _request_with_history():
+    from openharness.api.client import ApiMessageRequest
+    from openharness.engine.messages import ConversationMessage, TextBlock
+
+    messages = [
+        ConversationMessage(role="user", content=[TextBlock(text="first question")]),
+        ConversationMessage(role="assistant", content=[TextBlock(text="first answer")]),
+        ConversationMessage(role="user", content=[TextBlock(text="second question")]),
+    ]
+    return ApiMessageRequest(
+        model="claude-sonnet-4-6",
+        messages=messages,
+        system_prompt="STABLE-PREFIX\n\n# Relevant Memories\ndynamic tail",
+        system_cache_stable_chars=len("STABLE-PREFIX"),
+        tools=[
+            {"name": "grep", "description": "g", "input_schema": {}},
+            {"name": "read_file", "description": "r", "input_schema": {}},
+        ],
+    )
+
+
+def test_prompt_caching_request_shape(monkeypatch):
+    class _FakeAsyncAnthropic:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr("openharness.api.client.AsyncAnthropic", _FakeAsyncAnthropic)
+    client = AnthropicApiClient(api_key="k", prompt_caching=True)
+    request = _request_with_history()
+
+    system = client._system_param(request)
+    assert isinstance(system, list)
+    assert system[0]["text"] == "STABLE-PREFIX"
+    assert system[0]["cache_control"] == {"type": "ephemeral"}
+    assert system[1]["text"].lstrip().startswith("# Relevant Memories")
+    assert "cache_control" not in system[1]
+
+    tools = client._tools_with_cache_marker(request.tools)
+    assert "cache_control" not in tools[0]
+    assert tools[1]["cache_control"] == {"type": "ephemeral"}
+    # The shared schema list must not be mutated in place.
+    assert "cache_control" not in request.tools[1]
+
+    messages = [m.to_api_param() for m in request.messages]
+    client._mark_history_prefix(messages)
+    prev_turn_last_block = messages[-2]["content"][-1]
+    assert prev_turn_last_block["cache_control"] == {"type": "ephemeral"}
+    assert all(
+        "cache_control" not in block
+        for block in messages[-1]["content"]
+        if isinstance(block, dict)
+    )
+
+
+def test_prompt_caching_oauth_attribution_is_first_uncached_block(monkeypatch):
+    class _FakeAsyncAnthropic:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr("openharness.api.client.AsyncAnthropic", _FakeAsyncAnthropic)
+    monkeypatch.setattr("openharness.api.client.get_claude_code_session_id", lambda: "s1")
+    monkeypatch.setattr(
+        "openharness.api.client.claude_attribution_header", lambda: "ATTRIBUTION"
+    )
+    client = AnthropicApiClient(auth_token="t", claude_oauth=True, prompt_caching=True)
+    system = client._system_param(_request_with_history())
+    assert system[0] == {"type": "text", "text": "ATTRIBUTION"}
+    assert system[1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_prompt_caching_disabled_keeps_string_system(monkeypatch):
+    class _FakeAsyncAnthropic:
+        def __init__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr("openharness.api.client.AsyncAnthropic", _FakeAsyncAnthropic)
+    client = AnthropicApiClient(api_key="k", prompt_caching=False)
+    system = client._system_param(_request_with_history())
+    assert isinstance(system, str)
+    assert system.startswith("STABLE-PREFIX")
+
+
+def test_usage_snapshot_carries_cache_counters():
+    from openharness.api.usage import UsageSnapshot
+    from openharness.engine.cost_tracker import CostTracker
+
+    tracker = CostTracker()
+    tracker.add(UsageSnapshot(input_tokens=10, output_tokens=2, cache_read_input_tokens=90))
+    tracker.add(
+        UsageSnapshot(
+            input_tokens=5,
+            output_tokens=1,
+            cache_creation_input_tokens=100,
+            cache_read_input_tokens=50,
+        )
+    )
+    total = tracker.total
+    assert total.cache_read_input_tokens == 140
+    assert total.cache_creation_input_tokens == 100
+    assert total.model_dump()["cache_read_input_tokens"] == 140

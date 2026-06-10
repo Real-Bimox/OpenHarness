@@ -10,6 +10,11 @@ class UsageSnapshot(BaseModel):
 
     input_tokens: int = 0
     output_tokens: int = 0
+    # Prompt-caching counters (Anthropic-format providers). Cache reads are
+    # billed separately from regular input tokens and are the signal that
+    # the cache breakpoints are effective.
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:

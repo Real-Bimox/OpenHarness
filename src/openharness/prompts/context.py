@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from functools import partial
 from pathlib import Path
 from typing import Iterable
 
@@ -22,6 +24,11 @@ from openharness.prompts.system_prompt import build_system_prompt
 from openharness.skills.loader import load_skill_registry
 
 
+# Formatted section keyed by registry identity: the registry cache returns
+# the same object while skill files are unchanged.
+_SKILLS_SECTION_CACHE: dict[int, tuple[object, str | None]] = {}
+
+
 def _build_skills_section(
     cwd: str | Path,
     *,
@@ -36,6 +43,17 @@ def _build_skills_section(
         extra_plugin_roots=extra_plugin_roots,
         settings=settings,
     )
+    hit = _SKILLS_SECTION_CACHE.get(id(registry))
+    if hit is not None and hit[0] is registry:
+        return hit[1]
+    result = _format_skills_section(registry)
+    if len(_SKILLS_SECTION_CACHE) > 16:
+        _SKILLS_SECTION_CACHE.clear()
+    _SKILLS_SECTION_CACHE[id(registry)] = (registry, result)
+    return result
+
+
+def _format_skills_section(registry) -> str | None:
     skills = [skill for skill in registry.list_skills() if not skill.disable_model_invocation]
     if not skills:
         return None
@@ -99,6 +117,36 @@ def _build_permission_mode_section(settings: Settings) -> str:
     return f"# Current Permission Mode\n{guidance}"
 
 
+def _record_memory_usage(cwd: str | Path, headers: list) -> None:
+    """Record memory recall without blocking the prompt build.
+
+    The usage write takes a file lock and fsyncs; when an event loop is
+    running, push it to the executor instead of stalling the line.
+    """
+    if not headers:
+        return
+    write = partial(mark_memory_used, cwd, headers, memory_dir=headers[0].path.parent)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            write()
+        except OSError:
+            pass
+        return
+    loop.run_in_executor(None, _swallow_oserror(write))
+
+
+def _swallow_oserror(func):
+    def _run() -> None:
+        try:
+            func()
+        except OSError:
+            pass
+
+    return _run
+
+
 def build_runtime_system_prompt(
     settings: Settings,
     *,
@@ -109,6 +157,32 @@ def build_runtime_system_prompt(
     include_project_memory: bool = True,
 ) -> str:
     """Build the runtime system prompt with project instructions and memory."""
+    prompt, _ = build_runtime_system_prompt_with_cache_boundary(
+        settings,
+        cwd=cwd,
+        latest_user_prompt=latest_user_prompt,
+        extra_skill_dirs=extra_skill_dirs,
+        extra_plugin_roots=extra_plugin_roots,
+        include_project_memory=include_project_memory,
+    )
+    return prompt
+
+
+def build_runtime_system_prompt_with_cache_boundary(
+    settings: Settings,
+    *,
+    cwd: str | Path,
+    latest_user_prompt: str | None = None,
+    extra_skill_dirs: Iterable[str | Path] | None = None,
+    extra_plugin_roots: Iterable[str | Path] | None = None,
+    include_project_memory: bool = True,
+) -> tuple[str, int]:
+    """Build the runtime system prompt and its cache-stable prefix length.
+
+    Everything except the per-line relevant-memories section is stable
+    between lines; the returned boundary lets the API client place a prompt
+    cache breakpoint at the end of the stable prefix.
+    """
     if is_coordinator_mode():
         sections = [get_coordinator_system_prompt()]
     else:
@@ -161,6 +235,7 @@ def build_runtime_system_prompt(
             if content:
                 sections.append(f"# {title}\n\n```md\n{content[:12000]}\n```")
 
+    relevant_section: str | None = None
     if include_project_memory and settings.memory.enabled:
         memory_section = load_memory_prompt(
             cwd,
@@ -177,11 +252,11 @@ def build_runtime_system_prompt(
                 max_results=settings.memory.max_files,
             )
             if relevant:
-                try:
-                    headers = [item.header for item in relevant]
-                    mark_memory_used(cwd, headers, memory_dir=headers[0].path.parent)
-                except OSError:
-                    pass
-                sections.append(format_relevant_memories(relevant))
+                headers = [item.header for item in relevant]
+                _record_memory_usage(cwd, headers)
+                relevant_section = format_relevant_memories(relevant)
 
-    return "\n\n".join(section for section in sections if section.strip())
+    stable = "\n\n".join(section for section in sections if section.strip())
+    if relevant_section and relevant_section.strip():
+        return f"{stable}\n\n{relevant_section}", len(stable)
+    return stable, len(stable)
