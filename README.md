@@ -28,7 +28,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/React+Ink-TUI-61DAFB?logo=react&logoColor=white" alt="React">
-  <img src="https://img.shields.io/badge/pytest-1197_pass-brightgreen" alt="Pytest">
+  <img src="https://img.shields.io/badge/pytest-1201_pass-brightgreen" alt="Pytest">
   <img src="https://img.shields.io/badge/E2E-6_suites-orange" alt="E2E">
   <img src="https://img.shields.io/badge/output-text_|_json_|_stream--json-blueviolet" alt="Output">
   <a href="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml"><img src="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -153,6 +153,10 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
+- **2026-06-10** 🗜️ **v0.1.14** — Config caching & prompt-cache breakpoints:
+  - Per-line runtime assembly drops from ~45–60 ms to ~4 ms: settings, plugins, skills, CLAUDE.md, git info, and prompt sections are cached behind stat/identity fingerprints with hot-reload preserved.
+  - Anthropic prompt-caching breakpoints (system prefix / tools / history) cut input cost and TTFT on long sessions; `usage` payloads now report `cache_read_input_tokens`. Kill switch: `prompt_caching_enabled`.
+  - Details: [RELEASE_NOTES_v0.1.14.md](RELEASE_NOTES_v0.1.14.md).
 - **2026-06-10** ⚡ **v0.1.13** — Persistent task workers & per-turn performance:
   - Background agent workers are persistent: one process serves all coordinator follow-ups (idle timeout via `task_worker_idle_timeout_s`), and conversations save/restore under a stable per-task session id — restarts resume with full context instead of paying a multi-second rebuild with an empty conversation.
   - Per-turn overhead cuts across the engine: no more fixed 50 ms compaction poll, cached tool schemas, incremental token estimation, background memory extraction (`memory.extract_model` for a cheaper model), reused Codex connections, and linear streamed-argument accumulation.
@@ -759,7 +763,7 @@ Currently `ohmo init` / `ohmo config` can guide channel setup for:
 
 ```bash
 # Run all tests
-uv run pytest -q                           # 1197 unit/integration
+uv run pytest -q                           # 1201 unit/integration
 python scripts/test_harness_features.py     # Harness E2E
 python scripts/test_real_skills_plugins.py  # Real plugins E2E
 ```
