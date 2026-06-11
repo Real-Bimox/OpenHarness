@@ -36,6 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+health-server = ["fastapi>=0.100", "uvicorn>=0.20"]
 dev = [
     "pexpect>=4.9.0",
     "pytest>=8.0.0",

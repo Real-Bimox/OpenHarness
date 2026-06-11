@@ -2625,6 +2625,32 @@ def provider_remove(
         raise typer.Exit(1)
     print(f"Removed provider profile: {name}", flush=True)
 
+
+def _check_health_server_deps() -> None:
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ImportError:
+        print(
+            "Error: --health-server requires the 'health-server' extra.\n"
+            "  pip install openharness[health-server]",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
+
+def _maybe_start_health_server(port: int) -> None:
+    _check_health_server_deps()
+    try:
+        from openharness.api.health_server import start_health_server_background, BindError
+
+        handle = start_health_server_background(host="127.0.0.1", port=port)
+    except BindError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise typer.Exit(1)
+    print(f"Health server running on 127.0.0.1:{handle.port}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Main command
 # ---------------------------------------------------------------------------
@@ -2827,10 +2853,65 @@ def main(
         "--mcp-serve",
         help="Run as an MCP server over stdio (exposes session search, skill loop, and recovery status)",
     ),
+    health_server: bool = typer.Option(
+        False,
+        "--health-server",
+        help="Start the HTTP health/status server as the primary mode, or as a background thread alongside --headless, --task-worker, or --mcp-serve (requires openharness[health-server])",
+        rich_help_panel="Advanced",
+    ),
+    health_server_port: int | None = typer.Option(
+        None,
+        "--health-server-port",
+        help="Port for the health server (default: 8642). Requires --health-server.",
+        rich_help_panel="Advanced",
+    ),
 ) -> None:
     """Start an interactive session or run a single prompt."""
     if ctx.invoked_subcommand is not None:
         return
+
+    _health_server_enabled = health_server
+
+    if health_server_port is not None and not health_server:
+        print(
+            "Error: --health-server-port requires --health-server.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
+
+    if health_server:
+        raw_port = health_server_port or os.environ.get("OPENHARNESS_HEALTH_SERVER_PORT", "8642")
+        try:
+            _health_port = int(raw_port)
+        except (ValueError, TypeError):
+            print(
+                f"Error: Invalid health server port: {raw_port!r} (must be 0-65535).",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+        if not (0 <= _health_port <= 65535):
+            print(
+                f"Error: Health server port {_health_port} out of range (must be 0-65535).",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
+
+    _primary_mode = (
+        headless or task_worker or mcp_serve
+        or print_mode is not None or dry_run
+        or continue_session or resume is not None or backend_only
+    )
+    _supported_primary = (
+        headless or task_worker or mcp_serve
+    )
+
+    if _health_server_enabled and _primary_mode and not _supported_primary:
+        print(
+            "Error: --health-server is only supported standalone or with --headless, "
+            "--task-worker, or --mcp-serve in this release.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(1)
 
     if mcp_serve:
         if (
@@ -2850,7 +2931,19 @@ def main(
             raise typer.Exit(1)
         from openharness.mcp.serve import run_mcp_server
 
+        if _health_server_enabled:
+            _maybe_start_health_server(_health_port)
         run_mcp_server()
+        return
+
+    if _health_server_enabled and not _primary_mode:
+        _check_health_server_deps()
+        from openharness.api.health_server import create_health_app
+
+        import uvicorn
+
+        app = create_health_app()
+        uvicorn.run(app, host="127.0.0.1", port=_health_port)
         return
 
     import asyncio
@@ -2957,6 +3050,8 @@ def main(
                 file=sys.stderr,
             )
             raise typer.Exit(1)
+        if _health_server_enabled:
+            _maybe_start_health_server(_health_port)
         asyncio.run(
             run_headless_control(
                 cwd=cwd,
@@ -3120,6 +3215,8 @@ def main(
         return
 
     if task_worker:
+        if _health_server_enabled:
+            _maybe_start_health_server(_health_port)
         asyncio.run(
             run_task_worker(
                 cwd=cwd,

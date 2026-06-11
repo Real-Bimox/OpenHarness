@@ -46,12 +46,12 @@ In scope:
 
 - An optional FastAPI application (`openharness[health-server]` extra) exposing health, status, and system-metrics endpoints over HTTP.
 - A CLI flag `--health-server` to start the server as the primary mode (standalone) or as a background thread alongside another mode.
-- A `GET /health` liveness endpoint (no auth, sub-millisecond, suitable for container probes).
+- A `GET /health` liveness endpoint (no auth, zero I/O, suitable for container probes).
 - A `GET /health/detailed` readiness endpoint (no auth, reuses `build_status(probe=True)`).
 - A `GET /api/status` operational-status endpoint (no auth in first release; auth gate deferred to a follow-up proposal).
 - A `GET /api/system/stats` host/process metrics endpoint (no auth in first release).
 - A `GET /v1/capabilities` API-discovery endpoint (no auth).
-- Integration with long-running modes: `--headless`, `--task-worker`, `--mcp-serve`, and `oh cron start` can optionally start the health server as a background thread.
+- Integration with long-running modes: `--headless`, `--task-worker`, and `--mcp-serve` can optionally start the health server as a background thread.
 
 Out of scope:
 
@@ -61,6 +61,7 @@ Out of scope:
 - Prometheus/OpenTelemetry native format (a future `/metrics` endpoint can be added without schema changes).
 - A web dashboard SPA (this proposal is strictly a JSON API).
 - Any change to the base install's dependency set.
+- Cron integration (`oh cron start --health-server`) and interactive/REPL integration; these have different lifecycles and are deferred.
 
 ## Current State
 
@@ -138,11 +139,11 @@ Readiness probe. No auth. Calls `build_status(probe=True)`.
 }
 ```
 
-Suitable for: operational dashboards, incident response, readiness probes (non-ok status if recorder is disabled or thread probe times out).
+Suitable for: operational dashboards, incident response, readiness probes (non-ok status if the thread probe times out or fails).
 
 #### `GET /api/status`
 
-Operational status. No auth (loopback bind). Combines `build_status(probe=False)` with `AppStateStore`.
+Operational status. No auth (loopback bind). Combines `build_status(probe=False)` with `AppStateStore` when a store is injected.
 
 ```json
 {
@@ -225,8 +226,7 @@ Suitable for: external UIs, custom orchestrators, version compatibility checks.
 
 ```bash
 oh --health-server                # Start on 127.0.0.1:8642
-oh --health-server --port 9090    # Custom port
-oh --health-server --host 0.0.0.0 --port 8642  # Bind to all interfaces
+oh --health-server --health-server-port 9090    # Custom port
 ```
 
 The process runs the health server as its primary activity. Useful for sidecar containers or dedicated monitoring instances.
@@ -234,10 +234,10 @@ The process runs the health server as its primary activity. Useful for sidecar c
 #### Background thread mode
 
 ```bash
-oh --headless --health-server-port 8642
-oh --task-worker --health-server-port 8642
-oh --mcp-serve --health-server-port 8642
-oh cron start --health-server-port 8642
+oh --headless --health-server
+oh --task-worker --health-server
+oh --mcp-serve --health-server
+oh --headless --health-server --health-server-port 8642
 ```
 
 The health server starts in a daemon thread alongside the primary mode. External systems can probe the process while it performs its main work.
@@ -264,7 +264,7 @@ Add to `pyproject.toml` as an optional extra:
 
 ```toml
 [project.optional-dependencies]
-health-server = ["fastapi>=0.100", "uvicorn[standard]>=0.20"]
+health-server = ["fastapi>=0.100", "uvicorn>=0.20"]
 ```
 
 The base install is unchanged. Users who want the health server run:
@@ -279,8 +279,7 @@ Lazy import pattern: the CLI flag checks for FastAPI availability at invocation 
 
 | Setting | Source | Default |
 |---|---|---|
-| `--health-server-host` | CLI flag | `127.0.0.1` |
-| `--health-server-port` | CLI flag | `8642` |
+| `--health-server-port` | CLI flag (requires `--health-server`) | `8642` |
 | `OPENHARNESS_HEALTH_SERVER_PORT` | Environment variable | `8642` |
 
 No entry in `settings.json` for the first release. The health server is an operational concern, not a persistent user preference.
@@ -297,11 +296,7 @@ The default bind address is `127.0.0.1`. The health server is reachable only fro
 
 ### Non-loopback binding
 
-Binding to `0.0.0.0` or a specific interface requires the explicit `--host` flag. When non-loopback binding is detected, the startup log prints a warning:
-
-```
-WARNING: Health server bound to 0.0.0.0:8642 — endpoints are reachable from the network without authentication.
-```
+Non-loopback binding requires authentication and is deferred to a follow-up proposal. In v1, the server binds to `127.0.0.1` only — there is no `--health-server-host` option.
 
 No authentication is enforced in the first release. Auth gating (session token, bearer token, or mTLS) is deferred to a follow-up proposal because:
 
@@ -319,9 +314,9 @@ No CORS headers are set. The health server is not designed for browser consumpti
 
 ## Performance
 
-### Target: sub-millisecond liveness
+### Target: zero-I/O liveness
 
-`GET /health` must respond in under 1 ms. It touches no I/O, no diagnostics files, no state stores. It returns three string constants.
+`GET /health` responds with three string constants — no I/O, no diagnostics files, no state stores. No timing gate in CI; the zero-I/O property is what matters.
 
 ### Target: bounded detailed queries
 
@@ -339,16 +334,16 @@ Users who do not install `openharness[health-server]` see zero changes: no new i
 
 1. `pip install openharness[health-server]` installs fastapi and uvicorn without errors.
 2. `oh --health-server` starts an HTTP server on `127.0.0.1:8642`.
-3. `curl http://127.0.0.1:8642/health` returns `{"status": "ok", "platform": "openharness", "version": "..."}` in under 1 ms.
+3. `curl http://127.0.0.1:8642/health` returns `{"status": "ok", "platform": "openharness", "version": "..."}` (zero-I/O response, no timing gate).
 4. `curl http://127.0.0.1:8642/health/detailed` returns a valid `build_status()` document with `thread_probe` populated.
-5. `curl http://127.0.0.1:8642/api/status` returns a document including `app_state` from `AppStateStore`.
+5. `curl http://127.0.0.1:8642/api/status` returns a document where `app_state` is included when a store is injected; omitted otherwise.
 6. `curl http://127.0.0.1:8642/api/system/stats` returns host metrics (with `psutil` fields when psutil is installed, without errors when it is not).
 7. `curl http://127.0.0.1:8642/v1/capabilities` returns a valid capabilities document listing all five endpoints.
-8. `oh --headless --health-server-port 8642` starts the headless JSONL protocol on stdin/stdout and the health server on port 8642 simultaneously.
+8. `oh --headless --health-server` starts the headless JSONL protocol on stdin/stdout and the health server simultaneously.
 9. Running `oh --health-server` without `openharness[health-server]` installed prints a clear install instruction and exits with code 1.
 10. `GET /health` is reachable while a headless turn is active (the background thread is not blocked by the async event loop).
-11. No new files, imports, or threads are created when the health server is not started (base install unchanged).
-12. Binding to a non-loopback address prints a warning about unauthenticated network access.
+11. No runtime imports, threads, or state are created when `--health-server` is not passed (base install unchanged).
+12. Non-loopback binding is not possible in v1 (no `--health-server-host` option; server binds to `127.0.0.1` only).
 
 ## Future Work
 
