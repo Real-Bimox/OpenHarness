@@ -57,6 +57,21 @@ class PermissionSettings(BaseModel):
     denied_commands: list[str] = Field(default_factory=list)
 
 
+class DiagnosticsSettings(BaseModel):
+    """Local diagnostics recorder configuration (see docs/proposals/observability-metrics.md)."""
+
+    enabled: bool = True
+    event_log_enabled: bool = True
+    retention_days: int = 14
+    max_daily_mb: float = 25.0
+    # Path policy for recorded paths: safe | exact | hash.
+    include_paths: str = "safe"
+    export_include_logs: bool = True
+    heartbeat_enabled: bool = True
+    # Per-operation slow thresholds (ms) overriding the built-in defaults.
+    slow_thresholds: dict[str, float] = Field(default_factory=dict)
+
+
 class FallbackProvider(BaseModel):
     """One entry in the provider fallback chain (see docs/proposals/error-recovery.md)."""
 
@@ -622,6 +637,7 @@ class Settings(BaseModel):
     hooks: dict[str, list[HookDefinition]] = Field(default_factory=dict)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     skills: SkillSettings = Field(default_factory=SkillSettings)
+    diagnostics: DiagnosticsSettings = Field(default_factory=DiagnosticsSettings)
     # Provider fallback chain tried in order when the primary fails.
     fallback_providers: list[FallbackProvider] = Field(default_factory=list)
     # Multiple API keys per provider for rotation on rate-limit/auth/billing.

@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Status | DRAFT |
+| Status | APPROVED |
 | Proposal branch | `proposal/observability-metrics` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-11 |
