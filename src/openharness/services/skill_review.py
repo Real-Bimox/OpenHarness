@@ -60,17 +60,19 @@ _active_tasks: set[asyncio.Task[Any]] = set()
 
 
 def should_review(bundle, *, turns_since_review: int) -> bool:
-    """Return True when a review should fire now."""
+    """Return True when a review should fire now.
+
+    Ordered cheapest-first: the interval gate runs before the registry scan
+    so a not-yet-due turn never pays for the tool-name lookup.
+    """
     settings = bundle.current_settings()
     skills = getattr(settings, "skills", None)
     if skills is None or not skills.review_enabled:
         return False
     interval = int(skills.review_interval_turns or 0)
-    if interval <= 0:
+    if interval <= 0 or turns_since_review < interval:
         return False
-    if "skill_manage" not in {tool.name for tool in bundle.tool_registry.list_tools()}:
-        return False
-    return turns_since_review >= interval
+    return any(tool.name == "skill_manage" for tool in bundle.tool_registry.list_tools())
 
 
 def schedule_review(bundle, *, on_summary=None) -> None:

@@ -2664,9 +2664,20 @@ def main(
         help="Run the stdin-driven headless worker loop used for background agent tasks",
         hidden=True,
     ),
+    mcp_serve: bool = typer.Option(
+        False,
+        "--mcp-serve",
+        help="Run as an MCP server over stdio (exposes session search, skill loop, and recovery status)",
+    ),
 ) -> None:
     """Start an interactive session or run a single prompt."""
     if ctx.invoked_subcommand is not None:
+        return
+
+    if mcp_serve:
+        from openharness.mcp.serve import run_mcp_server
+
+        run_mcp_server()
         return
 
     import asyncio
