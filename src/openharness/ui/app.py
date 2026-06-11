@@ -816,7 +816,7 @@ async def run_headless_control(
             index_enabled,
         )
 
-        request_id = request.correlation_id
+        request_id = request.effective_request_id
         if not index_enabled():
             await _error(INDEX_DISABLED_MESSAGE, request_id=request_id)
             return
@@ -876,6 +876,38 @@ async def run_headless_control(
             usage = getattr(bundle.engine, "total_usage", None)
             if usage is not None:
                 payload["usage"] = usage.model_dump()
+        await _emit(payload, request_id=request_id)
+
+    async def _emit_diagnostics_snapshot(request: HeadlessRequest) -> None:
+        """Answer a diagnostics request (additive; observability-metrics §6)."""
+        from openharness.diagnostics import context as diag_context
+        from openharness.diagnostics import get_recorder
+        from openharness.diagnostics.snapshot import (
+            build_status,
+            read_events,
+            recent_errors,
+            summarize_events,
+            thread_executor_probe_async,
+        )
+
+        request_id = request.effective_request_id
+        payload: dict[str, Any] = {
+            "type": "diagnostics_snapshot",
+            "run_id": diag_context.run_id(),
+        }
+        get_recorder().flush()
+        if (request.scope or "summary") == "status":
+            status = build_status()
+            status["executor_probe"] = await thread_executor_probe_async()
+            payload["status"] = status
+            payload["summary"] = status["summary"]
+            payload["recent_errors"] = status["recent_errors"]
+            payload["recorder"] = status["recorder"]
+        else:
+            events = read_events(since_seconds=3600.0)
+            payload["summary"] = summarize_events(events, window_seconds=3600.0)
+            payload["recent_errors"] = recent_errors(events)
+            payload["recorder"] = get_recorder().health()
         await _emit(payload, request_id=request_id)
 
     async def _run_active_request(awaitable, *, request_id: str | None) -> bool:
@@ -983,24 +1015,33 @@ async def run_headless_control(
                 )
                 await _error(f"Invalid request: {exc}", recoverable=True)
                 continue
+            # External correlation id (if any) flows into diagnostics events
+            # only; it is never used for protocol routing.
+            _diag_context.correlation_id_var.set(request.correlation_id)
             # Answer read-only and interrupt requests immediately, even while a
             # turn is active; everything else is queued FIFO. Guard so a
             # handling failure can never silently kill stdin processing.
             try:
                 if request.type == "list_sessions":
-                    await _emit_sessions(request.correlation_id)
+                    with _watchdog.track("headless_list", request_id=request.effective_request_id):
+                        await _emit_sessions(request.effective_request_id)
                     continue
                 if request.type == "search_sessions":
-                    await _emit_session_search(request)
+                    with _watchdog.track("headless_search", request_id=request.effective_request_id):
+                        await _emit_session_search(request)
                     continue
                 if request.type == "skill_loop_status":
-                    await _emit_skill_loop_status(request.correlation_id)
+                    await _emit_skill_loop_status(request.effective_request_id)
                     continue
                 if request.type == "status":
-                    await _emit_status(request.correlation_id)
+                    with _watchdog.track("headless_status", request_id=request.effective_request_id):
+                        await _emit_status(request.effective_request_id)
+                    continue
+                if request.type == "diagnostics":
+                    await _emit_diagnostics_snapshot(request)
                     continue
                 if request.type == "interrupt":
-                    await _interrupt_active_request(request.correlation_id)
+                    await _interrupt_active_request(request.effective_request_id)
                     continue
                 if request.type == "shutdown" and request.force:
                     # Forced shutdown cancels active work; plain shutdown
@@ -1010,21 +1051,29 @@ async def run_headless_control(
                         active_request_task.cancel()
             except Exception as exc:
                 with contextlib.suppress(Exception):
-                    await _error(f"Request handling failed: {exc}", request_id=request.correlation_id)
+                    await _error(f"Request handling failed: {exc}", request_id=request.effective_request_id)
                 continue
             await request_queue.put(request)
 
+    from openharness.diagnostics import context as _diag_context
     from openharness.diagnostics import record as _diag_record
+    from openharness.diagnostics import watchdog as _watchdog
     from openharness.diagnostics.runinfo import write_current_run
+    from openharness.diagnostics.snapshot import thread_executor_probe_async
 
     write_current_run("headless")
     _diag_record("headless", "process", "started", attrs={"mode": "headless"})
+    _watchdog.start_watchdog("headless")
     await _emit({"type": "process_ready", "protocol_version": HEADLESS_PROTOCOL_VERSION})
+    # Startup executor probe (diagnostic only, never load-bearing): detects
+    # environments where to_thread/executor handoff is unsafe.
+    probe_task = asyncio.create_task(thread_executor_probe_async())
     reader = asyncio.create_task(_read_requests())
     try:
         while True:
             request = await request_queue.get()
-            request_id = request.correlation_id
+            request_id = request.effective_request_id
+            _diag_context.correlation_id_var.set(request.correlation_id)
             _request_start = time.monotonic()
             _request_type = request.type
             if force_shutdown and request.type != "shutdown":
@@ -1060,10 +1109,13 @@ async def run_headless_control(
                             request_id=request_id,
                         )
                         continue
-                if not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
-                    _record_request()
-                    break
+                with _watchdog.track("headless_submit", request_id=request_id):
+                    should_continue = await _run_active_request(
+                        _submit(line, request_id=request_id), request_id=request_id
+                    )
                 _record_request()
+                if not should_continue:
+                    break
             elif request.type in {"resume", "continue"}:
                 if not await _restore_session(request, request_id=request_id):
                     continue
@@ -1088,7 +1140,7 @@ async def run_headless_control(
                     if pending.type != "shutdown":
                         await _error(
                             "Process is shutting down",
-                            request_id=pending.correlation_id,
+                            request_id=pending.effective_request_id,
                             recoverable=False,
                         )
                 await _emit(
@@ -1097,8 +1149,12 @@ async def run_headless_control(
                 )
                 break
     finally:
+        probe_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await probe_task
         reader.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reader
+        _watchdog.stop_watchdog()
         if bundle is not None:
             await close_runtime(bundle)

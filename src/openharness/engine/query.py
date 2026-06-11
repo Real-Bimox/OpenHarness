@@ -784,11 +784,20 @@ async def run_query(
             "tool_schema_count": len(api_request.tools),
             "max_tokens_effective": effective_max_tokens,
         }
+        # Watchdog coverage for "no first token yet": closed on the first
+        # token, on completion, and on failure (close() is idempotent).
+        from contextlib import ExitStack
+
+        from openharness.diagnostics import watchdog as _diag_watchdog
+
+        ttft_watch = ExitStack()
+        ttft_watch.enter_context(_diag_watchdog.track("api_first_token"))
         try:
             async for event in context.api_client.stream_message(api_request):
                 if isinstance(event, ApiTextDeltaEvent):
                     if first_token_ms is None:
                         first_token_ms = (time.monotonic() - api_call_start) * 1000.0
+                        ttft_watch.close()
                     yield AssistantTextDelta(text=event.text), None
                     continue
                 if isinstance(event, ApiRetryEvent):
@@ -843,6 +852,7 @@ async def run_query(
                 if isinstance(event, ApiMessageCompleteEvent):
                     final_message = event.message
                     usage = event.usage
+            ttft_watch.close()
             record(
                 "api",
                 "model_call",
@@ -858,6 +868,7 @@ async def run_query(
                 },
             )
         except Exception as exc:
+            ttft_watch.close()
             record(
                 "api",
                 "model_call",
@@ -1085,19 +1096,22 @@ async def _execute_tool_call(
             )
 
     log.debug("executing %s ...", tool_name)
+    from openharness.diagnostics import watchdog as _diag_watchdog
+
     t0 = time.monotonic()
-    result = await tool.execute(
-        parsed_input,
-        ToolExecutionContext(
-            cwd=context.cwd,
-            metadata={
-                "tool_registry": context.tool_registry,
-                "ask_user_prompt": context.ask_user_prompt,
-                **(context.tool_metadata or {}),
-            },
-            hook_executor=context.hook_executor,
-        ),
-    )
+    with _diag_watchdog.track("tool_call", tool_use_id=tool_use_id):
+        result = await tool.execute(
+            parsed_input,
+            ToolExecutionContext(
+                cwd=context.cwd,
+                metadata={
+                    "tool_registry": context.tool_registry,
+                    "ask_user_prompt": context.ask_user_prompt,
+                    **(context.tool_metadata or {}),
+                },
+                hook_executor=context.hook_executor,
+            ),
+        )
     elapsed = time.monotonic() - t0
     log.debug("executed %s in %.2fs err=%s output_len=%d",
               tool_name, elapsed, result.is_error, len(result.output or ""))

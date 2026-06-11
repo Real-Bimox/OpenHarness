@@ -128,6 +128,10 @@ Notes:
   (`assistant_complete.usage` is the per-turn snapshot from the provider).
 - `error` with a `question` field is emitted when the model calls `ask_user`,
   which is unavailable in headless mode.
+- Every request accepts an optional `correlation_id` that is echoed into
+  local diagnostics events only — never used for protocol routing. The
+  additive `diagnostics` request / `diagnostics_snapshot` event pair is
+  specified in [observability-metrics](observability-metrics.md) §6.
 
 This protocol intentionally mirrors the current `stream-json` and React backend event vocabulary so the implementation stays small.
 

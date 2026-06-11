@@ -324,8 +324,11 @@ class ConversationIndex:
                 ),
             )
 
+        from openharness.diagnostics import watchdog
+
         update_start = time.monotonic()
-        self._write(_apply)
+        with watchdog.track("index_update", session_id=session_id):
+            self._write(_apply)
         from openharness.diagnostics import record
 
         record(
@@ -378,15 +381,18 @@ class ConversationIndex:
         exclude_session: str | None = None,
     ) -> dict[str, Any]:
         """Discovery search. Returns {"hits": [...]} or {"error": "..."}."""
+        from openharness.diagnostics import watchdog
+
         start = time.monotonic()
-        result = self._search_impl(
-            raw_query,
-            project=project,
-            limit=limit,
-            sort=sort,
-            role_filter=role_filter,
-            exclude_session=exclude_session,
-        )
+        with watchdog.track("index_search"):
+            result = self._search_impl(
+                raw_query,
+                project=project,
+                limit=limit,
+                sort=sort,
+                role_filter=role_filter,
+                exclude_session=exclude_session,
+            )
         from openharness.diagnostics import record
 
         record(

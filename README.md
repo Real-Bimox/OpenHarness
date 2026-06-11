@@ -300,7 +300,21 @@ printf '%s\n' \
   | oh --headless --permission-mode full_auto
 ```
 
-Key semantics: requests run FIFO; `status`/`list_sessions`/`interrupt` are answered immediately even mid-turn; `shutdown` is graceful by default while `{"type":"shutdown","force":true}` cancels the active turn; events carry token `usage`; interrupted turns are persisted for resume. Full request/event reference: [docs/proposals/headless-local-control-api.md](docs/proposals/headless-local-control-api.md).
+Key semantics: requests run FIFO; `status`/`list_sessions`/`interrupt`/`diagnostics` are answered immediately even mid-turn; `shutdown` is graceful by default while `{"type":"shutdown","force":true}` cancels the active turn; events carry token `usage`; interrupted turns are persisted for resume. Every request may carry an optional `correlation_id` that external orchestrators get echoed into diagnostics events (never used for routing). Full request/event reference: [docs/proposals/headless-local-control-api.md](docs/proposals/headless-local-control-api.md).
+
+### Diagnostics & Observability (Local-Only)
+
+OpenHarness records bounded, redacted, structured diagnostic events locally — no network sink, no new dependencies. Every turn, model call, tool execution, permission decision, snapshot write, and index operation is correlated by one `run_id` (plus `turn_id`/`request_id`/`tool_use_id`), stored as daily JSONL under the data dir with 14-day retention and a 25 MB/day cap, and never contains prompt text, assistant text, tool output, or secrets:
+
+```bash
+oh diagnostics status --json          # canonical health/status document
+oh diagnostics tail --component api   # most recent events
+oh diagnostics summary --since 24h    # counts, errors, token counters
+oh diagnostics export --since 24h     # redacted support bundle (.tar.gz)
+oh diagnostics purge --older-than 14d
+```
+
+The same data is reachable from integrations: headless `{"type":"diagnostics","scope":"summary"}` returns a `diagnostics_snapshot` event, and the MCP server exposes a read-only `diagnostics_status` tool. Long-lived modes run a watchdog that emits `slow_operation` events (with redacted stack snapshots past hard thresholds) and 5-second heartbeats. Diagnostics add < 0.5 ms per submitted line (gated at release time by `scripts/measure_per_line.py`) and can be disabled with `{"diagnostics": {"enabled": false}}` in settings. Design: [docs/proposals/observability-metrics.md](docs/proposals/observability-metrics.md).
 
 ### Dry Run (Safe Preview)
 

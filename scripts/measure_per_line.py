@@ -86,8 +86,10 @@ async def _measure(iterations: int, cwd: str) -> list[float]:
 
 
 def main() -> int:
-    iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 15
-    rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+    # Defaults sized so the min-line estimate converges on a loaded machine;
+    # the 0.5 ms diagnostics-delta gate needs more samples than the 5 ms one.
+    iterations = int(sys.argv[1]) if len(sys.argv) > 1 else 30
+    rounds = int(sys.argv[2]) if len(sys.argv) > 2 else 7
     # Best-of-N rounds, same methodology as scripts/measure_startup.py:
     # scheduler/GC noise on a busy machine easily exceeds the budget margin.
     round_p50s: list[float] = []

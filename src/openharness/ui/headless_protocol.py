@@ -22,9 +22,15 @@ class HeadlessRequest(BaseModel):
         "interrupt",
         "shutdown",
         "permission_response",
+        "diagnostics",
     ]
     request_id: str | None = None
     id: str | None = None
+    # Optional external correlation id (docs/proposals/observability-metrics.md
+    # §6): echoed into diagnostics events only, never used for protocol routing.
+    correlation_id: str | None = None
+    # diagnostics request scope: "summary" (default) or "status".
+    scope: str | None = None
     prompt: str | None = None
     line: str | None = None
     text: str | None = None
@@ -40,7 +46,7 @@ class HeadlessRequest(BaseModel):
     project: str | None = None
 
     @property
-    def correlation_id(self) -> str | None:
+    def effective_request_id(self) -> str | None:
         return self.request_id or self.id
 
     @property

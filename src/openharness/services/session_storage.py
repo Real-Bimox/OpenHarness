@@ -147,16 +147,19 @@ def save_session_snapshot(
     }
     data = json.dumps(payload, indent=2) + "\n"
 
-    # Save as latest
-    latest_path = session_dir / "latest.json"
-    # Per-line state cache: rename-atomic, no fsync (see atomic_write_bytes).
-    atomic_write_text(latest_path, data, fsync=False)
+    from openharness.diagnostics import watchdog
 
-    # Save by session ID
-    session_path = session_dir / f"session-{sid}.json"
-    atomic_write_text(session_path, data, fsync=False)
-    _update_session_index(session_dir, _session_index_entry(payload, session_path))
-    _update_conversation_index(payload)
+    with watchdog.track("snapshot_write", session_id=sid):
+        # Save as latest
+        latest_path = session_dir / "latest.json"
+        # Per-line state cache: rename-atomic, no fsync (see atomic_write_bytes).
+        atomic_write_text(latest_path, data, fsync=False)
+
+        # Save by session ID
+        session_path = session_dir / f"session-{sid}.json"
+        atomic_write_text(session_path, data, fsync=False)
+        _update_session_index(session_dir, _session_index_entry(payload, session_path))
+        _update_conversation_index(payload)
 
     from openharness.diagnostics import record
 

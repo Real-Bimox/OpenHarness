@@ -67,7 +67,7 @@ def test_write_and_read_back(tmp_path: Path):
     assert recorder.health()["events_written"] == 1
 
 
-def test_disabled_mode_writes_nothing(tmp_path: Path):
+def test_diagnostics_disabled_mode_no_writes(tmp_path: Path):
     recorder = _recorder(tmp_path, enabled=False)
     recorder.record("api", "call")
     recorder.flush()
@@ -75,7 +75,7 @@ def test_disabled_mode_writes_nothing(tmp_path: Path):
     assert recorder.health()["events_written"] == 0
 
 
-def test_queue_overflow_drops_low_priority_first(tmp_path: Path):
+def test_diagnostics_overflow_drops_low_priority_events(tmp_path: Path):
     import openharness.diagnostics.recorder as rec_mod
 
     recorder = _recorder(tmp_path)

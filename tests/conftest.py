@@ -44,5 +44,7 @@ def _isolate_fs_caches():
 
     conversation_index.reset_conversation_index()
     from openharness.diagnostics import reset_recorder
+    from openharness.diagnostics.watchdog import stop_watchdog
 
+    stop_watchdog()
     reset_recorder()

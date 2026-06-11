@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
@@ -841,6 +842,7 @@ sessions_app = typer.Typer(name="sessions", help="List, search, and reindex save
 skills_cli_app = typer.Typer(name="skills", help="Inspect skill usage, pins, pending writes, and the curator")
 fallback_app = typer.Typer(name="fallback", help="Manage the provider fallback chain")
 autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
+diagnostics_app = typer.Typer(name="diagnostics", help="Inspect and export local diagnostics")
 
 app.add_typer(mcp_app)
 app.add_typer(plugin_app)
@@ -852,6 +854,151 @@ app.add_typer(autopilot_app)
 app.add_typer(sessions_app)
 app.add_typer(skills_cli_app)
 app.add_typer(fallback_app)
+app.add_typer(diagnostics_app)
+
+
+# ---- diagnostics subcommands (docs/proposals/observability-metrics.md §6) ----
+
+def _parse_duration_seconds(value: str) -> float:
+    """Parse durations like '30m', '1h', '24h', '14d' into seconds."""
+    raw = value.strip().lower()
+    units = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+    if raw and raw[-1] in units:
+        return float(raw[:-1]) * units[raw[-1]]
+    return float(raw)
+
+
+@diagnostics_app.command("status")
+def diagnostics_status(
+    as_json: bool = typer.Option(False, "--json", help="Print the canonical status document"),
+) -> None:
+    """Show recorder health, recent errors, index state, and run metadata."""
+    from openharness.diagnostics.snapshot import build_status
+
+    status = build_status(probe=True)
+    if as_json:
+        print(json.dumps(status, ensure_ascii=False, indent=2))
+        return
+    run = status.get("run") or {}
+    recorder = status.get("recorder") or {}
+    summary = status.get("summary") or {}
+    probe = status.get("executor_probe") or {}
+    print(f"version:        {status['version']}  (run {status['run_id']})")
+    print(f"mode:           {run.get('mode', 'n/a')}  pid {run.get('pid', 'n/a')}")
+    print(
+        "recorder:       "
+        f"{'enabled' if recorder.get('enabled') else 'disabled'}  "
+        f"written {recorder.get('events_written', 0)}  "
+        f"dropped {recorder.get('events_dropped', 0)}  queued {recorder.get('queued', 0)}"
+    )
+    index = status.get("index") or {}
+    print(f"index:          enabled={index.get('enabled')}  fts={index.get('fts_enabled')}")
+    print(f"executor probe: {probe.get('status', 'n/a')}")
+    print(f"events (1h):    {summary.get('events', 0)}")
+    for component, bucket in sorted((summary.get("by_component") or {}).items()):
+        print(f"  {component:<12} total {bucket['total']:<6} errors {bucket['errors']}")
+    errors = status.get("recent_errors") or []
+    if errors:
+        print("recent errors:")
+        for err in errors:
+            print(f"  {err.get('ts')}  {err.get('component')}.{err.get('operation')}  {err.get('reason') or err.get('type') or ''}")
+
+
+@diagnostics_app.command("tail")
+def diagnostics_tail(
+    component: str = typer.Option(None, "--component", help="Filter by component (api, tool, headless, ...)"),
+    limit: int = typer.Option(50, "--limit"),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSONL events"),
+) -> None:
+    """Show the most recent diagnostic events."""
+    from openharness.diagnostics import get_recorder
+    from openharness.diagnostics.snapshot import read_events
+
+    get_recorder().flush()
+    events = read_events(component=component, limit=limit)
+    for event in events:
+        if as_json:
+            print(json.dumps(event, ensure_ascii=False))
+            continue
+        duration = event.get("duration_ms")
+        duration_text = f" {duration:.1f}ms" if isinstance(duration, (int, float)) else ""
+        print(
+            f"{event.get('ts')}  {event.get('level', 'info'):<7} "
+            f"{event.get('component')}.{event.get('operation')} "
+            f"{event.get('event')} [{event.get('status')}]" + duration_text
+        )
+    if not events:
+        print("No diagnostic events recorded yet.")
+
+
+@diagnostics_app.command("summary")
+def diagnostics_summary(
+    since: str = typer.Option("1h", "--since", help="Window, e.g. 30m, 1h, 24h"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Aggregate event counts, errors, and token counters over a window."""
+    from openharness.diagnostics import get_recorder
+    from openharness.diagnostics.snapshot import read_events, recent_errors, summarize_events
+
+    window = _parse_duration_seconds(since)
+    get_recorder().flush()
+    events = read_events(since_seconds=window)
+    summary = summarize_events(events, window_seconds=window)
+    if as_json:
+        print(json.dumps({"summary": summary, "recent_errors": recent_errors(events)}, ensure_ascii=False, indent=2))
+        return
+    print(f"events in last {since}: {summary['events']}")
+    for component, bucket in sorted(summary["by_component"].items()):
+        print(f"  {component:<12} total {bucket['total']:<6} errors {bucket['errors']}")
+    if summary["counters"]:
+        print("counters:")
+        for key, value in sorted(summary["counters"].items()):
+            print(f"  {key}: {value:g}")
+    for err in recent_errors(events):
+        print(f"error: {err.get('ts')}  {err.get('component')}.{err.get('operation')}  {err.get('reason') or err.get('type') or ''}")
+
+
+@diagnostics_app.command("export")
+def diagnostics_export(
+    since: str = typer.Option("24h", "--since", help="Include event logs newer than this"),
+    output: Path = typer.Option(None, "--output", help="Bundle path (.tar.gz); defaults under the data dir"),
+    include_stacks: bool = typer.Option(False, "--include-stacks", help="Include redacted stack snapshots"),
+) -> None:
+    """Export a redacted diagnostic bundle for support."""
+    from openharness.diagnostics.export import export_bundle
+
+    result = export_bundle(
+        output=output,
+        since_seconds=_parse_duration_seconds(since),
+        include_stacks=include_stacks,
+    )
+    print(f"Wrote {result['path']}")
+    print(f"  files: {len(result['files'])}  redactions: {result['redactions']['total']}")
+
+
+@diagnostics_app.command("purge")
+def diagnostics_purge(
+    older_than: str = typer.Option("14d", "--older-than", help="Delete diagnostics older than this"),
+) -> None:
+    """Delete old event logs, summaries, stack snapshots, and exports."""
+    from openharness.diagnostics.snapshot import diagnostics_dir
+
+    cutoff = time.time() - _parse_duration_seconds(older_than)
+    removed = 0
+    for subdir, pattern in (
+        ("events", "*.jsonl"),
+        ("summaries", "*.json"),
+        ("stacks", "*.txt"),
+        ("exports", "*.tar.gz"),
+    ):
+        for path in (diagnostics_dir() / subdir).glob(pattern):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
+    print(f"Removed {removed} diagnostic file(s) older than {older_than}.")
 
 
 @fallback_app.command("list")

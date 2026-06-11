@@ -26,11 +26,12 @@ def _instrumented(fn):
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        from openharness.diagnostics import build_error, record
+        from openharness.diagnostics import build_error, record, watchdog
 
         start = _time.monotonic()
         try:
-            result = fn(*args, **kwargs)
+            with watchdog.track("mcp_tool_call"):
+                result = fn(*args, **kwargs)
         except Exception as exc:
             record(
                 "mcp",
@@ -164,9 +165,42 @@ def build_server():
         }
         return json.dumps(payload, ensure_ascii=False)
 
+    @server.tool()
+    @_instrumented
+    def diagnostics_status() -> str:
+        """Report local diagnostics: recorder health, recent errors, index state.
+
+        Read-only mirror of the headless diagnostics summary; raw event logs
+        are exported only through `oh diagnostics export` on the CLI.
+        """
+        from openharness.diagnostics import get_recorder
+        from openharness.diagnostics.snapshot import build_status
+
+        get_recorder().flush()
+        return json.dumps(build_status(probe=False), ensure_ascii=False)
+
     return server
 
 
 def run_mcp_server() -> None:
     """Run the stdio MCP server (blocking)."""
-    build_server().run()
+    import time as _time
+
+    from openharness.diagnostics import record, watchdog
+    from openharness.diagnostics.runinfo import write_current_run
+
+    start = _time.monotonic()
+    write_current_run("mcp")
+    server = build_server()
+    record(
+        "mcp",
+        "server_start",
+        "completed",
+        duration_ms=(_time.monotonic() - start) * 1000.0,
+        attrs={"mode": "mcp"},
+    )
+    watchdog.start_watchdog("mcp")
+    try:
+        server.run()
+    finally:
+        watchdog.stop_watchdog()
