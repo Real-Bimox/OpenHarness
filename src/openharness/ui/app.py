@@ -1021,27 +1021,47 @@ async def run_headless_control(
             # Answer read-only and interrupt requests immediately, even while a
             # turn is active; everything else is queued FIFO. Guard so a
             # handling failure can never silently kill stdin processing.
+            fast_start = time.monotonic()
+
+            def _record_fast_request() -> None:
+                from openharness.diagnostics import record as _diag_fast_record
+
+                _diag_fast_record(
+                    "headless",
+                    "request",
+                    "completed",
+                    duration_ms=(time.monotonic() - fast_start) * 1000.0,
+                    request_id=request.effective_request_id,
+                    attrs={"request_type": request.type},
+                )
+
             try:
                 if request.type == "list_sessions":
                     with _watchdog.track("headless_list", request_id=request.effective_request_id):
                         await _emit_sessions(request.effective_request_id)
+                    _record_fast_request()
                     continue
                 if request.type == "search_sessions":
                     with _watchdog.track("headless_search", request_id=request.effective_request_id):
                         await _emit_session_search(request)
+                    _record_fast_request()
                     continue
                 if request.type == "skill_loop_status":
                     await _emit_skill_loop_status(request.effective_request_id)
+                    _record_fast_request()
                     continue
                 if request.type == "status":
                     with _watchdog.track("headless_status", request_id=request.effective_request_id):
                         await _emit_status(request.effective_request_id)
+                    _record_fast_request()
                     continue
                 if request.type == "diagnostics":
                     await _emit_diagnostics_snapshot(request)
+                    _record_fast_request()
                     continue
                 if request.type == "interrupt":
                     await _interrupt_active_request(request.effective_request_id)
+                    _record_fast_request()
                     continue
                 if request.type == "shutdown" and request.force:
                     # Forced shutdown cancels active work; plain shutdown
@@ -1147,6 +1167,7 @@ async def run_headless_control(
                     {"type": "shutdown", "session_id": bundle.session_id if bundle is not None else ""},
                     request_id=request_id,
                 )
+                _record_request()
                 break
     finally:
         probe_task.cancel()
