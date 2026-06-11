@@ -2633,7 +2633,7 @@ def _check_health_server_deps() -> None:
     except ImportError:
         print(
             "Error: --health-server requires the 'health-server' extra.\n"
-            "  pip install openharness[health-server]",
+            "  pip install openharness-ai[health-server]",
             file=sys.stderr,
         )
         raise typer.Exit(1)
@@ -2856,7 +2856,7 @@ def main(
     health_server: bool = typer.Option(
         False,
         "--health-server",
-        help="Start the HTTP health/status server as the primary mode, or as a background thread alongside --headless, --task-worker, or --mcp-serve (requires openharness[health-server])",
+        help="Start the HTTP health/status server as the primary mode, or as a background thread alongside --headless, --task-worker, or --mcp-serve (requires openharness-ai[health-server])",
         rich_help_panel="Advanced",
     ),
     health_server_port: int | None = typer.Option(

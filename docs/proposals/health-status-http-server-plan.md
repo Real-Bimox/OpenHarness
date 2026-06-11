@@ -404,7 +404,7 @@ health_server: bool = typer.Option(
     "--health-server",
     help="Start the HTTP health/status server as the primary mode, "
          "or as a background thread alongside --headless, --task-worker, "
-         "or --mcp-serve (requires openharness[health-server])",
+         "or --mcp-serve (requires openharness-ai[health-server])",
     rich_help_panel="Advanced",
 ),
 health_server_port: int | None = typer.Option(
@@ -565,7 +565,7 @@ def _check_health_server_deps() -> None:
     except ImportError:
         print(
             "Error: --health-server requires the 'health-server' extra.\n"
-            "  pip install openharness[health-server]",
+            "  pip install openharness-ai[health-server]",
             file=sys.stderr,
         )
         raise typer.Exit(1)
@@ -794,7 +794,7 @@ def test_auth_status_exposes_model_not_key():
 
 def test_missing_deps_error():
     # Patch sys.modules to hide fastapi, run CLI with --health-server,
-    # assert stderr contains "pip install openharness[health-server]"
+    # assert stderr contains "pip install openharness-ai[health-server]"
     # and exit code is 1.
 
 def test_port_without_enable_errors():
@@ -869,7 +869,7 @@ async def test_system_stats_disk():
 
 | # | Criterion | Implementation location |
 |---|---|---|
-| 1 | `pip install openharness[health-server]` installs deps | `pyproject.toml` health-server extra |
+| 1 | `pip install openharness-ai[health-server]` installs deps | `pyproject.toml` health-server extra |
 | 2 | `oh --health-server` starts on 127.0.0.1:8642 | `cli.py` standalone mode block |
 | 3 | `GET /health` returns ok, zero-I/O response (no timing gate in CI) | `health_server.py` — constant handler; test checks content, not latency |
 | 4 | `GET /health/detailed` returns build_status plus top-level `"status"` and `"platform"` keys, with thread_probe populated | `health_server.py` — wraps `build_status(probe=True)` |

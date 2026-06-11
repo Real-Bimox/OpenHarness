@@ -14,7 +14,7 @@
 
 Add an optional HTTP health and status server to OpenHarness so that container orchestrators, load balancers, monitoring systems, and remote operators can probe process liveness, inspect runtime state, and collect resource metrics without requiring SSH access, a TUI session, or the JSONL headless protocol.
 
-The server is an **opt-in install-time extra** (`openharness[health-server]`) that introduces FastAPI and uvicorn only when explicitly requested. The base install is unchanged.
+The server is an **opt-in install-time extra** (`openharness-ai[health-server]`) that introduces FastAPI and uvicorn only when explicitly requested. The base install is unchanged.
 
 ## Motivation
 
@@ -44,7 +44,7 @@ OpenHarness can deliver equivalent value with a lighter server that reuses the e
 
 In scope:
 
-- An optional FastAPI application (`openharness[health-server]` extra) exposing health, status, and system-metrics endpoints over HTTP.
+- An optional FastAPI application (`openharness-ai[health-server]` extra) exposing health, status, and system-metrics endpoints over HTTP.
 - A CLI flag `--health-server` to start the server as the primary mode (standalone) or as a background thread alongside another mode.
 - A `GET /health` liveness endpoint (no auth, zero I/O, suitable for container probes).
 - A `GET /health/detailed` readiness endpoint (no auth, reuses `build_status(probe=True)`).
@@ -270,7 +270,7 @@ health-server = ["fastapi>=0.100", "uvicorn>=0.20"]
 The base install is unchanged. Users who want the health server run:
 
 ```bash
-pip install openharness[health-server]
+pip install openharness-ai[health-server]
 ```
 
 Lazy import pattern: the CLI flag checks for FastAPI availability at invocation time and prints a clear install instruction if missing, matching the pattern used by `mcp/serve.py` for MCP dependencies.
@@ -328,11 +328,11 @@ The uvicorn daemon thread adds ~10 MB RSS (Python + FastAPI + uvicorn). No measu
 
 ### No impact on base install
 
-Users who do not install `openharness[health-server]` see zero changes: no new imports, no new threads, no new files.
+Users who do not install `openharness-ai[health-server]` see zero changes: no new imports, no new threads, no new files.
 
 ## Acceptance Criteria
 
-1. `pip install openharness[health-server]` installs fastapi and uvicorn without errors.
+1. `pip install openharness-ai[health-server]` installs fastapi and uvicorn without errors.
 2. `oh --health-server` starts an HTTP server on `127.0.0.1:8642`.
 3. `curl http://127.0.0.1:8642/health` returns `{"status": "ok", "platform": "openharness", "version": "..."}` (zero-I/O response, no timing gate).
 4. `curl http://127.0.0.1:8642/health/detailed` returns a valid `build_status()` document with `thread_probe` populated.
@@ -340,7 +340,7 @@ Users who do not install `openharness[health-server]` see zero changes: no new i
 6. `curl http://127.0.0.1:8642/api/system/stats` returns host metrics (with `psutil` fields when psutil is installed, without errors when it is not).
 7. `curl http://127.0.0.1:8642/v1/capabilities` returns a valid capabilities document listing all five endpoints.
 8. `oh --headless --health-server` starts the headless JSONL protocol on stdin/stdout and the health server simultaneously.
-9. Running `oh --health-server` without `openharness[health-server]` installed prints a clear install instruction and exits with code 1.
+9. Running `oh --health-server` without `openharness-ai[health-server]` installed prints a clear install instruction and exits with code 1.
 10. `GET /health` is reachable while a headless turn is active (the background thread is not blocked by the async event loop).
 11. No runtime imports, threads, or state are created when `--health-server` is not passed (base install unchanged).
 12. Non-loopback binding is not possible in v1 (no `--health-server-host` option; server binds to `127.0.0.1` only).

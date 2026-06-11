@@ -153,6 +153,10 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
+- **2026-06-11** 🩺 **Proposal branch: optional health/status HTTP server**:
+  - Adds an opt-in `openharness-ai[health-server]` extra with FastAPI + plain uvicorn for a local-only JSON health API. The base install remains unchanged.
+  - `oh --health-server` serves `GET /health`, `GET /health/detailed`, `GET /api/status`, `GET /api/system/stats`, and `GET /v1/capabilities` on `127.0.0.1`.
+  - Long-lived local modes can run it in the background with `oh --headless --health-server`, `oh --task-worker --health-server`, or `oh --mcp-serve --health-server`. Design: [docs/proposals/health-status-http-server.md](docs/proposals/health-status-http-server.md).
 - **2026-06-11** 🔍 **v0.1.18** — Local-first observability & diagnostics:
   - Bounded, redacted, structured diagnostic events for every turn, model call, tool execution, permission decision, snapshot write, and index operation — correlated by one `run_id`, stored locally as daily JSONL (14-day retention, 25 MB/day cap), never containing prompts, outputs, or secrets. Adds < 0.5 ms per line (release-gated).
   - New `oh diagnostics status|tail|summary|export|purge` CLI group; headless `diagnostics` request + optional `correlation_id` on every request; MCP `diagnostics_status` tool; redacted support-bundle export with per-rule redaction report.
@@ -320,6 +324,34 @@ oh diagnostics purge --older-than 14d
 ```
 
 The same data is reachable from integrations: headless `{"type":"diagnostics","scope":"summary"}` returns a `diagnostics_snapshot` event, and the MCP server exposes a read-only `diagnostics_status` tool. Long-lived modes run a watchdog that emits `slow_operation` events (with redacted stack snapshots past hard thresholds) and 5-second heartbeats. Diagnostics add < 0.5 ms per submitted line (gated at release time by `scripts/measure_per_line.py`) and can be disabled with `{"diagnostics": {"enabled": false}}` in settings. Design: [docs/proposals/observability-metrics.md](docs/proposals/observability-metrics.md).
+
+### Optional Health/Status HTTP Server
+
+The health server is opt-in and local-only. It adds FastAPI and plain uvicorn only when installed through the optional extra; the base install has no new runtime dependency:
+
+```bash
+pip install "openharness-ai[health-server]"
+
+# From a source checkout:
+python -m pip install -e ".[health-server]"
+```
+
+Run it as the primary process:
+
+```bash
+oh --health-server
+oh --health-server --health-server-port 9090
+```
+
+Or run it beside long-lived local modes:
+
+```bash
+oh --headless --health-server
+oh --task-worker --health-server
+oh --mcp-serve --health-server
+```
+
+The v1 server binds to `127.0.0.1` only and exposes read-only JSON endpoints: `/health`, `/health/detailed`, `/api/status`, `/api/system/stats`, and `/v1/capabilities`. Non-loopback binding, authentication, cron integration, and Prometheus `/metrics` are deferred follow-ups. Design: [docs/proposals/health-status-http-server.md](docs/proposals/health-status-http-server.md).
 
 ### Dry Run (Safe Preview)
 
@@ -711,7 +743,7 @@ Model:       -m/--model, --effort, --max-turns
 Output:      -p/--print, --output-format text|json|stream-json, --headless
 Permissions: --permission-mode, --dangerously-skip-permissions
 Context:     -s/--system-prompt, --append-system-prompt, --settings
-Advanced:    -d/--debug, --mcp-config, --bare
+Advanced:    -d/--debug, --mcp-config, --bare, --health-server
 
 Subcommands: oh setup | oh provider | oh auth | oh mcp | oh plugin
 ```

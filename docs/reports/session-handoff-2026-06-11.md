@@ -12,7 +12,7 @@
 
 ## What Was Completed
 
-- Added optional dependency extra: `openharness[health-server]`.
+- Added optional dependency extra: `openharness-ai[health-server]`.
 - Added `src/openharness/api/health_server.py` with:
   - `GET /health`
   - `GET /health/detailed`
