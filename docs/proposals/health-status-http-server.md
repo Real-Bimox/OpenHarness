@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Status | DRAFT |
+| Status | IMPLEMENTED |
 | Proposal branch | `proposal/health-status-http-server` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-11 |
