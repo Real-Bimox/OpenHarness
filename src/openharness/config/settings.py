@@ -607,6 +607,9 @@ class Settings(BaseModel):
     # Anthropic prompt-caching breakpoints (system/tools/history prefix).
     # Kill switch: set false if a provider rejects cache_control blocks.
     prompt_caching_enabled: bool = True
+    # Derived FTS index over saved sessions powering session_search and the
+    # search_sessions surfaces. Kill switch only; the index is rebuildable.
+    conversation_index_enabled: bool = True
     voice_mode: bool = False
     fast_mode: bool = False
     effort: str = "medium"

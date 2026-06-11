@@ -156,8 +156,23 @@ def save_session_snapshot(
     session_path = session_dir / f"session-{sid}.json"
     atomic_write_text(session_path, data, fsync=False)
     _update_session_index(session_dir, _session_index_entry(payload, session_path))
+    _update_conversation_index(payload)
 
     return latest_path
+
+
+def _update_conversation_index(payload: dict[str, Any]) -> None:
+    """Feed the derived search index; never let it break a save."""
+    try:
+        from openharness.config import load_settings
+
+        if not load_settings().conversation_index_enabled:
+            return
+        from openharness.services.conversation_index import index_snapshot_best_effort
+
+        index_snapshot_best_effort(payload)
+    except Exception:
+        pass
 
 
 def _sanitize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:

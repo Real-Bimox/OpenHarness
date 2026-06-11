@@ -40,3 +40,6 @@ def _isolate_fs_caches():
     environment._ENV_INFO_CACHE.clear()
     system_prompt._SYSTEM_PROMPT_CACHE.clear()
     ui_runtime._AUTH_STATUS_CACHE.clear()
+    from openharness.services import conversation_index
+
+    conversation_index.reset_conversation_index()

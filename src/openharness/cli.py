@@ -837,6 +837,7 @@ auth_app = typer.Typer(name="auth", help="Manage authentication")
 provider_app = typer.Typer(name="provider", help="Manage provider profiles")
 config_app = typer.Typer(name="config", help="Show or update settings")
 cron_app = typer.Typer(name="cron", help="Manage cron scheduler and jobs")
+sessions_app = typer.Typer(name="sessions", help="List, search, and reindex saved conversations")
 autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
 
 app.add_typer(mcp_app)
@@ -846,6 +847,57 @@ app.add_typer(provider_app)
 app.add_typer(config_app)
 app.add_typer(cron_app)
 app.add_typer(autopilot_app)
+app.add_typer(sessions_app)
+
+
+@sessions_app.command("list")
+def sessions_list(
+    project: str = typer.Option("all", "--project", help="Project path to scope to, or 'all'"),
+    limit: int = typer.Option(10, "--limit"),
+) -> None:
+    """List recently active indexed conversations."""
+    from openharness.services.conversation_index import get_conversation_index
+
+    result = get_conversation_index().browse(project=project, limit=limit)
+    for row in result["sessions"]:
+        preview = (row.get("preview") or "").replace("\n", " ")
+        print(f"{row['session_id']}  [{row.get('project','')}] {row.get('title') or preview}")
+    if not result["sessions"]:
+        print("No indexed sessions. Run `oh sessions reindex` to build the index from saved snapshots.")
+
+
+@sessions_app.command("search")
+def sessions_search(
+    query: str = typer.Argument(..., help="Full-text query (AND/OR/NOT, trailing * for prefix)"),
+    project: str = typer.Option("all", "--project", help="Project path to scope to, or 'all'"),
+    limit: int = typer.Option(5, "--limit"),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+) -> None:
+    """Search past conversations from the derived FTS index."""
+    from openharness.services.conversation_index import get_conversation_index
+
+    result = get_conversation_index().search(query, project=project, limit=limit)
+    if "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        raise typer.Exit(1)
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    for hit in result["hits"]:
+        meta = hit.get("session") or {}
+        print(f"\n{hit['session_id']}  [{meta.get('project','')}] {meta.get('title','')}")
+        print(f"  match #{hit['match_message_id']} ({hit['matched_role']}): {hit['snippet']}")
+    if not result["hits"]:
+        print("No matches.")
+
+
+@sessions_app.command("reindex")
+def sessions_reindex() -> None:
+    """Rebuild the conversation index from all saved snapshots."""
+    from openharness.services.conversation_index import get_conversation_index
+
+    count = get_conversation_index().rebuild()
+    print(f"Reindexed {count} session snapshot(s).")
 
 
 # ---- mcp subcommands ----
