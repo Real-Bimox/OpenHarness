@@ -39,8 +39,14 @@ def build_server():
         Provide `query` to discover; `session_id` to read a session;
         `session_id` + `around_message_id` to scroll; nothing to browse recent.
         """
-        from openharness.services.conversation_index import get_conversation_index
+        from openharness.services.conversation_index import (
+            INDEX_DISABLED_MESSAGE,
+            get_conversation_index,
+            index_enabled,
+        )
 
+        if not index_enabled():
+            return json.dumps({"error": INDEX_DISABLED_MESSAGE})
         index = get_conversation_index()
         if session_id and around_message_id is not None:
             result = {"mode": "scroll", **index.around(session_id, around_message_id, window=window)}
@@ -55,8 +61,14 @@ def build_server():
     @server.tool()
     def list_sessions(project: str = "all", limit: int = 20) -> str:
         """List recently active OpenHarness sessions with previews."""
-        from openharness.services.conversation_index import get_conversation_index
+        from openharness.services.conversation_index import (
+            INDEX_DISABLED_MESSAGE,
+            get_conversation_index,
+            index_enabled,
+        )
 
+        if not index_enabled():
+            return json.dumps({"error": INDEX_DISABLED_MESSAGE})
         return json.dumps(get_conversation_index().browse(project=project, limit=limit), ensure_ascii=False)
 
     @server.tool()

@@ -12,7 +12,6 @@ from openharness.api.client import (
     ProviderFallbackEvent,
 )
 from openharness.api.credentials import CredentialPool
-from openharness.api.errors import OpenHarnessApiError
 from openharness.api.resilient_client import FallbackTarget, ResilientApiClient
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, TextBlock
@@ -179,3 +178,36 @@ def test_resolver_wraps_only_when_configured(monkeypatch, tmp_path):
     )
     # pool keyed on provider; anthropic api-key provider id is 'anthropic'
     assert isinstance(with_pool, (ResilientApiClient,)) or with_pool is not None
+
+
+@pytest.mark.asyncio
+async def test_translated_terminal_errors_use_classifier_for_fallback():
+    """OpenHarnessApiError must be classified, not blanket-fallbacked as 'auth'."""
+    from openharness.api.errors import AuthenticationFailure, RequestFailure
+
+    # AuthenticationFailure: classifier says fallback, with the right reason.
+    primary = _ScriptedClient([AuthenticationFailure("terse")], name="PrimaryClient")
+    fallback = _ScriptedClient([_complete("fb")], name="FallbackClient")
+    client = ResilientApiClient(
+        primary,
+        primary_model="m",
+        fallbacks=[FallbackTarget(provider="p", model="fm", factory=lambda: fallback)],
+        max_retries=1,
+    )
+    events = await _drain(client, _request())
+    fb_events = [e for e in events if isinstance(e, ProviderFallbackEvent)]
+    assert fb_events and fb_events[0].reason == "auth"
+
+    # RequestFailure with no fallback-worthy classification: raise, do NOT
+    # consume the fallback chain.
+    primary2 = _ScriptedClient([RequestFailure("stream ended unexpectedly mid-frame")], name="PrimaryClient")
+    untouched = _ScriptedClient([_complete("never")], name="FallbackClient")
+    client2 = ResilientApiClient(
+        primary2,
+        primary_model="m",
+        fallbacks=[FallbackTarget(provider="p", model="fm", factory=lambda: untouched)],
+        max_retries=1,
+    )
+    with pytest.raises(RequestFailure):
+        await _drain(client2, _request())
+    assert untouched._call == 0

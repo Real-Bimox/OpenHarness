@@ -136,6 +136,14 @@ def classify_error(exc: BaseException) -> ClassifiedError:
     """Classify any exception into a recovery policy. Order = specificity."""
     status, text = _extract(exc)
 
+    # 0. Our own translated error types are authoritative regardless of text.
+    from openharness.api.errors import AuthenticationFailure, RateLimitFailure
+
+    if isinstance(exc, AuthenticationFailure):
+        return _make(RecoveryReason.AUTH, status, text, rotate=True, fallback=True)
+    if isinstance(exc, RateLimitFailure):
+        return _make(RecoveryReason.RATE_LIMIT, status, text, retryable=True, rotate=True, fallback=True)
+
     # 1. Content policy — before status, so a 400 safety block isn't a format error.
     if _has(text, _CONTENT_POLICY):
         return _make(RecoveryReason.CONTENT_POLICY, status, text, fallback=True)

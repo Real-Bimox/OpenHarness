@@ -1025,12 +1025,21 @@ def skills_curator(
         print(f"\n{report['summary']}")
 
 
+def _require_conversation_index() -> None:
+    from openharness.services.conversation_index import INDEX_DISABLED_MESSAGE, index_enabled
+
+    if not index_enabled():
+        print(f"Error: {INDEX_DISABLED_MESSAGE}", file=sys.stderr)
+        raise typer.Exit(1)
+
+
 @sessions_app.command("list")
 def sessions_list(
     project: str = typer.Option("all", "--project", help="Project path to scope to, or 'all'"),
     limit: int = typer.Option(10, "--limit"),
 ) -> None:
     """List recently active indexed conversations."""
+    _require_conversation_index()
     from openharness.services.conversation_index import get_conversation_index
 
     result = get_conversation_index().browse(project=project, limit=limit)
@@ -1049,6 +1058,7 @@ def sessions_search(
     as_json: bool = typer.Option(False, "--json", help="Print raw JSON results"),
 ) -> None:
     """Search past conversations from the derived FTS index."""
+    _require_conversation_index()
     from openharness.services.conversation_index import get_conversation_index
 
     result = get_conversation_index().search(query, project=project, limit=limit)
@@ -1069,6 +1079,7 @@ def sessions_search(
 @sessions_app.command("reindex")
 def sessions_reindex() -> None:
     """Rebuild the conversation index from all saved snapshots."""
+    _require_conversation_index()
     from openharness.services.conversation_index import get_conversation_index
 
     count = get_conversation_index().rebuild()
@@ -2675,6 +2686,21 @@ def main(
         return
 
     if mcp_serve:
+        if (
+            headless
+            or task_worker
+            or backend_only
+            or print_mode is not None
+            or dry_run
+            or continue_session
+            or resume is not None
+        ):
+            print(
+                "Error: --mcp-serve cannot be combined with --headless, --task-worker,"
+                " --backend-only, -p/--print, --dry-run, or --continue/--resume.",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
         from openharness.mcp.serve import run_mcp_server
 
         run_mcp_server()

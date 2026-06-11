@@ -787,9 +787,16 @@ async def run_headless_control(
 
     async def _emit_session_search(request: HeadlessRequest) -> None:
         """Answer a search_sessions request from the derived index (read-only)."""
-        from openharness.services.conversation_index import get_conversation_index
+        from openharness.services.conversation_index import (
+            INDEX_DISABLED_MESSAGE,
+            get_conversation_index,
+            index_enabled,
+        )
 
         request_id = request.correlation_id
+        if not index_enabled():
+            await _error(INDEX_DISABLED_MESSAGE, request_id=request_id)
+            return
         active = bundle.session_id if bundle is not None else None
 
         def _run() -> dict[str, Any]:

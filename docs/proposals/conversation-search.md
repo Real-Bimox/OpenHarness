@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Status | IN PROGRESS |
+| Status | IMPLEMENTED |
 | Proposal branch | `proposal/learning-search-resilience` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-10 |

@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Status | APPROVED |
+| Status | IMPLEMENTED |
 | Proposal branch | `proposal/headless-local-control-api` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-09 |

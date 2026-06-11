@@ -166,7 +166,7 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
   - Background agent workers are persistent: one process serves all coordinator follow-ups (idle timeout via `task_worker_idle_timeout_s`), and conversations save/restore under a stable per-task session id — restarts resume with full context instead of paying a multi-second rebuild with an empty conversation.
   - Per-turn overhead cuts across the engine: no more fixed 50 ms compaction poll, cached tool schemas, incremental token estimation, background memory extraction (`memory.extract_model` for a cheaper model), reused Codex connections, and linear streamed-argument accumulation.
   - Full details in [RELEASE_NOTES_v0.1.13.md](RELEASE_NOTES_v0.1.13.md); roadmap in [docs/proposals/performance-hardening-roadmap.md](docs/proposals/performance-hardening-roadmap.md).
-- **2026-06-10** 🤖 **v0.1.10** — Local headless control API:
+- **2026-06-10** 📡 **v0.1.10** — Local headless control API:
   - `oh --headless` runs a local JSONL control protocol over stdin/stdout: `submit`, `resume`, `continue`, `list_sessions`, `status`, `interrupt`, and `shutdown` requests with structured events back, designed for local orchestrators that integrate OpenHarness without a TUI or network service.
   - `oh -p` now resumes sessions headlessly (`--resume <id>` / `--continue`), returns `session_id`, token `usage`, `errors`, and `permission_denials` in `--output-format json`, and exits non-zero on engine errors.
   - `shutdown` is graceful by default; `{"type":"shutdown","force":true}` cancels the active turn. Interrupted turns are persisted so resume keeps the exchange.

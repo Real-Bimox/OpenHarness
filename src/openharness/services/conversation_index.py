@@ -612,6 +612,19 @@ def flush_index_queue() -> None:
     _index_executor().submit(lambda: None).result()
 
 
+INDEX_DISABLED_MESSAGE = "Conversation indexing is disabled (conversation_index_enabled=false)."
+
+
+def index_enabled() -> bool:
+    """Single gate consulted by every surface (tool, CLI, headless, MCP)."""
+    try:
+        from openharness.config import load_settings
+
+        return bool(load_settings().conversation_index_enabled)
+    except Exception:
+        return True
+
+
 def index_snapshot_best_effort(payload: dict[str, Any], *, source: str = "local") -> None:
     """Queue a snapshot for indexing without ever blocking the save path."""
 

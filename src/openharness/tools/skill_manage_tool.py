@@ -193,7 +193,6 @@ class SkillManageTool(BaseTool):
 
         skills_dir = get_user_skills_dir()
         skill_dir = skills_dir / arguments.name
-        mutating_content = action in {"create", "edit", "patch", "write_file"}
 
         # Approval gate: stage instead of write when enabled.
         from openharness.services.skill_approval import gate_bypassed, stage_pending_write

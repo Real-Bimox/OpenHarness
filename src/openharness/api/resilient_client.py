@@ -106,15 +106,22 @@ class ResilientApiClient:
                 async for event in client.stream_message(current_request):
                     yield event
                 return
-            except OpenHarnessApiError:
+            except OpenHarnessApiError as exc:
                 # Already-translated terminal errors (the inner client decided
-                # not to retry). Try fallback before giving up.
+                # not to retry). The classifier stays the sole policy
+                # authority here too: fall back only when it says so.
+                classified = classify_error(exc)
+                if not classified.should_fallback:
+                    raise
                 advanced = self._advance_fallback(fallback_index)
                 if advanced is None:
                     raise
                 client, model, fallback_index = advanced
                 yield ProviderFallbackEvent(
-                    reason="auth", from_model=self._primary_model, to_provider=client.__class__.__name__, to_model=model
+                    reason=classified.reason.value,
+                    from_model=self._primary_model,
+                    to_provider=client.__class__.__name__,
+                    to_model=model,
                 )
                 retry_count = 0
                 continue
