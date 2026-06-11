@@ -62,7 +62,7 @@ The missing pieces are structural:
 - Additive. Do not change the current headless protocol version unless a future release needs a breaking change.
 - Redacted by default. Do not store prompt text, assistant text, tool output, secrets, API keys, tokens, or large paths unless explicitly requested for a local debug bundle.
 - Correlated. Every important operation should carry `run_id`, and where applicable `session_id`, `request_id`, `turn_id`, `api_call_id`, `tool_use_id`, and `task_id`.
-- Cheap. Metrics must not materially affect per-line latency. The target overhead is less than 1 ms per emitted event on a normal local disk, and diagnostics must remain best-effort if the writer falls behind.
+- Cheap. Metrics must not materially affect per-line latency. The hard target for the first release is less than 0.5 ms added per submitted line with diagnostics enabled versus disabled; diagnostics must remain best-effort if the writer falls behind.
 - Bounded. Retention and file sizes must be capped.
 - Inspectable. A human can read the JSONL, and the CLI/headless/MCP surfaces can summarize it without special tooling.
 - Release-useful. A consumer can attach one exported bundle to an issue and give us enough evidence to diagnose most local integration failures.
@@ -80,6 +80,8 @@ The missing pieces are structural:
 ### 1. Core Diagnostic Event Schema
 
 Add a small local recorder, for example `src/openharness/diagnostics/recorder.py`, based only on the standard library.
+
+The recorder hot path must not depend on asyncio or the default thread executor. The v0.1.17 search hang showed that executor handoff itself can be the failure point in constrained environments. Emitting a diagnostic event should therefore be a plain synchronous append to a bounded `collections.deque`, protected by a small lock. A plain daemon writer thread drains the deque to JSONL files. The recorder must never call `asyncio.to_thread()` or `loop.run_in_executor()` from the event hot path, and the daemon writer must not keep process teardown alive.
 
 Every event is a compact JSON object:
 
@@ -159,16 +161,20 @@ Default policy:
 - Never fsync every event. Flush periodically and on graceful shutdown.
 - If writing fails, disable the recorder for that process and emit one stderr warning.
 
-Settings:
+Settings follow the existing grouped-settings style:
 
 ```json
 {
-  "diagnostics_enabled": true,
-  "diagnostics_event_log_enabled": true,
-  "diagnostics_retention_days": 14,
-  "diagnostics_max_daily_mb": 25,
-  "diagnostics_include_paths": "safe",
-  "diagnostics_export_include_logs": true
+  "diagnostics": {
+    "enabled": true,
+    "event_log_enabled": true,
+    "retention_days": 14,
+    "max_daily_mb": 25,
+    "include_paths": "safe",
+    "export_include_logs": true,
+    "heartbeat_enabled": true,
+    "slow_thresholds": {}
+  }
 }
 ```
 
@@ -327,7 +333,7 @@ Path policy:
 
 | File/area | Add instrumentation |
 |---|---|
-| `src/openharness/cli.py` | process start, mode, debug setting, startup validation, doctor/diagnostics commands. |
+| `src/openharness/cli.py` | process start, mode, debug setting, startup validation, diagnostics commands. |
 | `src/openharness/ui/app.py` | headless request lifecycle, queue depth, status/list/search response latency, shutdown, interrupt, parse errors. |
 | `src/openharness/engine/query_engine.py` | turn lifecycle, cumulative usage, session memory checkpoint duration. |
 | `src/openharness/engine/query.py` | model call span, time to first token, retry/fallback/rotation counters, tool validation/permission/execution spans, compaction spans. |
@@ -367,14 +373,14 @@ oh diagnostics purge --older-than 14d
 - latest run durations and token counters.
 - event recorder health and dropped-event count.
 
-Extend `oh doctor --json` to include the current diagnostics summary, or make `doctor` point to `oh diagnostics status` for runtime evidence.
+`oh diagnostics status --json` is the canonical v1 diagnostics surface. A separate `doctor` CLI alias can be considered later, but there is no `oh doctor` command today; only the interactive slash command registry has a `/doctor` command.
 
 #### Headless JSONL
 
 Add an additive request:
 
 ```json
-{"type":"diagnostics","request_id":"diag-1","scope":"summary"}
+{"type":"diagnostics","request_id":"diag-1","correlation_id":"consumer-run-42","scope":"summary"}
 ```
 
 Response:
@@ -392,6 +398,8 @@ Response:
 
 This keeps the existing protocol version intact because it is an additive request/event pair.
 
+All headless requests may optionally carry `correlation_id`. It is echoed into diagnostics only, not used for protocol routing, so external integrators can attach their own run or job identifier without overloading `request_id`.
+
 #### MCP
 
 Add a read-only `diagnostics_status` tool mirroring the headless summary. Do not expose raw event logs over MCP in the first implementation; exports should stay explicit through the CLI.
@@ -405,7 +413,7 @@ manifest.json
 current-run.json
 events/*.jsonl
 summaries/*.json
-doctor.json
+status.json
 release-info.json
 redaction-report.json
 ```
@@ -422,7 +430,7 @@ Default stored fields:
 - Low-cardinality names: component, operation, event, status, tool name, provider label, model name, channel name.
 - Counts and durations.
 - Error type, classifier reason, status code, short redacted message preview.
-- Path policy output according to `diagnostics_include_paths`.
+- Path policy output according to `diagnostics.include_paths`.
 
 Default excluded fields:
 
@@ -441,10 +449,11 @@ Default excluded fields:
 Add a lightweight watchdog:
 
 - Track all in-flight operations with start time and correlation IDs.
-- Every five seconds emit a `diagnostics.heartbeat` summary with active operation ages.
+- Every five seconds emit a `diagnostics.heartbeat` summary with active operation ages in long-lived modes only: headless, MCP, gateway, TUI, and task-worker. Do not run the heartbeat in one-shot `-p`/print mode.
+- Run the watchdog as a daemon task/thread that cannot keep teardown alive.
 - If a headless request, model call, tool call, index operation, snapshot write, or channel operation exceeds its configured slow threshold, emit a `slow_operation` event.
 - If an operation exceeds a hard diagnostic threshold, capture a standard-library stack snapshot with `faulthandler` or `sys._current_frames()` into a redacted local file referenced by the event.
-- Add a `runtime.thread_executor_probe` at startup and in `oh diagnostics status`, because recent release work showed that executor handoff can fail in constrained environments.
+- Add a `runtime.thread_executor_probe` at startup and in `oh diagnostics status`, because recent release work showed that executor handoff can fail in constrained environments. The probe should use a bounded `wait_for(asyncio.to_thread(...), timeout=2)` when an event loop is available and record `ok`, `failed`, or `timeout` plus duration. The probe is diagnostic only; the recorder itself must not depend on the executor.
 
 Suggested default slow thresholds:
 
@@ -470,9 +479,11 @@ Suggested default slow thresholds:
   - redaction helpers.
   - recorder singleton.
   - context helpers for `run_id`, `request_id`, `turn_id`.
-  - bounded JSONL writer and daily rotation.
+  - synchronous bounded-deque append hot path.
+  - daemon-thread JSONL writer and daily rotation.
 - Add settings with conservative defaults.
 - Add unit tests for schema stability, redaction, retention, queue overflow, and disabled mode.
+- Add the bounded thread-executor probe, but keep it out of the recorder write path.
 
 ### Phase 2 - Critical Path Instrumentation
 
@@ -488,12 +499,16 @@ Instrument the release-critical local/headless path:
 
 Acceptance target: a headless smoke run emits a complete diagnostic timeline from process start to shutdown without prompt/tool-output leakage.
 
+Diagnostics for user-facing stream events such as retry, fallback, credential rotation, and compaction must be emitted at the same call sites as the stream events. Do not derive diagnostics later by reading the stream; that creates double-emission drift. Pin this with tests that force a fallback and assert both the user-facing event and diagnostic event are emitted.
+
 ### Phase 3 - Diagnostic Surfaces
 
 - Add `oh diagnostics status|tail|summary|export|purge`.
 - Add headless `diagnostics` request.
 - Add MCP `diagnostics_status`.
 - Extend release smoke checks to validate redaction and expected metrics.
+- Add the long-lived-mode watchdog and `slow_operation` events.
+- Add the cheap Phase 5 gates now: expected event types in smoke, redaction test, overflow test, and diagnostics-on/off latency budget test.
 
 ### Phase 4 - Background And Integration Surfaces
 
@@ -501,7 +516,9 @@ Acceptance target: a headless smoke run emits a complete diagnostic timeline fro
 - Add integration-specific summaries for local consumers: headless, MCP, channel, gateway, cron.
 - Add a release report template that includes diagnostics summary from the latest verification run.
 
-### Phase 5 - Release Gates
+Phase 4 should land after the WS4/WS5 performance work that rewrites persistence and per-channel dispatch paths. Instrumenting channel/gateway/cron/task files before those rewrites would double the work and increase merge risk. The rewritten subsystems should include diagnostics as part of their final shape.
+
+### Phase 5 - Full Release Gates
 
 Add release checks:
 
@@ -511,6 +528,8 @@ Add release checks:
 - Export bundle does not contain known test secrets, prompt text, tool output, or forbidden attribution strings.
 - Per-line latency budget remains within the existing performance target.
 - Recorder queue overflow test proves graceful event dropping.
+
+The full Phase 5 gate set follows Phase 4. The Phase 1-3 release carries only the cheap gate subset listed in Phase 3.
 
 ## Acceptance Criteria
 
@@ -532,8 +551,24 @@ Add release checks:
 - Tool execution test that verifies duration/error/output-size fields without output bodies.
 - Session/index tests that verify snapshot/index duration metrics and error isolation.
 - Recovery tests that verify retry/fallback/credential rotation metrics.
+- Forced-fallback double-emission test that verifies the user-facing stream event and diagnostic event are emitted from the same call site.
 - Diagnostic export test with seeded fake secrets and fake prompt/tool content.
-- Performance test extending `scripts/measure_per_line.py` to compare diagnostics enabled vs disabled.
+- Performance test extending `scripts/measure_per_line.py` to compare diagnostics enabled vs disabled, with a hard budget of less than 0.5 ms added per submitted line.
+
+## Acceptance Traceability
+
+| Acceptance criterion | Named test |
+|---|---|
+| 1. Correlated headless timeline | `test_diagnostics_headless_timeline` |
+| 2. Usage parity | `test_diagnostics_usage_matches_line_complete` |
+| 3. Retry/fallback/rotation metrics | `test_diagnostics_forced_fallback_double_emission` |
+| 4. Permission denial metrics | `test_diagnostics_permission_denial_redacted` |
+| 5. Conversation search metrics | `test_diagnostics_session_search_metrics` |
+| 6. Export bundle structure | `test_diagnostics_export_bundle_manifest` |
+| 7. Export bundle redaction | `test_diagnostics_export_redacts_seeded_secrets` |
+| 8. Disabled mode | `test_diagnostics_disabled_mode_no_writes` |
+| 9. Queue overflow behavior | `test_diagnostics_overflow_drops_low_priority_events` |
+| 10. Status schema | `test_diagnostics_status_json_schema` |
 
 ## Risks And Mitigations
 
@@ -546,13 +581,13 @@ Add release checks:
 | Users expect production observability integrations | Document local-only scope; optional external sinks can be a later proposal. |
 | Multi-tenancy needs different dimensions | Keep `tenant_id` out of v1; reserve schema field for future multi-tenancy design. |
 
-## Open Questions
+## Current Recommendations For Open Questions
 
-1. Should exact local paths be allowed by default for owner-only debug bundles, or should `safe` remain the default for all users?
-2. Should diagnostic event logging be enabled by default for all modes, or only for headless/MCP/print in the first release?
-3. What retention default is acceptable for consumer environments: 7, 14, or 30 days?
-4. Should consumers be allowed to pass an external `integration_id` or `correlation_id` in headless requests, separate from `request_id`?
-5. Should stack snapshots be included in normal exports, or only when `--include-stacks` is specified?
+1. Use `safe` path handling by default for every user. Exact paths require an explicit local debug opt-in.
+2. Enable metadata-only diagnostics by default in the first release for headless, MCP, print, TUI, and task-worker modes. Heartbeats run only in long-lived modes, never in print one-shots.
+3. Keep 14 days as the default retention period.
+4. Allow optional external `correlation_id` on headless requests, separate from `request_id`, and store it only in diagnostics.
+5. Capture redacted stack snapshots on hard thresholds, store them as referenced local files, and include them in exports only when explicitly requested with an include-stacks option.
 
 ## Recommended Initial Scope
 
