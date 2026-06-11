@@ -17,6 +17,7 @@ class HeadlessRequest(BaseModel):
         "continue",
         "list_sessions",
         "search_sessions",
+        "skill_loop_status",
         "status",
         "interrupt",
         "shutdown",

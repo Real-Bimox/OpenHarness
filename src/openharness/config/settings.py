@@ -57,6 +57,27 @@ class PermissionSettings(BaseModel):
     denied_commands: list[str] = Field(default_factory=list)
 
 
+class SkillSettings(BaseModel):
+    """Skill learning-loop configuration (see docs/proposals/skill-learning-loop.md)."""
+
+    # Post-turn background self-review that may create/improve skills.
+    review_enabled: bool = True
+    # Run the review at most once per this many user turns; 0 disables it.
+    review_interval_turns: int = 10
+    # Model for the review fork; empty = the session model.
+    review_model: str = ""
+    # Stage skill writes for human approval instead of applying immediately.
+    write_approval: bool = False
+    # Scan skill writes for secrets/injection and block on a hit (default on).
+    guard_writes: bool = True
+    # Weekly LLM consolidation of agent-created skills into umbrellas.
+    curator_enabled: bool = True
+    curator_interval_hours: float = 168.0
+    curator_model: str = ""
+    stale_after_days: float = 30.0
+    archive_after_days: float = 90.0
+
+
 class MemorySettings(BaseModel):
     """Memory system configuration."""
 
@@ -590,6 +611,7 @@ class Settings(BaseModel):
     permission: PermissionSettings = Field(default_factory=PermissionSettings)
     hooks: dict[str, list[HookDefinition]] = Field(default_factory=dict)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    skills: SkillSettings = Field(default_factory=SkillSettings)
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     enabled_plugins: dict[str, bool] = Field(default_factory=dict)

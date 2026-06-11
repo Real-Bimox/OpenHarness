@@ -754,6 +754,37 @@ async def run_headless_control(
         sessions = list_session_snapshots(_session_lookup_cwd(), limit=20)
         await _emit({"type": "sessions", "sessions": sessions}, request_id=request_id)
 
+    async def _emit_skill_loop_status(request_id: str | None) -> None:
+        """Report skill telemetry, pending writes, and last curator run."""
+
+        def _run() -> dict[str, Any]:
+            from openharness.services.skill_approval import list_pending
+            from openharness.services.skill_curator import load_state
+            from openharness.skills.usage import load_records
+
+            records = load_records()
+            return {
+                "skills": {
+                    name: {
+                        "state": rec.get("state", "active"),
+                        "use_count": rec.get("use_count", 0),
+                        "patch_count": rec.get("patch_count", 0),
+                        "pinned": bool(rec.get("pinned")),
+                        "agent_created": rec.get("created_by") == "agent",
+                    }
+                    for name, rec in records.items()
+                },
+                "pending_writes": len(list_pending()),
+                "curator": load_state().get("last_report", {}),
+            }
+
+        try:
+            payload = await asyncio.to_thread(_run)
+        except Exception as exc:
+            await _error(f"skill_loop_status failed: {exc}", request_id=request_id)
+            return
+        await _emit({"type": "skill_loop_status", **payload}, request_id=request_id)
+
     async def _emit_session_search(request: HeadlessRequest) -> None:
         """Answer a search_sessions request from the derived index (read-only)."""
         from openharness.services.conversation_index import get_conversation_index
@@ -918,6 +949,9 @@ async def run_headless_control(
                     continue
                 if request.type == "search_sessions":
                     await _emit_session_search(request)
+                    continue
+                if request.type == "skill_loop_status":
+                    await _emit_skill_loop_status(request.correlation_id)
                     continue
                 if request.type == "status":
                     await _emit_status(request.correlation_id)

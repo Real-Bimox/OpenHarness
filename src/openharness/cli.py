@@ -838,6 +838,7 @@ provider_app = typer.Typer(name="provider", help="Manage provider profiles")
 config_app = typer.Typer(name="config", help="Show or update settings")
 cron_app = typer.Typer(name="cron", help="Manage cron scheduler and jobs")
 sessions_app = typer.Typer(name="sessions", help="List, search, and reindex saved conversations")
+skills_cli_app = typer.Typer(name="skills", help="Inspect skill usage, pins, pending writes, and the curator")
 autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
 
 app.add_typer(mcp_app)
@@ -848,6 +849,114 @@ app.add_typer(config_app)
 app.add_typer(cron_app)
 app.add_typer(autopilot_app)
 app.add_typer(sessions_app)
+app.add_typer(skills_cli_app)
+
+
+@skills_cli_app.command("usage")
+def skills_usage() -> None:
+    """Show recorded skill usage and lifecycle state."""
+    from openharness.skills.usage import load_records
+
+    records = load_records()
+    if not records:
+        print("No skill usage recorded yet.")
+        return
+    for name in sorted(records):
+        r = records[name]
+        flags = []
+        if r.get("pinned"):
+            flags.append("pinned")
+        if r.get("created_by") == "agent":
+            flags.append("agent-created")
+        suffix = f" [{', '.join(flags)}]" if flags else ""
+        print(f"{name}: state={r.get('state','active')} uses={r.get('use_count',0)} patches={r.get('patch_count',0)}{suffix}")
+
+
+@skills_cli_app.command("pin")
+def skills_pin(name: str = typer.Argument(...)) -> None:
+    """Pin a skill so the curator cannot archive or delete it."""
+    from openharness.skills.usage import set_pinned
+
+    set_pinned(name, True)
+    print(f"Pinned {name}.")
+
+
+@skills_cli_app.command("unpin")
+def skills_unpin(name: str = typer.Argument(...)) -> None:
+    """Remove a skill's pin."""
+    from openharness.skills.usage import set_pinned
+
+    set_pinned(name, False)
+    print(f"Unpinned {name}.")
+
+
+@skills_cli_app.command("pending")
+def skills_pending() -> None:
+    """List staged skill writes awaiting approval."""
+    from openharness.services.skill_approval import list_pending
+
+    pending = list_pending()
+    if not pending:
+        print("No pending skill writes.")
+        return
+    for record in pending:
+        args = record.get("arguments", {})
+        print(f"{record['id']}: {args.get('action')} {args.get('name')} (origin={record.get('origin')})")
+
+
+@skills_cli_app.command("diff")
+def skills_diff(pending_id: str = typer.Argument(...)) -> None:
+    """Show the unified diff a pending skill write would apply."""
+    from openharness.services.skill_approval import pending_diff
+
+    diff = pending_diff(pending_id)
+    if diff is None:
+        print(f"No pending write with id {pending_id}.", file=sys.stderr)
+        raise typer.Exit(1)
+    print(diff or "(no textual change)")
+
+
+@skills_cli_app.command("approve")
+def skills_approve(pending_id: str = typer.Argument(...)) -> None:
+    """Apply a staged skill write."""
+    import asyncio as _asyncio
+
+    from openharness.services.skill_approval import apply_pending
+
+    result = _asyncio.run(apply_pending(pending_id))
+    if not result.get("success"):
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        raise typer.Exit(1)
+    print(f"Applied {pending_id}.")
+
+
+@skills_cli_app.command("discard")
+def skills_discard(pending_id: str = typer.Argument(...)) -> None:
+    """Discard a staged skill write."""
+    from openharness.services.skill_approval import discard_pending
+
+    if discard_pending(pending_id):
+        print(f"Discarded {pending_id}.")
+    else:
+        print(f"No pending write with id {pending_id}.", file=sys.stderr)
+        raise typer.Exit(1)
+
+
+@skills_cli_app.command("curator")
+def skills_curator(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Run lifecycle + report without the LLM pass"),
+) -> None:
+    """Run the skill curator (lifecycle pass, plus LLM consolidation unless --dry-run)."""
+    import asyncio as _asyncio
+
+    from openharness.services.skill_curator import run_curator
+
+    report = _asyncio.run(run_curator(dry_run=dry_run))
+    print(f"staled: {report['staled']}")
+    print(f"archived: {report['archived']}")
+    print(f"consolidation: {report['consolidation']}")
+    if report.get("summary"):
+        print(f"\n{report['summary']}")
 
 
 @sessions_app.command("list")

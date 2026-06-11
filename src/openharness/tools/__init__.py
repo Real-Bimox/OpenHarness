@@ -71,6 +71,7 @@ _CORE_TOOL_SPECS: tuple[_ToolSpec, ...] = (
     _ToolSpec("openharness.tools.skill_tool", "SkillTool", "skill", "Load an OpenHarness skill."),
     _ToolSpec("openharness.tools.tool_search_tool", "ToolSearchTool", "tool_search", "Search the available tool list by name or description."),
     _ToolSpec("openharness.tools.session_search_tool", "SessionSearchTool", "session_search", "Search past conversations (full-text, zero LLM cost)."),
+    _ToolSpec("openharness.tools.skill_manage_tool", "SkillManageTool", "skill_manage", "Create, improve, or retire user skills."),
     _ToolSpec("openharness.tools.config_tool", "ConfigTool", "config", "Read or update OpenHarness configuration."),
     _ToolSpec("openharness.tools.brief_tool", "BriefTool", "brief", "Condense text to a requested length."),
     _ToolSpec("openharness.tools.sleep_tool", "SleepTool", "sleep", "Wait for a number of seconds."),

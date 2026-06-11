@@ -143,6 +143,7 @@ class RuntimeBundle:
     autodream_context: dict[str, object] | None = None
     _settings_cache: tuple[tuple, Any] | None = field(default=None, repr=False)
     _hook_registry_cache: tuple[tuple, Any] | None = field(default=None, repr=False)
+    _turns_since_skill_review: int = field(default=0, repr=False)
 
     def _settings_fingerprint(self) -> tuple:
         """Cheap identity of the on-disk settings source plus profile env."""
@@ -859,10 +860,34 @@ async def handle_line(
             await print_system(pending)
         await save_runtime_snapshot(bundle, system_prompt=system_prompt, model=settings.model)
         sync_app_state(bundle)
+        _maybe_schedule_skill_review(bundle, print_system)
         return True
     await save_runtime_snapshot(bundle, system_prompt=system_prompt, model=settings.model)
     sync_app_state(bundle)
+    _maybe_schedule_skill_review(bundle, print_system)
     return True
+
+
+def _maybe_schedule_skill_review(bundle: RuntimeBundle, print_system: SystemPrinter) -> None:
+    """Count a completed user turn and fire a background skill review when due."""
+    if bundle.external_api_client:
+        return
+    try:
+        from openharness.services import skill_review
+
+        bundle._turns_since_skill_review += 1
+        if skill_review.should_review(bundle, turns_since_review=bundle._turns_since_skill_review):
+            bundle._turns_since_skill_review = 0
+
+            def _on_summary(message: str) -> None:
+                try:
+                    asyncio.get_running_loop().create_task(print_system(message))
+                except RuntimeError:
+                    pass
+
+            skill_review.schedule_review(bundle, on_summary=_on_summary)
+    except Exception:
+        pass
 
 
 async def _render_command_result(
