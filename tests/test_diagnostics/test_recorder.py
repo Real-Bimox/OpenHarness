@@ -144,7 +144,7 @@ def test_span_records_duration_and_failure(tmp_path: Path):
         with recorder.span("index", "search"):
             raise ValueError("boom")
     recorder.flush()
-    lines = [json.loads(l) for l in (tmp_path / "events" / time.strftime("%Y-%m-%d")).with_suffix(".jsonl").read_text().splitlines()]
+    lines = [json.loads(line) for line in (tmp_path / "events" / time.strftime("%Y-%m-%d")).with_suffix(".jsonl").read_text().splitlines()]
     completed = [e for e in lines if e["event"] == "completed"]
     failed = [e for e in lines if e["event"] == "failed"]
     assert completed[0]["attrs"]["hits"] == 3
