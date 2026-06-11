@@ -57,6 +57,16 @@ class PermissionSettings(BaseModel):
     denied_commands: list[str] = Field(default_factory=list)
 
 
+class FallbackProvider(BaseModel):
+    """One entry in the provider fallback chain (see docs/proposals/error-recovery.md)."""
+
+    provider: str
+    model: str
+    base_url: str | None = None
+    api_format: str | None = None
+    api_key_env: str | None = None
+
+
 class SkillSettings(BaseModel):
     """Skill learning-loop configuration (see docs/proposals/skill-learning-loop.md)."""
 
@@ -612,6 +622,12 @@ class Settings(BaseModel):
     hooks: dict[str, list[HookDefinition]] = Field(default_factory=dict)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     skills: SkillSettings = Field(default_factory=SkillSettings)
+    # Provider fallback chain tried in order when the primary fails.
+    fallback_providers: list[FallbackProvider] = Field(default_factory=list)
+    # Multiple API keys per provider for rotation on rate-limit/auth/billing.
+    credential_pools: dict[str, list[str]] = Field(default_factory=dict)
+    # Per-request retry attempts before fallback/rotation escalation.
+    api_max_retries: int = 3
     sandbox: SandboxSettings = Field(default_factory=SandboxSettings)
     web: WebSettings = Field(default_factory=WebSettings)
     enabled_plugins: dict[str, bool] = Field(default_factory=dict)

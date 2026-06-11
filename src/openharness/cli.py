@@ -839,6 +839,7 @@ config_app = typer.Typer(name="config", help="Show or update settings")
 cron_app = typer.Typer(name="cron", help="Manage cron scheduler and jobs")
 sessions_app = typer.Typer(name="sessions", help="List, search, and reindex saved conversations")
 skills_cli_app = typer.Typer(name="skills", help="Inspect skill usage, pins, pending writes, and the curator")
+fallback_app = typer.Typer(name="fallback", help="Manage the provider fallback chain")
 autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
 
 app.add_typer(mcp_app)
@@ -850,6 +851,71 @@ app.add_typer(cron_app)
 app.add_typer(autopilot_app)
 app.add_typer(sessions_app)
 app.add_typer(skills_cli_app)
+app.add_typer(fallback_app)
+
+
+@fallback_app.command("list")
+def fallback_list() -> None:
+    """Show the configured provider fallback chain."""
+    from openharness.config.settings import load_settings
+
+    chain = load_settings().fallback_providers
+    if not chain:
+        print("No fallback providers configured.")
+        return
+    for i, entry in enumerate(chain, 1):
+        suffix = f" @ {entry.base_url}" if entry.base_url else ""
+        print(f"  {i}. {entry.provider}:{entry.model}{suffix}")
+
+
+@fallback_app.command("add")
+def fallback_add(
+    provider: str = typer.Argument(..., help="Provider id, e.g. 'openai' or 'anthropic'"),
+    model: str = typer.Argument(..., help="Model id to use on this provider"),
+    base_url: str = typer.Option(None, "--base-url"),
+    api_format: str = typer.Option(None, "--api-format"),
+    api_key_env: str = typer.Option(None, "--api-key-env", help="Env var holding this provider's key"),
+) -> None:
+    """Append a provider to the fallback chain (does not change the active provider)."""
+    from openharness.config.settings import FallbackProvider, load_settings, save_settings
+
+    settings = load_settings()
+    for entry in settings.fallback_providers:
+        if entry.provider == provider and entry.model == model and entry.base_url == base_url:
+            print("That fallback entry already exists.", file=sys.stderr)
+            raise typer.Exit(1)
+    settings.fallback_providers.append(
+        FallbackProvider(
+            provider=provider, model=model, base_url=base_url, api_format=api_format, api_key_env=api_key_env
+        )
+    )
+    save_settings(settings)
+    print(f"Added fallback {provider}:{model}.")
+
+
+@fallback_app.command("remove")
+def fallback_remove(index: int = typer.Argument(..., help="1-based index from `oh fallback list`")) -> None:
+    """Remove a fallback chain entry by index."""
+    from openharness.config.settings import load_settings, save_settings
+
+    settings = load_settings()
+    if index < 1 or index > len(settings.fallback_providers):
+        print(f"No fallback entry at index {index}.", file=sys.stderr)
+        raise typer.Exit(1)
+    removed = settings.fallback_providers.pop(index - 1)
+    save_settings(settings)
+    print(f"Removed {removed.provider}:{removed.model}.")
+
+
+@fallback_app.command("clear")
+def fallback_clear() -> None:
+    """Remove all fallback chain entries."""
+    from openharness.config.settings import load_settings, save_settings
+
+    settings = load_settings()
+    settings.fallback_providers = []
+    save_settings(settings)
+    print("Fallback chain cleared.")
 
 
 @skills_cli_app.command("usage")

@@ -239,7 +239,59 @@ class RuntimeBundle:
 
 
 def _resolve_api_client_from_settings(settings) -> SupportsStreamingMessages:
-    """Build the appropriate API client for the resolved settings."""
+    """Build the API client, wrapping it for resilience when configured.
+
+    A plain client is returned unless a fallback chain or credential pool is
+    set, so the common path has zero overhead.
+    """
+    base = _build_base_client(settings)
+    materialized = settings.materialize_active_profile()
+    fallbacks = list(getattr(materialized, "fallback_providers", []) or [])
+    from openharness.api.credentials import build_credential_pools
+
+    pools = build_credential_pools(materialized)
+    pool = pools.get(materialized.provider)
+    if not fallbacks and pool is None:
+        return base
+
+    from openharness.api.resilient_client import FallbackTarget, ResilientApiClient
+
+    def _rebuild_primary(api_key: str) -> SupportsStreamingMessages:
+        return _build_base_client(materialized.model_copy(update={"api_key": api_key}))
+
+    targets: list[FallbackTarget] = []
+    for entry in fallbacks:
+        update = {
+            "active_profile": None,
+            "provider": entry.provider,
+            "model": entry.model,
+            "base_url": entry.base_url,
+            "api_format": entry.api_format or materialized.api_format,
+        }
+        if entry.api_key_env:
+            import os
+
+            update["api_key"] = os.environ.get(entry.api_key_env, "")
+        target_settings = materialized.model_copy(update={k: v for k, v in update.items() if v is not None})
+        targets.append(
+            FallbackTarget(
+                provider=entry.provider,
+                model=entry.model,
+                factory=lambda s=target_settings: _build_base_client(s),
+            )
+        )
+    return ResilientApiClient(
+        base,
+        primary_model=materialized.model,
+        rebuild_primary=_rebuild_primary if pool is not None else None,
+        credential_pool=pool,
+        fallbacks=targets,
+        max_retries=getattr(materialized, "api_max_retries", 3),
+    )
+
+
+def _build_base_client(settings) -> SupportsStreamingMessages:
+    """Build the concrete provider client for the resolved settings."""
     # Ensure profile fields (base_url, model, api_format) are projected to settings
     settings = settings.materialize_active_profile()
 
