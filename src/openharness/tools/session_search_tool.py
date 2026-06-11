@@ -65,8 +65,6 @@ class SessionSearchTool(BaseTool):
         return True
 
     async def execute(self, arguments: SessionSearchInput, context: ToolExecutionContext) -> ToolResult:
-        import asyncio
-
         from openharness.config import load_settings
         from openharness.services.conversation_index import get_conversation_index
 
@@ -115,26 +113,11 @@ class SessionSearchTool(BaseTool):
             )
             return {"mode": "discover", "query": arguments.query, **search}
 
-        from openharness.services.conversation_index import (
-            INDEX_OPERATION_TIMEOUT_SECONDS,
-            dump_worker_stacks,
-        )
-
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_run), timeout=INDEX_OPERATION_TIMEOUT_SECONDS
-            )
-        except asyncio.TimeoutError:
+            result = _run()
+        except Exception as exc:
             return ToolResult(
-                output=json.dumps(
-                    {
-                        "success": False,
-                        "error": (
-                            f"session_search timed out after {INDEX_OPERATION_TIMEOUT_SECONDS:.0f}s;"
-                            " worker stacks: " + dump_worker_stacks()[:1500]
-                        ),
-                    }
-                ),
+                output=json.dumps({"success": False, "error": f"session_search failed: {exc}"}),
                 is_error=True,
             )
         if "error" in result:

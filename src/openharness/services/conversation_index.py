@@ -614,31 +614,6 @@ def flush_index_queue() -> None:
 
 INDEX_DISABLED_MESSAGE = "Conversation indexing is disabled (conversation_index_enabled=false)."
 
-# Hard bound for any caller-facing index operation. A search is milliseconds;
-# if the database layer ever blocks (e.g. file locking on an exotic
-# filesystem), surfaces must answer with a diagnosable error, never hang.
-INDEX_OPERATION_TIMEOUT_SECONDS = 20.0
-
-
-def dump_worker_stacks() -> str:
-    """Render stack traces of non-main threads for timeout diagnostics."""
-    import sys
-    import threading
-    import traceback
-
-    frames = sys._current_frames()
-    lines: list[str] = []
-    for thread in threading.enumerate():
-        if thread is threading.main_thread() or thread.ident is None:
-            continue
-        frame = frames.get(thread.ident)
-        if frame is None:
-            continue
-        stack = "".join(traceback.format_stack(frame, limit=8))
-        lines.append(f"--- thread {thread.name} ---\n{stack}")
-    return "\n".join(lines)[:4000]
-
-
 def index_enabled() -> bool:
     """Single gate consulted by every surface (tool, CLI, headless, MCP)."""
     try:
