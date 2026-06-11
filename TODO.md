@@ -3,7 +3,8 @@
 ## Health Status HTTP Server
 
 - [ ] Open a PR from `proposal/health-status-http-server` to `main` in `Real-Bimox/OpenHarness`.
-- [ ] Review commit `14ea306` on the PR, focusing on `src/openharness/api/health_server.py`, `src/openharness/cli.py`, and the optional `health-server` dependency extra.
+- [ ] Confirm the local branch tip matches `origin/proposal/health-status-http-server`.
+- [ ] Review implementation commit `14ea306` on the PR, focusing on `src/openharness/api/health_server.py`, `src/openharness/cli.py`, and the optional `health-server` dependency extra.
 - [ ] On the review workstation, install the optional test dependencies with `python -m pip install -e ".[dev,health-server]"`.
 - [ ] Run `ruff check .`.
 - [ ] Run `git diff --check`.

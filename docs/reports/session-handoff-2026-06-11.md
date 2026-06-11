@@ -5,7 +5,8 @@
 - Repository: `Real-Bimox/OpenHarness`
 - Branch: `proposal/health-status-http-server`
 - Remote tracking branch: `origin/proposal/health-status-http-server`
-- Current commit: `14ea306 Implement optional health status HTTP server`
+- Implementation commit: `14ea306 Implement optional health status HTTP server`
+- Handoff commit: `9da9ba9 Add health server session handoff`
 - Base commit: `acfdbe1 Finalize observability release readiness fixes`
 - `main` is unchanged at `acfdbe1` locally and on `origin/main`.
 
@@ -85,7 +86,7 @@ git rev-parse --short HEAD
 git rev-parse --short origin/proposal/health-status-http-server
 ```
 
-Expected commit for both local and remote branch tips: `14ea306`.
+Expected result: local `HEAD` and `origin/proposal/health-status-http-server` resolve to the same commit.
 
 3. Install review/test dependencies in the workstation venv:
 
