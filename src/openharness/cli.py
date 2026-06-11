@@ -2832,6 +2832,11 @@ def main(
         return
 
     if print_mode is not None:
+        from openharness.diagnostics import record as _diag_record
+        from openharness.diagnostics.runinfo import write_current_run
+
+        write_current_run("print")
+        _diag_record("startup", "runtime_start", "snapshot", attrs={"mode": "print", "version": __version__})
         prompt = print_mode.strip()
         if not prompt:
             print("Error: -p/--print requires a prompt value, e.g. -p 'your prompt'", file=sys.stderr)

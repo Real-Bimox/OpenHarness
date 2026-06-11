@@ -158,6 +158,16 @@ def save_session_snapshot(
     _update_session_index(session_dir, _session_index_entry(payload, session_path))
     _update_conversation_index(payload)
 
+    from openharness.diagnostics import record
+
+    record(
+        "storage",
+        "snapshot_save",
+        "completed",
+        duration_ms=(time.time() - now) * 1000.0,
+        session_id=sid,
+        attrs={"app": "openharness", "size_bytes": len(data), "message_count": len(messages)},
+    )
     return latest_path
 
 

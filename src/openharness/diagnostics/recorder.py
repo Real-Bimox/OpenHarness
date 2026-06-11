@@ -212,9 +212,11 @@ class Recorder:
     def _write_batch(self, batch: list[dict[str, Any]]) -> None:
         today = time.strftime("%Y-%m-%d")
         path = self.events_dir / f"{today}.jsonl"
+        # Recreate per batch: the parent can vanish under us (temp dirs,
+        # purges); one mkdir per flush is negligible and keeps us alive.
+        self.events_dir.mkdir(parents=True, exist_ok=True)
         if today != self._current_date:
             self._current_date = today
-            self.events_dir.mkdir(parents=True, exist_ok=True)
             self._current_size = path.stat().st_size if path.exists() else 0
         if self._current_size >= self.max_daily_bytes:
             with self._lock:

@@ -180,6 +180,9 @@ class ConversationIndex:
         except sqlite3.DatabaseError as exc:
             # Derived cache: recovery is delete-and-recreate, never surgery.
             log.warning("conversation index unreadable (%s); rebuilding file", exc)
+            from openharness.diagnostics import record
+
+            record("index", "rebuild", "completed", level="warning", attrs={"reason": "corrupt"})
             try:
                 self.db_path.unlink(missing_ok=True)
                 for suffix in ("-wal", "-shm"):
@@ -224,6 +227,9 @@ class ConversationIndex:
             return True
         except sqlite3.OperationalError:
             log.warning("SQLite FTS5 (trigram) unavailable; conversation search degrades to LIKE")
+            from openharness.diagnostics import record
+
+            record("index", "fts_probe", "failed", level="warning", attrs={"reason": "fts5_unavailable"})
             return False
 
     def close(self) -> None:
@@ -250,7 +256,9 @@ class ConversationIndex:
                     if attempt < _WRITE_RETRIES - 1 and any(
                         marker in str(exc).lower() for marker in _BUSY_MARKERS
                     ):
-                        pass
+                        from openharness.diagnostics import record
+
+                        record("index", "write", "retry", level="debug", attrs={"reason": "busy"})
                     else:
                         raise
             time.sleep(random.uniform(0.02, 0.15))
@@ -316,7 +324,18 @@ class ConversationIndex:
                 ),
             )
 
+        update_start = time.monotonic()
         self._write(_apply)
+        from openharness.diagnostics import record
+
+        record(
+            "index",
+            "index_update",
+            "completed",
+            level="debug",
+            duration_ms=(time.monotonic() - update_start) * 1000.0,
+            session_id=session_id,
+        )
 
     def rebuild(self) -> int:
         """Drop everything and reindex every snapshot on disk."""
@@ -359,6 +378,42 @@ class ConversationIndex:
         exclude_session: str | None = None,
     ) -> dict[str, Any]:
         """Discovery search. Returns {"hits": [...]} or {"error": "..."}."""
+        start = time.monotonic()
+        result = self._search_impl(
+            raw_query,
+            project=project,
+            limit=limit,
+            sort=sort,
+            role_filter=role_filter,
+            exclude_session=exclude_session,
+        )
+        from openharness.diagnostics import record
+
+        record(
+            "index",
+            "index_search",
+            "failed" if "error" in result else "completed",
+            status="error" if "error" in result else "ok",
+            duration_ms=(time.monotonic() - start) * 1000.0,
+            attrs={
+                "operation_kind": "discover",
+                "fts_enabled": self.fts_enabled,
+                "hits": len(result.get("hits", [])),
+                "reason": str(result.get("error", ""))[:80] or None,
+            },
+        )
+        return result
+
+    def _search_impl(
+        self,
+        raw_query: str,
+        *,
+        project: str | None = None,
+        limit: int = 3,
+        sort: str | None = None,
+        role_filter: list[str] | None = None,
+        exclude_session: str | None = None,
+    ) -> dict[str, Any]:
         assert self._conn is not None
         limit = max(1, min(int(limit), 10))
         roles = [r.strip() for r in (role_filter or ["user", "assistant"]) if r.strip()]

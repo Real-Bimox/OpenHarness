@@ -514,6 +514,20 @@ def _record_tool_carryover(
         _remember_work_log(context.tool_metadata, entry="Exited plan mode")
 
 
+def _record_permission_denied(tool_name: str, reason: str, tool_use_id: str) -> None:
+    from openharness.diagnostics import record
+
+    record(
+        "permission",
+        "tool_permission",
+        "denied",
+        level="warning",
+        status="denied",
+        tool_use_id=tool_use_id,
+        attrs={"tool_name": tool_name, "reason": reason},
+    )
+
+
 def _tool_artifact_dir() -> Path:
     artifact_dir = get_data_dir() / "tool_artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -703,7 +717,24 @@ async def run_query(
                     await getter
         while not progress_queue.empty():
             yield progress_queue.get_nowait(), None
+        before_count = len(messages)
+        compact_start = time.monotonic()
         last_compaction_result = await task
+        compacted_messages, was_compacted = last_compaction_result
+        if was_compacted:
+            from openharness.diagnostics import record as _diag_record
+
+            _diag_record(
+                "memory",
+                "compact",
+                "completed",
+                duration_ms=(time.monotonic() - compact_start) * 1000.0,
+                attrs={"reason": trigger},
+                counters={
+                    "before_message_count": before_count,
+                    "after_message_count": len(compacted_messages),
+                },
+            )
         return
 
     turn_count = 0
@@ -734,22 +765,42 @@ async def run_query(
         final_message: ConversationMessage | None = None
         usage = UsageSnapshot()
 
+        from openharness.diagnostics import build_error, record
+
+        api_request = ApiMessageRequest(
+            model=context.model,
+            messages=messages,
+            system_prompt=context.system_prompt,
+            system_cache_stable_chars=context.system_prompt_stable_chars,
+            max_tokens=effective_max_tokens,
+            tools=context.tool_registry.to_api_schema(),
+            effort=context.effort,
+        )
+        api_call_start = time.monotonic()
+        first_token_ms: float | None = None
+        api_attrs = {
+            "model": context.model,
+            "request_message_count": len(messages),
+            "tool_schema_count": len(api_request.tools),
+            "max_tokens_effective": effective_max_tokens,
+        }
         try:
-            async for event in context.api_client.stream_message(
-                ApiMessageRequest(
-                    model=context.model,
-                    messages=messages,
-                    system_prompt=context.system_prompt,
-                    system_cache_stable_chars=context.system_prompt_stable_chars,
-                    max_tokens=effective_max_tokens,
-                    tools=context.tool_registry.to_api_schema(),
-                    effort=context.effort,
-                )
-            ):
+            async for event in context.api_client.stream_message(api_request):
                 if isinstance(event, ApiTextDeltaEvent):
+                    if first_token_ms is None:
+                        first_token_ms = (time.monotonic() - api_call_start) * 1000.0
                     yield AssistantTextDelta(text=event.text), None
                     continue
                 if isinstance(event, ApiRetryEvent):
+                    # Diagnostics are emitted at the same call site as the
+                    # user-facing stream event so the two can never drift.
+                    record(
+                        "api",
+                        "model_call",
+                        "retry",
+                        level="warning",
+                        attrs={"model": context.model, "reason": event.message[:80]},
+                    )
                     yield StatusEvent(
                         message=(
                             f"Request failed; retrying in {event.delay_seconds:.1f}s "
@@ -758,6 +809,17 @@ async def run_query(
                     ), None
                     continue
                 if isinstance(event, ProviderFallbackEvent):
+                    record(
+                        "api",
+                        "model_call",
+                        "fallback",
+                        level="warning",
+                        attrs={
+                            "reason": event.reason,
+                            "from_model": event.from_model,
+                            "to_model": event.to_model,
+                        },
+                    )
                     yield StatusEvent(
                         message=(
                             f"Switching to fallback provider {event.to_provider} "
@@ -766,6 +828,13 @@ async def run_query(
                     ), None
                     continue
                 if isinstance(event, CredentialRotatedEvent):
+                    record(
+                        "api",
+                        "model_call",
+                        "retry",
+                        level="warning",
+                        attrs={"provider": event.provider, "reason": event.reason},
+                    )
                     yield StatusEvent(
                         message=f"Rotated {event.provider} credential after {event.reason}."
                     ), None
@@ -774,7 +843,31 @@ async def run_query(
                 if isinstance(event, ApiMessageCompleteEvent):
                     final_message = event.message
                     usage = event.usage
+            record(
+                "api",
+                "model_call",
+                "completed",
+                duration_ms=(time.monotonic() - api_call_start) * 1000.0,
+                attrs=api_attrs,
+                counters={
+                    "time_to_first_token_ms": round(first_token_ms, 2) if first_token_ms else 0,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                },
+            )
         except Exception as exc:
+            record(
+                "api",
+                "model_call",
+                "failed",
+                level="error",
+                status="error",
+                duration_ms=(time.monotonic() - api_call_start) * 1000.0,
+                attrs=api_attrs,
+                error=build_error(exc, status_code=getattr(exc, "status_code", None)),
+            )
             error_msg = str(exc)
             if _is_completion_token_limit_error(exc):
                 supported_limit = _extract_completion_token_limit(exc)
@@ -976,6 +1069,7 @@ async def _execute_tool_call(
             confirmed = await context.permission_prompt(tool_name, decision.reason)
             if not confirmed:
                 log.debug("permission denied by user for %s", tool_name)
+                _record_permission_denied(tool_name, "user_denied", tool_use_id)
                 return ToolResultBlock(
                     tool_use_id=tool_use_id,
                     content=decision.reason or f"Permission denied for {tool_name}",
@@ -983,6 +1077,7 @@ async def _execute_tool_call(
                 )
         else:
             log.debug("permission blocked for %s: %s", tool_name, decision.reason)
+            _record_permission_denied(tool_name, "policy_blocked", tool_use_id)
             return ToolResultBlock(
                 tool_use_id=tool_use_id,
                 content=decision.reason or f"Permission denied for {tool_name}",
@@ -1006,6 +1101,20 @@ async def _execute_tool_call(
     elapsed = time.monotonic() - t0
     log.debug("executed %s in %.2fs err=%s output_len=%d",
               tool_name, elapsed, result.is_error, len(result.output or ""))
+    from openharness.diagnostics import record as _diag_record
+
+    _diag_record(
+        "tool",
+        "tool_execute",
+        "failed" if result.is_error else "completed",
+        status="error" if result.is_error else "ok",
+        duration_ms=elapsed * 1000.0,
+        tool_use_id=tool_use_id,
+        attrs={
+            "tool_name": tool_name,
+            "output_chars": len(result.output or ""),
+        },
+    )
     # Artifact offload writes multi-MB outputs to disk; keep it off the event
     # loop so concurrently gathered sibling tools and streaming are not stalled.
     inline_output, artifact_path = await asyncio.to_thread(

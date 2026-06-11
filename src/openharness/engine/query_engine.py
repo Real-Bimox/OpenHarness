@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -62,6 +63,7 @@ class QueryEngine:
         self._extract_task: asyncio.Task[None] | None = None
         self._extract_last_message_count = 0
         self._system_prompt_stable_chars: int | None = None
+        self._turn_counter = 0
 
     @property
     def messages(self) -> list[ConversationMessage]:
@@ -304,6 +306,17 @@ class QueryEngine:
         coordinator_context = self._build_coordinator_context_message()
         if coordinator_context is not None:
             query_messages.append(coordinator_context)
+
+        from openharness.diagnostics import context as diag_context
+        from openharness.diagnostics import record
+
+        self._turn_counter += 1
+        turn_token = diag_context.turn_id_var.set(diag_context.new_turn_id(self._turn_counter))
+        session_token = diag_context.session_id_var.set(
+            str(self._tool_metadata.get("session_id") or "") or None
+        )
+        turn_start = time.monotonic()
+        turn_status = "ok"
         try:
             async for event, usage in run_query(context, query_messages):
                 if isinstance(event, AssistantTurnComplete):
@@ -311,7 +324,27 @@ class QueryEngine:
                 if usage is not None:
                     self._cost_tracker.add(usage)
                 yield event
+        except BaseException:
+            turn_status = "error"
+            raise
         finally:
+            total = self._cost_tracker.total
+            record(
+                "engine",
+                "turn",
+                "completed" if turn_status == "ok" else "failed",
+                status=turn_status,
+                duration_ms=(time.monotonic() - turn_start) * 1000.0,
+                attrs={"model": self._model, "message_count": len(self._messages)},
+                counters={
+                    "input_tokens": total.input_tokens,
+                    "output_tokens": total.output_tokens,
+                    "cache_read_input_tokens": total.cache_read_input_tokens,
+                    "cache_creation_input_tokens": total.cache_creation_input_tokens,
+                },
+            )
+            diag_context.turn_id_var.reset(turn_token)
+            diag_context.session_id_var.reset(session_token)
             await self._update_session_memory()
             self._schedule_durable_memory_extraction()
             self._schedule_auto_dream()

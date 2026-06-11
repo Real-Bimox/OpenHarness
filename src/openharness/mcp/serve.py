@@ -19,6 +19,42 @@ import json
 from typing import Any
 
 
+def _instrumented(fn):
+    """Record an mcp.tool_call span around a server tool handler."""
+    import functools
+    import time as _time
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        from openharness.diagnostics import build_error, record
+
+        start = _time.monotonic()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            record(
+                "mcp",
+                "mcp_tool_call",
+                "failed",
+                level="error",
+                status="error",
+                duration_ms=(_time.monotonic() - start) * 1000.0,
+                attrs={"tool_name": fn.__name__},
+                error=build_error(exc),
+            )
+            raise
+        record(
+            "mcp",
+            "mcp_tool_call",
+            "completed",
+            duration_ms=(_time.monotonic() - start) * 1000.0,
+            attrs={"tool_name": fn.__name__},
+        )
+        return result
+
+    return wrapper
+
+
 def build_server():
     """Construct the FastMCP server with all read/maintenance tools registered."""
     from mcp.server.fastmcp import FastMCP
@@ -26,6 +62,7 @@ def build_server():
     server = FastMCP("openharness")
 
     @server.tool()
+    @_instrumented
     def search_sessions(
         query: str = "",
         project: str = "all",
@@ -59,6 +96,7 @@ def build_server():
         return json.dumps(result, ensure_ascii=False)
 
     @server.tool()
+    @_instrumented
     def list_sessions(project: str = "all", limit: int = 20) -> str:
         """List recently active OpenHarness sessions with previews."""
         from openharness.services.conversation_index import (
@@ -72,6 +110,7 @@ def build_server():
         return json.dumps(get_conversation_index().browse(project=project, limit=limit), ensure_ascii=False)
 
     @server.tool()
+    @_instrumented
     def skill_loop_status() -> str:
         """Report skill usage telemetry, lifecycle states, and pending writes."""
         from openharness.services.skill_approval import list_pending
@@ -96,6 +135,7 @@ def build_server():
         return json.dumps(payload, ensure_ascii=False)
 
     @server.tool()
+    @_instrumented
     def run_skill_curator(dry_run: bool = True) -> str:
         """Run the skill curator (lifecycle pass; LLM consolidation unless dry_run)."""
         import asyncio
@@ -106,6 +146,7 @@ def build_server():
         return json.dumps(report, ensure_ascii=False)
 
     @server.tool()
+    @_instrumented
     def recovery_status() -> str:
         """Report the configured provider fallback chain and credential pools."""
         from openharness.api.credentials import build_credential_pools

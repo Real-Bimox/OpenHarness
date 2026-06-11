@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import sys
+import time
 import threading
 from dataclasses import asdict
 from typing import Any, TextIO
@@ -605,6 +606,28 @@ async def run_headless_control(
             await loop.connect_read_pipe(lambda: protocol, sys.stdin)
         except (AttributeError, NotImplementedError, OSError, ValueError):
             stdin_reader = None
+    raw_line_queue: asyncio.Queue[str] = asyncio.Queue()
+    if stdin_reader is None:
+        # Fallback input (injected streams, non-pipe platforms): pump lines
+        # from a daemon thread so a blocking readline can never stall the
+        # event loop. Deliberately a plain thread, not the default executor
+        # (the v0.1.17 hang showed executor handoff itself can fail).
+        pump_loop = asyncio.get_running_loop()
+
+        def _stdin_pump() -> None:
+            while True:
+                try:
+                    pumped = input_stream.readline()
+                except Exception:
+                    pumped = ""
+                try:
+                    pump_loop.call_soon_threadsafe(raw_line_queue.put_nowait, pumped)
+                except RuntimeError:
+                    return
+                if pumped == "":
+                    return
+
+        threading.Thread(target=_stdin_pump, name="headless-stdin", daemon=True).start()
     request_queue: asyncio.Queue[HeadlessRequest] = asyncio.Queue()
     write_lock = asyncio.Lock()
     current_request_id: str | None = None
@@ -884,6 +907,13 @@ async def run_headless_control(
                 current_request_id = None
 
     async def _interrupt_active_request(request_id: str | None) -> None:
+        from openharness.diagnostics import record as _diag_int_record
+
+        _diag_int_record(
+            "headless", "interrupt", "completed",
+            attrs={"active": active_request_task is not None and not active_request_task.done()},
+            request_id=request_id,
+        )
         if active_request_task is None or active_request_task.done():
             await _emit({"type": "interrupted", "active": False}, request_id=request_id)
             return
@@ -930,7 +960,7 @@ async def run_headless_control(
                     raw_bytes = await stdin_reader.readline()
                     raw = raw_bytes.decode("utf-8", errors="replace")
                 else:
-                    raw = input_stream.readline()
+                    raw = await raw_line_queue.get()
             except Exception as exc:
                 with contextlib.suppress(Exception):
                     await _error(f"stdin read failed: {exc}", recoverable=False)
@@ -945,6 +975,12 @@ async def run_headless_control(
             try:
                 request = HeadlessRequest.model_validate_json(raw)
             except Exception as exc:
+                from openharness.diagnostics import record as _diag_parse_record
+
+                _diag_parse_record(
+                    "headless", "request_parse", "failed", level="warning", status="error",
+                    attrs={"reason": "invalid_json"},
+                )
                 await _error(f"Invalid request: {exc}", recoverable=True)
                 continue
             # Answer read-only and interrupt requests immediately, even while a
@@ -978,15 +1014,33 @@ async def run_headless_control(
                 continue
             await request_queue.put(request)
 
+    from openharness.diagnostics import record as _diag_record
+    from openharness.diagnostics.runinfo import write_current_run
+
+    write_current_run("headless")
+    _diag_record("headless", "process", "started", attrs={"mode": "headless"})
     await _emit({"type": "process_ready", "protocol_version": HEADLESS_PROTOCOL_VERSION})
     reader = asyncio.create_task(_read_requests())
     try:
         while True:
             request = await request_queue.get()
             request_id = request.correlation_id
+            _request_start = time.monotonic()
+            _request_type = request.type
             if force_shutdown and request.type != "shutdown":
                 await _error("Process is shutting down", request_id=request_id, recoverable=False)
                 continue
+            def _record_request(status: str = "ok") -> None:
+                _diag_record(
+                    "headless",
+                    "request",
+                    "completed" if status == "ok" else "failed",
+                    status=status,
+                    duration_ms=(time.monotonic() - _request_start) * 1000.0,
+                    request_id=request_id,
+                    attrs={"request_type": _request_type},
+                )
+
             if request.type in {"submit", "submit_line"}:
                 line = request.submitted_text
                 if not line:
@@ -1007,7 +1061,9 @@ async def run_headless_control(
                         )
                         continue
                 if not await _run_active_request(_submit(line, request_id=request_id), request_id=request_id):
+                    _record_request()
                     break
+                _record_request()
             elif request.type in {"resume", "continue"}:
                 if not await _restore_session(request, request_id=request_id):
                     continue
