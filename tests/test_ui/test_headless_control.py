@@ -8,7 +8,9 @@ import asyncio
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,7 +19,7 @@ from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, TextBlock, ToolUseBlock
 from openharness.services.session_storage import save_session_snapshot
 from openharness.ui.app import run_headless_control, run_print_mode
-from openharness.ui.runtime import build_runtime, close_runtime
+from openharness.ui.runtime import build_runtime, close_runtime, save_runtime_snapshot
 
 
 class StaticApiClient:
@@ -90,6 +92,60 @@ def test_headless_cli_consumes_piped_stdin(tmp_path: Path, monkeypatch):
     )
     assert events[-1]["type"] == "shutdown"
     assert events[-1]["request_id"] == "shutdown-1"
+
+
+@pytest.mark.asyncio
+async def test_daemon_thread_helper_times_out_without_default_executor(monkeypatch):
+    """Headless fast paths must not depend on the default asyncio executor.
+
+    A stuck default-executor worker can keep ``asyncio.run()`` alive at process
+    teardown. The helper uses a daemon thread instead and returns promptly.
+    """
+    from openharness.utils.async_threads import run_sync_daemon_thread
+
+    def _executor_used(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError("default executor was used")
+
+    monkeypatch.setattr(asyncio, "to_thread", _executor_used)
+    release = threading.Event()
+    start = time.monotonic()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await run_sync_daemon_thread(release.wait, name="test-daemon-helper", timeout=0.01)
+    finally:
+        release.set()
+    assert time.monotonic() - start < 1.0
+
+
+@pytest.mark.asyncio
+async def test_save_runtime_snapshot_does_not_use_default_executor(monkeypatch):
+    def _executor_used(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError("default executor was used")
+
+    monkeypatch.setattr(asyncio, "to_thread", _executor_used)
+
+    saved: dict[str, object] = {}
+
+    class _Backend:
+        def save_snapshot(self, **kwargs):
+            saved.update(kwargs)
+
+    bundle = SimpleNamespace(
+        cwd="/tmp/project",
+        session_backend=_Backend(),
+        session_id="snapshot-test",
+        engine=SimpleNamespace(
+            model="test-model",
+            messages=[ConversationMessage.from_user_text("hello")],
+            total_usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+            tool_metadata={},
+        ),
+    )
+
+    await save_runtime_snapshot(bundle, system_prompt="system")
+
+    assert saved["session_id"] == "snapshot-test"
+    assert saved["model"] == "test-model"
 
 
 @pytest.mark.asyncio

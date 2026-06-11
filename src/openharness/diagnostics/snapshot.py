@@ -146,20 +146,23 @@ def recent_errors(events: list[dict[str, Any]], *, limit: int = _RECENT_ERRORS_L
     return compact
 
 
-async def thread_executor_probe_async(timeout: float = 2.0) -> dict[str, Any]:
-    """Bounded asyncio.to_thread round-trip; diagnostic only (§ watchdog).
+def thread_probe(timeout: float = 2.0) -> dict[str, Any]:
+    """Bounded daemon-thread round-trip; diagnostic only (§ watchdog).
 
-    The recorder itself never touches the executor — this probe exists to
-    detect environments where executor handoff is unsafe (v0.1.17 lesson).
+    Deliberately NOT ``asyncio.to_thread``/``run_in_executor``: the default
+    executor's workers are non-daemon, so in an environment where thread
+    handoff is broken, exactly what this probe detects, a stuck worker
+    makes ``asyncio.run()`` hang forever in ``shutdown_default_executor()``
+    at teardown, even after a ``wait_for`` timeout. A raw daemon thread can
+    time out the same way but can never block process exit.
     """
-    import asyncio
+    import threading
 
     start = time.perf_counter()
+    done = threading.Event()
     try:
-        await asyncio.wait_for(asyncio.to_thread(lambda: "ok"), timeout=timeout)
-        status = "ok"
-    except asyncio.TimeoutError:
-        status = "timeout"
+        threading.Thread(target=done.set, name="diagnostics-probe", daemon=True).start()
+        status = "ok" if done.wait(timeout) else "timeout"
     except Exception:
         status = "failed"
     result = {"status": status, "duration_ms": round((time.perf_counter() - start) * 1000.0, 2)}
@@ -167,28 +170,14 @@ async def thread_executor_probe_async(timeout: float = 2.0) -> dict[str, Any]:
 
     record(
         "diagnostics",
-        "thread_executor_probe",
+        "thread_probe",
         "completed" if status == "ok" else status if status == "timeout" else "failed",
         level="info" if status == "ok" else "warning",
         status="ok" if status == "ok" else "error",
         duration_ms=result["duration_ms"],
-        attrs={"probe": "thread_executor", "status": status},
+        attrs={"probe": "thread_spawn", "status": status},
     )
     return result
-
-
-def thread_executor_probe(timeout: float = 2.0) -> dict[str, Any]:
-    """Sync wrapper for contexts without a running event loop."""
-    import asyncio
-
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        try:
-            return asyncio.run(thread_executor_probe_async(timeout))
-        except Exception:
-            return {"status": "failed", "duration_ms": None}
-    return {"status": "skipped", "duration_ms": None}
 
 
 def _read_current_run() -> dict[str, Any] | None:
@@ -256,6 +245,6 @@ def build_status(*, probe: bool = False) -> dict[str, Any]:
         "index": _index_health(),
         "summary": summarize_events(events, window_seconds=_SUMMARY_WINDOW_SECONDS),
         "recent_errors": recent_errors(events),
-        "executor_probe": thread_executor_probe() if probe else None,
+        "thread_probe": thread_probe() if probe else None,
     }
     return status

@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Status | APPROVED |
+| Status | IMPLEMENTED |
 | Proposal branch | `proposal/observability-metrics` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-11 |
@@ -195,7 +195,7 @@ Path policy:
 | `runtime.import_probe_ms` | duration | probe | Tracks command/tool registry import drift. |
 | `runtime.shutdown_duration_ms` | duration | mode, status | Finds hangs during teardown. |
 | `runtime.event_loop_lag_ms` | gauge | mode | Diagnoses event-loop stalls. |
-| `runtime.thread_executor_probe_ms` | duration/status | mode | Detects environments where `to_thread`/executor handoff is unsafe. |
+| `runtime.thread_probe_ms` | duration/status | mode | Detects environments where thread handoff is unsafe. |
 | `runtime.rss_mb` | gauge | mode | Detects memory growth without adding `psutil`. Use `resource` where available. |
 | `runtime.open_file_count` | gauge | mode | Optional Linux-only health signal from `/proc/self/fd`. |
 
@@ -453,7 +453,7 @@ Add a lightweight watchdog:
 - Run the watchdog as a daemon task/thread that cannot keep teardown alive.
 - If a headless request, model call, tool call, index operation, snapshot write, or channel operation exceeds its configured slow threshold, emit a `slow_operation` event.
 - If an operation exceeds a hard diagnostic threshold, capture a standard-library stack snapshot with `faulthandler` or `sys._current_frames()` into a redacted local file referenced by the event.
-- Add a `runtime.thread_executor_probe` at startup and in `oh diagnostics status`, because recent release work showed that executor handoff can fail in constrained environments. The probe should use a bounded `wait_for(asyncio.to_thread(...), timeout=2)` when an event loop is available and record `ok`, `failed`, or `timeout` plus duration. The probe is diagnostic only; the recorder itself must not depend on the executor.
+- Add a `runtime.thread_probe` at startup and in `oh diagnostics status`, because recent release work showed that thread/executor handoff can fail in constrained environments. The probe is a raw daemon-thread round-trip bounded at 2 seconds, recording `ok`, `failed`, or `timeout` plus duration. It must never use `asyncio.to_thread()` or `loop.run_in_executor()`: the default executor's workers are non-daemon, so in exactly the broken environments this probe detects, a stuck worker hangs `asyncio.run()` teardown in `shutdown_default_executor()` even after a `wait_for` timeout. The probe is diagnostic only; the recorder must not depend on it, and process teardown must never await it.
 
 Suggested default slow thresholds:
 
@@ -483,7 +483,7 @@ Suggested default slow thresholds:
   - daemon-thread JSONL writer and daily rotation.
 - Add settings with conservative defaults.
 - Add unit tests for schema stability, redaction, retention, queue overflow, and disabled mode.
-- Add the bounded thread-executor probe, but keep it out of the recorder write path.
+- Add the bounded daemon-thread probe, but keep it out of the recorder write path.
 
 ### Phase 2 - Critical Path Instrumentation
 

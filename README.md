@@ -153,6 +153,11 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
+- **2026-06-11** 🔍 **v0.1.18** — Local-first observability & diagnostics:
+  - Bounded, redacted, structured diagnostic events for every turn, model call, tool execution, permission decision, snapshot write, and index operation — correlated by one `run_id`, stored locally as daily JSONL (14-day retention, 25 MB/day cap), never containing prompts, outputs, or secrets. Adds < 0.5 ms per line (release-gated).
+  - New `oh diagnostics status|tail|summary|export|purge` CLI group; headless `diagnostics` request + optional `correlation_id` on every request; MCP `diagnostics_status` tool; redacted support-bundle export with per-rule redaction report.
+  - Hang watchdog for long-lived modes: `slow_operation` events per threshold, stack snapshots past hard thresholds, heartbeats, and a daemon-thread probe that detects broken thread handoff without ever touching the asyncio executor.
+  - Fixes a v0.1.17 regression where the injected-stream headless stdin fallback could block the event loop. Design: [docs/proposals/observability-metrics.md](docs/proposals/observability-metrics.md).
 - **2026-06-11** 🧠 **v0.1.15** — Conversation search, skill learning & provider resilience:
   - `session_search` searches your past conversations (SQLite FTS5, zero LLM cost) via tool, `oh sessions`, headless, and MCP — secrets redacted before indexing, index rebuildable from snapshots.
   - A skill learning loop: `skill_manage` write tool, post-turn self-review, usage lifecycle + weekly curator, optional staged approval — confined to user skills with write scanning on by default.

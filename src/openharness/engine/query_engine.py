@@ -18,6 +18,7 @@ from openharness.hooks import HookEvent, HookExecutor
 from openharness.permissions.checker import PermissionChecker
 from openharness.services.autodream.service import schedule_auto_dream
 from openharness.tools.base import ToolRegistry
+from openharness.utils.async_threads import run_sync_daemon_thread
 
 
 class QueryEngine:
@@ -192,14 +193,42 @@ class QueryEngine:
             return
         from openharness.services.session_memory import update_session_memory_file
 
-        # The checkpoint write fsyncs; keep it off the event loop.
-        await asyncio.to_thread(
-            update_session_memory_file,
-            self._cwd,
-            list(self._messages),
-            tool_metadata=self._tool_metadata,
-            session_id=str(self._tool_metadata.get("session_id") or "default"),
-        )
+        start = time.monotonic()
+        try:
+            await run_sync_daemon_thread(
+                update_session_memory_file,
+                self._cwd,
+                list(self._messages),
+                name="session-memory-save",
+                timeout=10.0,
+                tool_metadata=self._tool_metadata,
+                session_id=str(self._tool_metadata.get("session_id") or "default"),
+            )
+        except asyncio.TimeoutError:
+            from openharness.diagnostics import record
+
+            record(
+                "memory",
+                "session_memory_update",
+                "timeout",
+                level="warning",
+                status="error",
+                duration_ms=(time.monotonic() - start) * 1000.0,
+                attrs={"reason": "timeout"},
+            )
+        except Exception as exc:
+            from openharness.diagnostics import build_error, record
+
+            record(
+                "memory",
+                "session_memory_update",
+                "failed",
+                level="warning",
+                status="error",
+                duration_ms=(time.monotonic() - start) * 1000.0,
+                attrs={"reason": "write_failed"},
+                error=build_error(exc, reason="write_failed"),
+            )
 
     def _schedule_durable_memory_extraction(self) -> None:
         """Run the optional extraction pass in the background.

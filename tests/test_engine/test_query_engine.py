@@ -78,6 +78,39 @@ class StaticApiClient:
         )
 
 
+@pytest.mark.asyncio
+async def test_session_memory_update_does_not_use_default_executor(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+
+    def _executor_used(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError("default executor was used")
+
+    monkeypatch.setattr(asyncio, "to_thread", _executor_used)
+
+    settings = Settings()
+    settings.memory.enabled = True
+    settings.memory.session_memory_enabled = True
+    engine = QueryEngine(
+        api_client=StaticApiClient("done"),
+        tool_registry=ToolRegistry(),
+        permission_checker=PermissionChecker(PermissionSettings(mode=PermissionMode.FULL_AUTO)),
+        cwd=tmp_path,
+        model="test-model",
+        system_prompt="system",
+        settings=settings,
+        tool_metadata={"session_id": "memory-test"},
+    )
+
+    events = [event async for event in engine.submit_message("current task")]
+
+    from openharness.services.session_memory import get_session_memory_content, get_session_memory_path
+
+    assert any(isinstance(event, AssistantTurnComplete) for event in events)
+    path = get_session_memory_path(tmp_path, "memory-test")
+    assert "current task" in get_session_memory_content(path)
+
+
 class RetryThenSuccessApiClient:
     async def stream_message(self, request):
         del request

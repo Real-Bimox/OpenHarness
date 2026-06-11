@@ -36,6 +36,7 @@ from openharness.ui.runtime import (
     save_runtime_snapshot,
     start_runtime,
 )
+from openharness.utils.async_threads import run_sync_daemon_thread
 
 
 _VALID_PRINT_OUTPUT_FORMATS = {"text", "json", "stream-json"}
@@ -802,7 +803,7 @@ async def run_headless_control(
             }
 
         try:
-            payload = await asyncio.to_thread(_run)
+            payload = await run_sync_daemon_thread(_run, name="skill-loop-status", timeout=10.0)
         except Exception as exc:
             await _error(f"skill_loop_status failed: {exc}", request_id=request_id)
             return
@@ -887,7 +888,6 @@ async def run_headless_control(
             read_events,
             recent_errors,
             summarize_events,
-            thread_executor_probe_async,
         )
 
         request_id = request.effective_request_id
@@ -897,8 +897,9 @@ async def run_headless_control(
         }
         get_recorder().flush()
         if (request.scope or "summary") == "status":
-            status = build_status()
-            status["executor_probe"] = await thread_executor_probe_async()
+            # probe=True is a daemon-thread round-trip bounded at 2 s; it
+            # never touches the asyncio executor (see snapshot.thread_probe).
+            status = build_status(probe=True)
             payload["status"] = status
             payload["summary"] = status["summary"]
             payload["recent_errors"] = status["recent_errors"]
@@ -1079,15 +1080,16 @@ async def run_headless_control(
     from openharness.diagnostics import record as _diag_record
     from openharness.diagnostics import watchdog as _watchdog
     from openharness.diagnostics.runinfo import write_current_run
-    from openharness.diagnostics.snapshot import thread_executor_probe_async
+    from openharness.diagnostics.snapshot import thread_probe
 
     write_current_run("headless")
     _diag_record("headless", "process", "started", attrs={"mode": "headless"})
     _watchdog.start_watchdog("headless")
     await _emit({"type": "process_ready", "protocol_version": HEADLESS_PROTOCOL_VERSION})
-    # Startup executor probe (diagnostic only, never load-bearing): detects
-    # environments where to_thread/executor handoff is unsafe.
-    probe_task = asyncio.create_task(thread_executor_probe_async())
+    # Startup thread probe (diagnostic only, never load-bearing): detects
+    # environments where thread handoff is unsafe. Fire-and-forget on a
+    # daemon thread; teardown must never wait on a diagnostic probe.
+    threading.Thread(target=thread_probe, name="diagnostics-startup-probe", daemon=True).start()
     reader = asyncio.create_task(_read_requests())
     try:
         while True:
@@ -1170,9 +1172,6 @@ async def run_headless_control(
                 _record_request()
                 break
     finally:
-        probe_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await probe_task
         reader.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await reader

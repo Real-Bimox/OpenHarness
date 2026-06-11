@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import typer
 
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 
 _PREVIEW_STOPWORDS = {
     "a",
@@ -882,7 +882,7 @@ def diagnostics_status(
     run = status.get("run") or {}
     recorder = status.get("recorder") or {}
     summary = status.get("summary") or {}
-    probe = status.get("executor_probe") or {}
+    probe = status.get("thread_probe") or {}
     print(f"version:        {status['version']}  (run {status['run_id']})")
     print(f"mode:           {run.get('mode', 'n/a')}  pid {run.get('pid', 'n/a')}")
     print(
@@ -893,7 +893,7 @@ def diagnostics_status(
     )
     index = status.get("index") or {}
     print(f"index:          enabled={index.get('enabled')}  fts={index.get('fts_enabled')}")
-    print(f"executor probe: {probe.get('status', 'n/a')}")
+    print(f"thread probe:   {probe.get('status', 'n/a')}")
     print(f"events (1h):    {summary.get('events', 0)}")
     for component, bucket in sorted((summary.get("by_component") or {}).items()):
         print(f"  {component:<12} total {bucket['total']:<6} errors {bucket['errors']}")

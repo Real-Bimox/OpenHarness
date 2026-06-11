@@ -43,6 +43,7 @@ from openharness.prompts import build_runtime_system_prompt_with_cache_boundary
 from openharness.state import AppState, AppStateStore
 from openharness.services.session_backend import DEFAULT_SESSION_BACKEND, SessionBackend
 from openharness.tools import ToolRegistry, create_default_tool_registry
+from openharness.utils.async_threads import run_sync_daemon_thread
 from openharness.keybindings import load_keybindings
 
 PermissionPrompt = Callable[[str, str], Awaitable[bool]]
@@ -632,16 +633,47 @@ async def save_runtime_snapshot(
     model: str | None = None,
 ) -> None:
     """Persist a runtime snapshot without blocking the event loop."""
-    await asyncio.to_thread(
-        bundle.session_backend.save_snapshot,
-        cwd=bundle.cwd,
-        model=model or bundle.engine.model,
-        system_prompt=system_prompt,
-        messages=bundle.engine.messages,
-        usage=bundle.engine.total_usage,
-        session_id=bundle.session_id,
-        tool_metadata=bundle.engine.tool_metadata,
-    )
+    start = time.monotonic()
+    try:
+        await run_sync_daemon_thread(
+            bundle.session_backend.save_snapshot,
+            name="runtime-snapshot-save",
+            timeout=20.0,
+            cwd=bundle.cwd,
+            model=model or bundle.engine.model,
+            system_prompt=system_prompt,
+            messages=bundle.engine.messages,
+            usage=bundle.engine.total_usage,
+            session_id=bundle.session_id,
+            tool_metadata=bundle.engine.tool_metadata,
+        )
+    except asyncio.TimeoutError:
+        from openharness.diagnostics import record
+
+        record(
+            "storage",
+            "snapshot_save",
+            "timeout",
+            level="warning",
+            status="error",
+            duration_ms=(time.monotonic() - start) * 1000.0,
+            session_id=bundle.session_id,
+            attrs={"app": "openharness", "reason": "timeout"},
+        )
+    except Exception as exc:
+        from openharness.diagnostics import build_error, record
+
+        record(
+            "storage",
+            "snapshot_save",
+            "failed",
+            level="warning",
+            status="error",
+            duration_ms=(time.monotonic() - start) * 1000.0,
+            session_id=bundle.session_id,
+            attrs={"app": "openharness", "reason": "write_failed"},
+            error=build_error(exc, reason="write_failed"),
+        )
 
 
 def _last_user_text(messages: list[ConversationMessage]) -> str:

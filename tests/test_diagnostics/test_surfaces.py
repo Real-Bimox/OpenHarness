@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import tarfile
 import time
 from pathlib import Path
@@ -368,14 +371,36 @@ def test_diagnostics_status_json_schema(tmp_path: Path, monkeypatch):
         "index",
         "summary",
         "recent_errors",
-        "executor_probe",
+        "thread_probe",
     ):
         assert key in status, f"missing status key: {key}"
-    assert status["executor_probe"]["status"] in {"ok", "failed", "timeout", "skipped"}
+    assert status["thread_probe"]["status"] in {"ok", "failed", "timeout"}
     assert isinstance(status["recorder"]["events_written"], int)
     assert isinstance(status["summary"]["by_component"], dict)
     secrets_view = json.dumps(status.get("auth"))
     assert "api_key" not in secrets_view
+
+
+def test_diagnostics_status_cli_process_exits_cleanly(tmp_path: Path):
+    """Regression guard for the first release review: status --json must not
+    strand a default-executor worker and hang process teardown."""
+    env = {
+        **os.environ,
+        "OPENHARNESS_CONFIG_DIR": str(tmp_path / "config"),
+        "OPENHARNESS_DATA_DIR": str(tmp_path / "data"),
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "openharness", "diagnostics", "status", "--json"],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    status = json.loads(result.stdout)
+    assert status["thread_probe"]["status"] in {"ok", "failed", "timeout"}
 
 
 # -- supporting surfaces (not in the traceability table) -----------------------
@@ -428,7 +453,39 @@ def test_watchdog_hard_threshold_dumps_stacks(tmp_path: Path, monkeypatch):
     assert stack_file
     stack_path = diag_dir / "stacks" / stack_file
     assert stack_path.exists()
-    assert "Thread" in stack_path.read_text(encoding="utf-8")
+    stack_text = stack_path.read_text(encoding="utf-8")
+    assert "thread" in stack_text.lower()
+    assert "most recent call first" in stack_text
+
+
+def test_diagnostics_package_is_executor_free():
+    """Hard constraint: nothing in the diagnostics package may touch the
+    asyncio default executor. Its workers are non-daemon, so in broken
+    environments a wedged worker hangs asyncio.run() teardown: the exact
+    failure mode this subsystem exists to diagnose (release blocker on the
+    first review of this branch)."""
+    import openharness.diagnostics as pkg
+
+    for path in Path(pkg.__file__).parent.glob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        # Call sites only; docstrings naming the hazard are allowed.
+        for forbidden in ("to_thread(", "run_in_executor("):
+            assert forbidden not in text, f"{path.name} uses {forbidden}"
+
+
+def test_thread_probe_works_without_executor(tmp_path: Path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    import asyncio
+
+    def _executor_used(*args, **kwargs):  # pragma: no cover - guard
+        raise AssertionError("diagnostics probe touched the asyncio executor")
+
+    monkeypatch.setattr(asyncio, "to_thread", _executor_used)
+    from openharness.diagnostics.snapshot import thread_probe
+
+    result = thread_probe(timeout=2.0)
+    assert result["status"] == "ok"
+    assert isinstance(result["duration_ms"], (int, float))
 
 
 def test_watchdog_does_not_start_in_print_mode(tmp_path: Path, monkeypatch):
