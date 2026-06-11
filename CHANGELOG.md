@@ -4,6 +4,16 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
+## [0.1.15] - 2026-06-11
+
+### Added
+
+- **Conversation search.** A rebuildable SQLite FTS5 index over saved session snapshots powers a `session_search` agent tool (discover/read/scroll/browse, zero LLM cost), an `oh sessions list|search|reindex` CLI, a headless `search_sessions` request, and an MCP tool. Secrets are redacted before indexing; message bodies are budgeted; queries are sanitized into valid FTS5. Gated by `conversation_index_enabled` (default on). Learned from hermes-agent; see `docs/proposals/conversation-search.md`.
+- **Skill learning loop.** A `skill_manage` agent tool (create/edit/patch/delete/write_file/remove_file, structurally confined to user skills, write scanning on by default), a post-turn background review fork that may create or improve skills, usage telemetry with an active/stale/archived lifecycle and pinning, a weekly LLM curator (no shell, no archive quota), and staged write approval with faithful diffs. New `SkillSettings` group; `oh skills usage|pin|unpin|pending|diff|approve|discard|curator` CLI; headless `skill_loop_status`. See `docs/proposals/skill-learning-loop.md`.
+- **Error recovery, fallback chains, and credential rotation.** A typed, declarative error classifier; a resilient wrapper client running the recovery state machine (rotate/fallback/backoff/restore) with one hard attempt budget; provider fallback chains (`oh fallback list|add|remove|clear`) with mid-turn switching; per-provider API-key pools with cooldowns; new `ProviderFallbackEvent`/`CredentialRotatedEvent` surfaced through stream-json and headless. See `docs/proposals/error-recovery.md`.
+- **MCP server mode** (`oh --mcp-serve`): a stdio MCP server exposing `search_sessions`, `list_sessions`, `skill_loop_status`, `run_skill_curator`, and `recovery_status` on the official SDK (no new dependency), wrapping the same internal operations as the headless protocol. See `docs/proposals/mcp-server-mode.md`.
+- Comparative study and honest parity accounting in `docs/reports/openharness-vs-hermes-agent.md` and `docs/reports/learning-search-resilience-parity.md` (one documented capability gap: multi-account OAuth credential pools).
+
 ## [0.1.14] - 2026-06-10
 
 ### Added

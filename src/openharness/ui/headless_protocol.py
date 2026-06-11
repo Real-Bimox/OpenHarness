@@ -16,6 +16,8 @@ class HeadlessRequest(BaseModel):
         "resume",
         "continue",
         "list_sessions",
+        "search_sessions",
+        "skill_loop_status",
         "status",
         "interrupt",
         "shutdown",
@@ -28,6 +30,14 @@ class HeadlessRequest(BaseModel):
     text: str | None = None
     session_id: str | None = None
     force: bool = False
+    # search_sessions parameters (additive; see docs/proposals/conversation-search.md)
+    query: str | None = None
+    limit: int | None = None
+    sort: str | None = None
+    around_message_id: int | None = None
+    window: int | None = None
+    role_filter: str | None = None
+    project: str | None = None
 
     @property
     def correlation_id(self) -> str | None:

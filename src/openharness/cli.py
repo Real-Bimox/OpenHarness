@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import typer
 
-__version__ = "0.1.14"
+__version__ = "0.1.15"
 
 _PREVIEW_STOPWORDS = {
     "a",
@@ -837,6 +837,9 @@ auth_app = typer.Typer(name="auth", help="Manage authentication")
 provider_app = typer.Typer(name="provider", help="Manage provider profiles")
 config_app = typer.Typer(name="config", help="Show or update settings")
 cron_app = typer.Typer(name="cron", help="Manage cron scheduler and jobs")
+sessions_app = typer.Typer(name="sessions", help="List, search, and reindex saved conversations")
+skills_cli_app = typer.Typer(name="skills", help="Inspect skill usage, pins, pending writes, and the curator")
+fallback_app = typer.Typer(name="fallback", help="Manage the provider fallback chain")
 autopilot_app = typer.Typer(name="autopilot", help="Manage repo autopilot")
 
 app.add_typer(mcp_app)
@@ -846,6 +849,230 @@ app.add_typer(provider_app)
 app.add_typer(config_app)
 app.add_typer(cron_app)
 app.add_typer(autopilot_app)
+app.add_typer(sessions_app)
+app.add_typer(skills_cli_app)
+app.add_typer(fallback_app)
+
+
+@fallback_app.command("list")
+def fallback_list() -> None:
+    """Show the configured provider fallback chain."""
+    from openharness.config.settings import load_settings
+
+    chain = load_settings().fallback_providers
+    if not chain:
+        print("No fallback providers configured.")
+        return
+    for i, entry in enumerate(chain, 1):
+        suffix = f" @ {entry.base_url}" if entry.base_url else ""
+        print(f"  {i}. {entry.provider}:{entry.model}{suffix}")
+
+
+@fallback_app.command("add")
+def fallback_add(
+    provider: str = typer.Argument(..., help="Provider id, e.g. 'openai' or 'anthropic'"),
+    model: str = typer.Argument(..., help="Model id to use on this provider"),
+    base_url: str = typer.Option(None, "--base-url"),
+    api_format: str = typer.Option(None, "--api-format"),
+    api_key_env: str = typer.Option(None, "--api-key-env", help="Env var holding this provider's key"),
+) -> None:
+    """Append a provider to the fallback chain (does not change the active provider)."""
+    from openharness.config.settings import FallbackProvider, load_settings, save_settings
+
+    settings = load_settings()
+    for entry in settings.fallback_providers:
+        if entry.provider == provider and entry.model == model and entry.base_url == base_url:
+            print("That fallback entry already exists.", file=sys.stderr)
+            raise typer.Exit(1)
+    settings.fallback_providers.append(
+        FallbackProvider(
+            provider=provider, model=model, base_url=base_url, api_format=api_format, api_key_env=api_key_env
+        )
+    )
+    save_settings(settings)
+    print(f"Added fallback {provider}:{model}.")
+
+
+@fallback_app.command("remove")
+def fallback_remove(index: int = typer.Argument(..., help="1-based index from `oh fallback list`")) -> None:
+    """Remove a fallback chain entry by index."""
+    from openharness.config.settings import load_settings, save_settings
+
+    settings = load_settings()
+    if index < 1 or index > len(settings.fallback_providers):
+        print(f"No fallback entry at index {index}.", file=sys.stderr)
+        raise typer.Exit(1)
+    removed = settings.fallback_providers.pop(index - 1)
+    save_settings(settings)
+    print(f"Removed {removed.provider}:{removed.model}.")
+
+
+@fallback_app.command("clear")
+def fallback_clear() -> None:
+    """Remove all fallback chain entries."""
+    from openharness.config.settings import load_settings, save_settings
+
+    settings = load_settings()
+    settings.fallback_providers = []
+    save_settings(settings)
+    print("Fallback chain cleared.")
+
+
+@skills_cli_app.command("usage")
+def skills_usage() -> None:
+    """Show recorded skill usage and lifecycle state."""
+    from openharness.skills.usage import load_records
+
+    records = load_records()
+    if not records:
+        print("No skill usage recorded yet.")
+        return
+    for name in sorted(records):
+        r = records[name]
+        flags = []
+        if r.get("pinned"):
+            flags.append("pinned")
+        if r.get("created_by") == "agent":
+            flags.append("agent-created")
+        suffix = f" [{', '.join(flags)}]" if flags else ""
+        print(f"{name}: state={r.get('state','active')} uses={r.get('use_count',0)} patches={r.get('patch_count',0)}{suffix}")
+
+
+@skills_cli_app.command("pin")
+def skills_pin(name: str = typer.Argument(...)) -> None:
+    """Pin a skill so the curator cannot archive or delete it."""
+    from openharness.skills.usage import set_pinned
+
+    set_pinned(name, True)
+    print(f"Pinned {name}.")
+
+
+@skills_cli_app.command("unpin")
+def skills_unpin(name: str = typer.Argument(...)) -> None:
+    """Remove a skill's pin."""
+    from openharness.skills.usage import set_pinned
+
+    set_pinned(name, False)
+    print(f"Unpinned {name}.")
+
+
+@skills_cli_app.command("pending")
+def skills_pending() -> None:
+    """List staged skill writes awaiting approval."""
+    from openharness.services.skill_approval import list_pending
+
+    pending = list_pending()
+    if not pending:
+        print("No pending skill writes.")
+        return
+    for record in pending:
+        args = record.get("arguments", {})
+        print(f"{record['id']}: {args.get('action')} {args.get('name')} (origin={record.get('origin')})")
+
+
+@skills_cli_app.command("diff")
+def skills_diff(pending_id: str = typer.Argument(...)) -> None:
+    """Show the unified diff a pending skill write would apply."""
+    from openharness.services.skill_approval import pending_diff
+
+    diff = pending_diff(pending_id)
+    if diff is None:
+        print(f"No pending write with id {pending_id}.", file=sys.stderr)
+        raise typer.Exit(1)
+    print(diff or "(no textual change)")
+
+
+@skills_cli_app.command("approve")
+def skills_approve(pending_id: str = typer.Argument(...)) -> None:
+    """Apply a staged skill write."""
+    import asyncio as _asyncio
+
+    from openharness.services.skill_approval import apply_pending
+
+    result = _asyncio.run(apply_pending(pending_id))
+    if not result.get("success"):
+        print(f"Error: {result.get('error')}", file=sys.stderr)
+        raise typer.Exit(1)
+    print(f"Applied {pending_id}.")
+
+
+@skills_cli_app.command("discard")
+def skills_discard(pending_id: str = typer.Argument(...)) -> None:
+    """Discard a staged skill write."""
+    from openharness.services.skill_approval import discard_pending
+
+    if discard_pending(pending_id):
+        print(f"Discarded {pending_id}.")
+    else:
+        print(f"No pending write with id {pending_id}.", file=sys.stderr)
+        raise typer.Exit(1)
+
+
+@skills_cli_app.command("curator")
+def skills_curator(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Run lifecycle + report without the LLM pass"),
+) -> None:
+    """Run the skill curator (lifecycle pass, plus LLM consolidation unless --dry-run)."""
+    import asyncio as _asyncio
+
+    from openharness.services.skill_curator import run_curator
+
+    report = _asyncio.run(run_curator(dry_run=dry_run))
+    print(f"staled: {report['staled']}")
+    print(f"archived: {report['archived']}")
+    print(f"consolidation: {report['consolidation']}")
+    if report.get("summary"):
+        print(f"\n{report['summary']}")
+
+
+@sessions_app.command("list")
+def sessions_list(
+    project: str = typer.Option("all", "--project", help="Project path to scope to, or 'all'"),
+    limit: int = typer.Option(10, "--limit"),
+) -> None:
+    """List recently active indexed conversations."""
+    from openharness.services.conversation_index import get_conversation_index
+
+    result = get_conversation_index().browse(project=project, limit=limit)
+    for row in result["sessions"]:
+        preview = (row.get("preview") or "").replace("\n", " ")
+        print(f"{row['session_id']}  [{row.get('project','')}] {row.get('title') or preview}")
+    if not result["sessions"]:
+        print("No indexed sessions. Run `oh sessions reindex` to build the index from saved snapshots.")
+
+
+@sessions_app.command("search")
+def sessions_search(
+    query: str = typer.Argument(..., help="Full-text query (AND/OR/NOT, trailing * for prefix)"),
+    project: str = typer.Option("all", "--project", help="Project path to scope to, or 'all'"),
+    limit: int = typer.Option(5, "--limit"),
+    as_json: bool = typer.Option(False, "--json", help="Print raw JSON results"),
+) -> None:
+    """Search past conversations from the derived FTS index."""
+    from openharness.services.conversation_index import get_conversation_index
+
+    result = get_conversation_index().search(query, project=project, limit=limit)
+    if "error" in result:
+        print(f"Error: {result['error']}", file=sys.stderr)
+        raise typer.Exit(1)
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    for hit in result["hits"]:
+        meta = hit.get("session") or {}
+        print(f"\n{hit['session_id']}  [{meta.get('project','')}] {meta.get('title','')}")
+        print(f"  match #{hit['match_message_id']} ({hit['matched_role']}): {hit['snippet']}")
+    if not result["hits"]:
+        print("No matches.")
+
+
+@sessions_app.command("reindex")
+def sessions_reindex() -> None:
+    """Rebuild the conversation index from all saved snapshots."""
+    from openharness.services.conversation_index import get_conversation_index
+
+    count = get_conversation_index().rebuild()
+    print(f"Reindexed {count} session snapshot(s).")
 
 
 # ---- mcp subcommands ----
@@ -2437,9 +2664,20 @@ def main(
         help="Run the stdin-driven headless worker loop used for background agent tasks",
         hidden=True,
     ),
+    mcp_serve: bool = typer.Option(
+        False,
+        "--mcp-serve",
+        help="Run as an MCP server over stdio (exposes session search, skill loop, and recovery status)",
+    ),
 ) -> None:
     """Start an interactive session or run a single prompt."""
     if ctx.invoked_subcommand is not None:
+        return
+
+    if mcp_serve:
+        from openharness.mcp.serve import run_mcp_server
+
+        run_mcp_server()
         return
 
     import asyncio

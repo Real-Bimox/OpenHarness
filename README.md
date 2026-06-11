@@ -28,7 +28,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/React+Ink-TUI-61DAFB?logo=react&logoColor=white" alt="React">
-  <img src="https://img.shields.io/badge/pytest-1201_pass-brightgreen" alt="Pytest">
+  <img src="https://img.shields.io/badge/pytest-1253_pass-brightgreen" alt="Pytest">
   <img src="https://img.shields.io/badge/E2E-6_suites-orange" alt="E2E">
   <img src="https://img.shields.io/badge/output-text_|_json_|_stream--json-blueviolet" alt="Output">
   <a href="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml"><img src="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -153,6 +153,11 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
+- **2026-06-11** 🧠 **v0.1.15** — Conversation search, skill learning & provider resilience:
+  - `session_search` searches your past conversations (SQLite FTS5, zero LLM cost) via tool, `oh sessions`, headless, and MCP — secrets redacted before indexing, index rebuildable from snapshots.
+  - A skill learning loop: `skill_manage` write tool, post-turn self-review, usage lifecycle + weekly curator, optional staged approval — confined to user skills with write scanning on by default.
+  - Typed error recovery with provider fallback chains (`oh fallback`) and API-key rotation, mid-turn, in one resilient wrapper client.
+  - New **MCP server** (`oh --mcp-serve`) exposes these features to MCP hosts. Details: [RELEASE_NOTES_v0.1.15.md](RELEASE_NOTES_v0.1.15.md); honest parity report: [docs/reports/learning-search-resilience-parity.md](docs/reports/learning-search-resilience-parity.md).
 - **2026-06-10** 🗜️ **v0.1.14** — Config caching & prompt-cache breakpoints:
   - Per-line runtime assembly drops from ~45–60 ms to ~4 ms: settings, plugins, skills, CLAUDE.md, git info, and prompt sections are cached behind stat/identity fingerprints with hot-reload preserved.
   - Anthropic prompt-caching breakpoints (system prefix / tools / history) cut input cost and TTFT on long sessions; `usage` payloads now report `cache_read_input_tokens`. Kill switch: `prompt_caching_enabled`.
@@ -763,7 +768,7 @@ Currently `ohmo init` / `ohmo config` can guide channel setup for:
 
 ```bash
 # Run all tests
-uv run pytest -q                           # 1201 unit/integration
+uv run pytest -q                           # 1253 unit/integration
 python scripts/test_harness_features.py     # Harness E2E
 python scripts/test_real_skills_plugins.py  # Real plugins E2E
 ```

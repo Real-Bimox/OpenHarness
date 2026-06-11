@@ -89,6 +89,11 @@ class QueryEngine:
         return self._system_prompt
 
     @property
+    def max_tokens(self) -> int:
+        """Return the per-request output token cap."""
+        return self._max_tokens
+
+    @property
     def tool_metadata(self) -> dict[str, object]:
         """Return the mutable tool metadata/carry-over state."""
         return self._tool_metadata

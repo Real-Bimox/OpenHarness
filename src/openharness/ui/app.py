@@ -754,6 +754,81 @@ async def run_headless_control(
         sessions = list_session_snapshots(_session_lookup_cwd(), limit=20)
         await _emit({"type": "sessions", "sessions": sessions}, request_id=request_id)
 
+    async def _emit_skill_loop_status(request_id: str | None) -> None:
+        """Report skill telemetry, pending writes, and last curator run."""
+
+        def _run() -> dict[str, Any]:
+            from openharness.services.skill_approval import list_pending
+            from openharness.services.skill_curator import load_state
+            from openharness.skills.usage import load_records
+
+            records = load_records()
+            return {
+                "skills": {
+                    name: {
+                        "state": rec.get("state", "active"),
+                        "use_count": rec.get("use_count", 0),
+                        "patch_count": rec.get("patch_count", 0),
+                        "pinned": bool(rec.get("pinned")),
+                        "agent_created": rec.get("created_by") == "agent",
+                    }
+                    for name, rec in records.items()
+                },
+                "pending_writes": len(list_pending()),
+                "curator": load_state().get("last_report", {}),
+            }
+
+        try:
+            payload = await asyncio.to_thread(_run)
+        except Exception as exc:
+            await _error(f"skill_loop_status failed: {exc}", request_id=request_id)
+            return
+        await _emit({"type": "skill_loop_status", **payload}, request_id=request_id)
+
+    async def _emit_session_search(request: HeadlessRequest) -> None:
+        """Answer a search_sessions request from the derived index (read-only)."""
+        from openharness.services.conversation_index import get_conversation_index
+
+        request_id = request.correlation_id
+        active = bundle.session_id if bundle is not None else None
+
+        def _run() -> dict[str, Any]:
+            index = get_conversation_index()
+            project = request.project or _session_lookup_cwd()
+            if request.session_id and request.around_message_id is not None:
+                return {"mode": "scroll", **index.around(
+                    request.session_id, request.around_message_id, window=request.window or 5
+                )}
+            if request.session_id:
+                return {"mode": "read", **index.read_session(request.session_id)}
+            if not (request.query or "").strip():
+                return {"mode": "browse", **index.browse(
+                    project=project, limit=request.limit or 10, exclude_session=active
+                )}
+            roles = (
+                [part.strip() for part in request.role_filter.split(",") if part.strip()]
+                if request.role_filter
+                else None
+            )
+            return {"mode": "discover", **index.search(
+                request.query or "",
+                project=project,
+                limit=request.limit or 3,
+                sort=request.sort,
+                role_filter=roles,
+                exclude_session=active,
+            )}
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except Exception as exc:
+            await _error(f"Session search failed: {exc}", request_id=request_id)
+            return
+        if "error" in result:
+            await _error(str(result["error"]), request_id=request_id)
+            return
+        await _emit({"type": "session_search_results", **result}, request_id=request_id)
+
     def _is_busy() -> bool:
         return rebuilding or (active_request_task is not None and not active_request_task.done())
 
@@ -871,6 +946,12 @@ async def run_headless_control(
             try:
                 if request.type == "list_sessions":
                     await _emit_sessions(request.correlation_id)
+                    continue
+                if request.type == "search_sessions":
+                    await _emit_session_search(request)
+                    continue
+                if request.type == "skill_loop_status":
+                    await _emit_skill_loop_status(request.correlation_id)
                     continue
                 if request.type == "status":
                     await _emit_status(request.correlation_id)

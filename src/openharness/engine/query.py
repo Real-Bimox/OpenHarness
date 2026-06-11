@@ -16,6 +16,8 @@ from openharness.api.client import (
     ApiMessageCompleteEvent,
     ApiMessageRequest,
     ApiRetryEvent,
+    CredentialRotatedEvent,
+    ProviderFallbackEvent,
     ApiTextDeltaEvent,
     SupportsStreamingMessages,
 )
@@ -753,6 +755,19 @@ async def run_query(
                             f"Request failed; retrying in {event.delay_seconds:.1f}s "
                             f"(attempt {event.attempt + 1} of {event.max_attempts}): {event.message}"
                         )
+                    ), None
+                    continue
+                if isinstance(event, ProviderFallbackEvent):
+                    yield StatusEvent(
+                        message=(
+                            f"Switching to fallback provider {event.to_provider} "
+                            f"(model {event.to_model}) after {event.reason}."
+                        )
+                    ), None
+                    continue
+                if isinstance(event, CredentialRotatedEvent):
+                    yield StatusEvent(
+                        message=f"Rotated {event.provider} credential after {event.reason}."
                     ), None
                     continue
 

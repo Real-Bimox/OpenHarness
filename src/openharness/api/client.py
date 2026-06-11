@@ -78,7 +78,31 @@ class ApiRetryEvent:
     delay_seconds: float
 
 
-ApiStreamEvent = ApiTextDeltaEvent | ApiMessageCompleteEvent | ApiRetryEvent
+@dataclass(frozen=True)
+class ProviderFallbackEvent:
+    """The resilient client switched to a fallback provider/model mid-turn."""
+
+    reason: str
+    from_model: str
+    to_provider: str
+    to_model: str
+
+
+@dataclass(frozen=True)
+class CredentialRotatedEvent:
+    """The resilient client rotated to another credential for the provider."""
+
+    reason: str
+    provider: str
+
+
+ApiStreamEvent = (
+    ApiTextDeltaEvent
+    | ApiMessageCompleteEvent
+    | ApiRetryEvent
+    | ProviderFallbackEvent
+    | CredentialRotatedEvent
+)
 
 
 class SupportsStreamingMessages(Protocol):
