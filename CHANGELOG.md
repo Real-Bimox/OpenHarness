@@ -4,6 +4,13 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
+## [0.1.17] - 2026-06-11
+
+### Fixed
+
+- Headless and agent session search now run the local index read directly instead of through the default asyncio thread executor, fixing the deterministic first-run search hang seen in executor-restricted environments.
+- Programmatic headless input streams now read directly instead of using the thread executor, so injected stream tests and embedded callers do not inherit the same executor startup failure.
+
 ## [0.1.16] - 2026-06-11
 
 ### Fixed
