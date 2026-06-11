@@ -826,8 +826,24 @@ async def run_headless_control(
                 exclude_session=active,
             )}
 
+        from openharness.services.conversation_index import (
+            INDEX_OPERATION_TIMEOUT_SECONDS,
+            dump_worker_stacks,
+        )
+
         try:
-            result = await asyncio.to_thread(_run)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_run), timeout=INDEX_OPERATION_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            stacks = dump_worker_stacks()
+            await _error(
+                f"Session search timed out after {INDEX_OPERATION_TIMEOUT_SECONDS:.0f}s."
+                " The index never blocks in normal operation; please report this"
+                f" with the following thread state:\n{stacks}",
+                request_id=request_id,
+            )
+            return
         except Exception as exc:
             await _error(f"Session search failed: {exc}", request_id=request_id)
             return

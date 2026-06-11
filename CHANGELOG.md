@@ -4,6 +4,16 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
+## [0.1.16] - 2026-06-11
+
+### Fixed
+
+- Conversation-search surfaces are bounded by a hard 20s timeout with worker-stack diagnostics on expiry — the protocol can no longer hang even if the index layer blocks (reported first-run hang; not reproducible locally in nine configurations, fixed structurally and pinned by tests).
+- `conversation_index_enabled=false` is honored by every surface (CLI exits 1, headless answers an error event, MCP returns an error payload) via one shared gate.
+- `--mcp-serve` rejects conflicting mode flags with exit 1 instead of silently starting the server.
+- `ResilientApiClient` classifies translated terminal errors and falls back only when the classifier says so, instead of blanket-fallbacking under a hardcoded `auth` reason.
+- Lint clean (`ruff check .`); disallowed emoji removed from README; five implemented proposals marked IMPLEMENTED and their merged branches archived per AGENTS.md.
+
 ## [0.1.15] - 2026-06-11
 
 ### Added

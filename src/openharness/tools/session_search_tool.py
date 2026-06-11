@@ -115,7 +115,28 @@ class SessionSearchTool(BaseTool):
             )
             return {"mode": "discover", "query": arguments.query, **search}
 
-        result = await asyncio.to_thread(_run)
+        from openharness.services.conversation_index import (
+            INDEX_OPERATION_TIMEOUT_SECONDS,
+            dump_worker_stacks,
+        )
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_run), timeout=INDEX_OPERATION_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"session_search timed out after {INDEX_OPERATION_TIMEOUT_SECONDS:.0f}s;"
+                            " worker stacks: " + dump_worker_stacks()[:1500]
+                        ),
+                    }
+                ),
+                is_error=True,
+            )
         if "error" in result:
             return ToolResult(output=json.dumps({"success": False, **result}), is_error=True)
         return ToolResult(output=json.dumps({"success": True, **result}, ensure_ascii=False))

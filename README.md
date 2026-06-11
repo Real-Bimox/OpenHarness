@@ -28,7 +28,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-≥3.10-blue?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/React+Ink-TUI-61DAFB?logo=react&logoColor=white" alt="React">
-  <img src="https://img.shields.io/badge/pytest-1253_pass-brightgreen" alt="Pytest">
+  <img src="https://img.shields.io/badge/pytest-1260_pass-brightgreen" alt="Pytest">
   <img src="https://img.shields.io/badge/E2E-6_suites-orange" alt="E2E">
   <img src="https://img.shields.io/badge/output-text_|_json_|_stream--json-blueviolet" alt="Output">
   <a href="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml"><img src="https://github.com/Real-Bimox/OpenHarness/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -768,7 +768,7 @@ Currently `ohmo init` / `ohmo config` can guide channel setup for:
 
 ```bash
 # Run all tests
-uv run pytest -q                           # 1253 unit/integration
+uv run pytest -q                           # 1260 unit/integration
 python scripts/test_harness_features.py     # Harness E2E
 python scripts/test_real_skills_plugins.py  # Real plugins E2E
 ```
