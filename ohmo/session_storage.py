@@ -73,9 +73,12 @@ def _load_session_index(session_dir: Path) -> list[dict[str, Any]]:
 
 def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> None:
     entries = sorted(entries, key=lambda item: item.get("created_at", 0), reverse=True)
+    # Derived/rename-only artifact (C.1): the transcript is the durable commit
+    # point, so the index never pays a per-write fsync (matches openharness).
     atomic_write_text(
         _session_index_path(session_dir),
         json.dumps({"version": 1, "sessions": entries}, indent=2) + "\n",
+        fsync=False,
     )
 
 
@@ -147,7 +150,12 @@ def _load_ohmo_snapshot_in_dir(session_dir: Path, session_id: str) -> dict[str, 
         return _load_ohmo_v2_payload(session_dir, session_id)
     if fmt == "v1":
         path = session_dir / f"session-{session_id}.json"
-        return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+        # Tolerate a corrupt / concurrently-removed legacy file so one bad .json
+        # never crashes ohmo listing (mirrors the openharness loader core).
+        try:
+            return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            return None
     return None
 
 
@@ -220,6 +228,14 @@ def save_session_snapshot(
             "message_count": len(messages),
         }
         session_format.write_head(session_dir, sid, head)
+        # CONFLICT supersede (C.3 / C.7): drop a now-stale legacy v1 .json for
+        # this id once the v2 write has succeeded (reads already prefer v2).
+        legacy_v1 = session_dir / f"session-{sid}.json"
+        if legacy_v1.exists():
+            try:
+                legacy_v1.unlink()
+            except OSError:
+                pass
         # Pointer is derived/rename-only per C.1 (the transcript, fsynced once by
         # the append/rewrite primitives above, is the durable artifact).
         pointer = json.dumps({"session_id": sid}) + "\n"
@@ -310,7 +326,7 @@ def list_snapshots(workspace: str | Path | None = None, limit: int = 20) -> list
         sid = str(entry.get("session_id") or "")
         if sid:
             by_id[sid] = entry
-    derived_any = False
+    derived: dict[str, dict[str, Any]] = {}
     for sid in session_ids_on_disk(session_dir):
         if sid in by_id:
             continue
@@ -319,11 +335,21 @@ def list_snapshots(workspace: str | Path | None = None, limit: int = 20) -> list
             continue
         fmt = session_format.detect_session_format(session_dir, sid)
         sp = session_dir / (f"session-{sid}.head.json" if fmt == "v2" else f"session-{sid}.json")
-        by_id[sid] = _session_index_entry(payload, sp)
-        derived_any = True
-    if derived_any:
+        entry = _session_index_entry(payload, sp)
+        derived[sid] = entry
+        by_id[sid] = entry
+    if derived:
+        # Re-read the index INSIDE the lock and merge the derived entries (C.2
+        # read-modify-write) so a concurrent saver's entry written in the
+        # read→write window is preserved, not clobbered by this stale snapshot.
         with exclusive_file_lock(session_dir / ".sessions.lock"):
-            _write_session_index(session_dir, list(by_id.values()))
+            merged: dict[str, dict[str, Any]] = {}
+            for entry in _load_session_index(session_dir):
+                sid = str(entry.get("session_id") or "")
+                if sid:
+                    merged[sid] = entry
+            merged.update(derived)
+            _write_session_index(session_dir, list(merged.values()))
     sessions: list[dict[str, Any]] = []
     for sid, item in by_id.items():
         if session_format.detect_session_format(session_dir, sid) is None:

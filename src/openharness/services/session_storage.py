@@ -197,6 +197,18 @@ def _backfill_index(session_dir: Path) -> list[dict[str, Any]]:
             continue
         seen.add(sid)
         entries.append(_session_index_entry({**head, "messages": []}, head_file))
+    for jsonl_file in session_dir.glob("session-*.jsonl"):
+        # Head-less v2 (transcript present, head lost in a crash — C.6): re-derive
+        # via the loader so it is indexed too (C.7). Runs before the v1 loop so a
+        # jsonl-only v2 still wins a CONFLICT over a same-id legacy .json.
+        sid = jsonl_file.stem[len("session-"):]
+        if sid in seen:
+            continue
+        payload = _load_v2_payload(session_dir, sid)
+        if payload is None:
+            continue
+        seen.add(sid)
+        entries.append(_session_index_entry(payload, session_dir / f"session-{sid}.head.json"))
     for json_file in session_dir.glob("session-*.json"):
         if json_file.name.endswith(".head.json"):
             continue
@@ -482,6 +494,17 @@ def _save_session_snapshot_v2(
         }
         session_format.write_head(session_dir, sid, head)
 
+        # CONFLICT supersede (C.3 / C.7): a legacy v1 session-<id>.json for this
+        # id is now stale (the v2 transcript is durable and reads prefer v2), so
+        # remove it once the v2 write has succeeded — otherwise the CONFLICT
+        # state lingers and the .json wastes disk until the session is pruned.
+        legacy_v1 = session_dir / f"session-{sid}.json"
+        if legacy_v1.exists():
+            try:
+                legacy_v1.unlink()
+            except OSError:
+                pass
+
         latest_path = session_dir / "latest.json"
         atomic_write_text(
             latest_path, json.dumps({"session_id": sid}) + "\n", fsync=False
@@ -609,7 +632,7 @@ def list_session_snapshots(cwd: str | Path, limit: int = 20) -> list[dict[str, A
     # Surface on-disk sessions a present-but-incomplete index is missing
     # (PMR-002). Derive each via the v2-aware loader core so a head-less v2
     # session (transcript present, head lost — C.6) still surfaces, degraded.
-    derived_any = False
+    derived: dict[str, dict[str, Any]] = {}
     for sid in session_ids_on_disk(session_dir):
         if sid in by_id:
             continue
@@ -618,13 +641,23 @@ def list_session_snapshots(cwd: str | Path, limit: int = 20) -> list[dict[str, A
             continue
         fmt = session_format.detect_session_format(session_dir, sid)
         sp = session_dir / (f"session-{sid}.head.json" if fmt == "v2" else f"session-{sid}.json")
-        by_id[sid] = _session_index_entry(payload, sp)
-        derived_any = True
-    if derived_any:
-        # C.7: persist the merged index ONCE under .sessions.lock (atomic, not
-        # per-entry, not merge-on-read), so the next listing is index-only.
+        entry = _session_index_entry(payload, sp)
+        derived[sid] = entry
+        by_id[sid] = entry
+    if derived:
+        # C.7 lazy one-time backfill, persisted ONCE under .sessions.lock (atomic,
+        # not per-entry, not merge-on-read). Re-read the index INSIDE the lock and
+        # merge the derived entries onto it (C.2 read-modify-write), so an entry a
+        # concurrent saver wrote in the read→write window is preserved rather than
+        # clobbered by this stale snapshot.
         with exclusive_file_lock(session_dir / ".sessions.lock"):
-            _write_session_index(session_dir, list(by_id.values()))
+            merged: dict[str, dict[str, Any]] = {}
+            for entry in _load_session_index(session_dir):
+                sid = str(entry.get("session_id") or "")
+                if sid:
+                    merged[sid] = entry
+            merged.update(derived)
+            _write_session_index(session_dir, list(merged.values()))
     sessions: list[dict[str, Any]] = []
     for sid, item in by_id.items():
         if session_format.detect_session_format(session_dir, sid) is None:
@@ -654,7 +687,14 @@ def _load_snapshot_in_dir(session_dir: Path, session_id: str) -> dict[str, Any] 
         return _load_v2_payload(session_dir, session_id)
     if fmt == "v1":
         path = session_dir / f"session-{session_id}.json"
-        return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+        # Tolerate a corrupt or concurrently-deleted v1 file (the file can vanish
+        # between the sniff and the read under a concurrent retention prune). The
+        # v2 path already absorbs these internally; mirror that here so a single
+        # bad legacy file never crashes listing or conversation-index rebuild.
+        try:
+            return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            return None
     return None
 
 

@@ -856,3 +856,42 @@ def test_session_tag_export_is_full_snapshot_under_v2(tmp_path: Path, monkeypatc
     payload = json.loads(dest.read_text())
     assert payload["session_id"] == "t1"
     assert payload["messages"][0]["content"][0]["text"] == "hello"  # full snapshot, not a pointer
+
+
+def test_v2_save_supersedes_legacy_v1_json(tmp_path: Path, monkeypatch):
+    # C.3 / C.7 supersede: a v2 save for an id that still has a legacy
+    # session-<id>.json removes the .json once the v2 write succeeds (reads
+    # already prefer v2), so the CONFLICT state does not linger on disk.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    session_dir = get_project_session_dir(project)
+    (session_dir / "session-sup.json").write_text(
+        json.dumps({"session_id": "sup", "model": "v1", "message_count": 1, "messages": []}),
+        encoding="utf-8",
+    )
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="sup",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="v2 now")])],
+                          usage=UsageSnapshot())
+    assert (session_dir / "session-sup.jsonl").exists()       # v2 transcript written
+    assert not (session_dir / "session-sup.json").exists()    # stale v1 superseded
+    from openharness.services.session_storage import load_session_by_id
+    snap = load_session_by_id(project, "sup")
+    assert snap is not None
+    assert [m["content"][0]["text"] for m in snap["messages"]] == ["v2 now"]
+
+
+def test_list_tolerates_corrupt_legacy_v1_file(tmp_path: Path, monkeypatch):
+    # C-1 robustness: a corrupt legacy session-*.json must NOT crash listing.
+    # The old glob loop caught per-file; routing through the loader core must too.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="good",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="ok")])],
+                          usage=UsageSnapshot())
+    session_dir = get_project_session_dir(project)
+    (session_dir / "session-bad.json").write_text("{ this is not valid json", encoding="utf-8")
+    ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
+    assert "good" in ids        # listing did not crash; the good session surfaces
+    assert "bad" not in ids     # the corrupt file is skipped, not surfaced
