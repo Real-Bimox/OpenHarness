@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import typer
 
-__version__ = "0.1.18"
+__version__ = "0.1.19"
 
 _PREVIEW_STOPWORDS = {
     "a",

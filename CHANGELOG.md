@@ -4,11 +4,11 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
-## [Unreleased]
+## [0.1.19] - 2026-06-13
 
 ### Added
 
-- **Optional health-status HTTP server.** `oh --health-server` (with `--health-server-port`; binds loopback `127.0.0.1` by default) starts a daemon-thread HTTP server exposing `GET /health`, `/health/detailed`, `/api/status`, `/api/system/stats`, and `/v1/capabilities`, reporting the running version and runtime status as JSON. Ships behind the optional `openharness-ai[health-server]` extra (FastAPI + uvicorn). Composable with `--headless`, `--task-worker`, and `--mcp-serve`; rejects incompatible single-shot flags (`-p`, `--dry-run`, `--continue`, `--resume`, `--backend-only`). Merged after v0.1.18; pending a release decision. See `docs/proposals/health-status-http-server.md`.
+- **Optional health-status HTTP server.** `oh --health-server` (with `--health-server-port`; binds loopback `127.0.0.1` by default) starts a daemon-thread HTTP server exposing `GET /health`, `/health/detailed`, `/api/status`, `/api/system/stats`, and `/v1/capabilities`, reporting the running version and runtime status as JSON. Ships behind the optional `openharness-ai[health-server]` extra (FastAPI + uvicorn). Composable with `--headless`, `--task-worker`, and `--mcp-serve`; rejects incompatible single-shot flags (`-p`, `--dry-run`, `--continue`, `--resume`, `--backend-only`). See `docs/proposals/health-status-http-server.md`.
 
 ## [0.1.18] - 2026-06-11
 

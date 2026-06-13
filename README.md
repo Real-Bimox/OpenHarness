@@ -148,7 +148,7 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
-- **2026-06-11** 🩺 **Unreleased** — Optional health/status HTTP server:
+- **2026-06-13** 🩺 **v0.1.19** — Optional health/status HTTP server:
   - Adds an opt-in `openharness-ai[health-server]` extra with FastAPI + plain uvicorn for a local-only JSON health API. The base install remains unchanged.
   - `oh --health-server` serves `GET /health`, `GET /health/detailed`, `GET /api/status`, `GET /api/system/stats`, and `GET /v1/capabilities` on `127.0.0.1`.
   - Long-lived local modes can run it in the background with `oh --headless --health-server`, `oh --task-worker --health-server`, or `oh --mcp-serve --health-server`. Design: [docs/proposals/health-status-http-server.md](docs/proposals/health-status-http-server.md).
