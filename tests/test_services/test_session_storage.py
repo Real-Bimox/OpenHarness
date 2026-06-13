@@ -769,3 +769,66 @@ def test_crash_truncated_transcript_loads_last_complete_history(tmp_path: Path, 
     # The partial line is dropped; the two complete messages survive.
     assert [m["content"][0]["text"] for m in snap["messages"]] == ["a", "b"]
     assert snap["message_count"] == 2
+
+
+def test_legacy_v1_full_latest_still_loads(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    session_dir = get_project_session_dir(project)
+    (session_dir / "latest.json").write_text(
+        json.dumps({
+            "session_id": "legfull", "cwd": str(project), "model": "claude-legacy",
+            "system_prompt": "old system prompt", "summary": "hi", "created_at": 5.0,
+            "message_count": 1, "usage": {"input_tokens": 7, "output_tokens": 8},
+            "tool_metadata": {"permission_mode": "default"},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }),
+        encoding="utf-8",
+    )
+    snap = load_session_snapshot(project)
+    assert snap is not None
+    assert snap["session_id"] == "legfull"
+    assert snap["model"] == "claude-legacy"
+    assert snap["usage"]["output_tokens"] == 8
+    assert snap["messages"][0]["content"][0]["text"] == "hi"
+
+
+def test_legacy_v1_session_file_loads_by_id(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    from openharness.services.session_storage import load_session_by_id
+
+    session_dir = get_project_session_dir(project)
+    (session_dir / "session-legid.json").write_text(
+        json.dumps({"session_id": "legid", "model": "m", "summary": "s", "created_at": 1.0,
+                    "message_count": 1,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "z"}]}]}),
+        encoding="utf-8",
+    )
+    snap = load_session_by_id(project, "legid")
+    assert snap is not None and snap["session_id"] == "legid"
+    assert snap["messages"][0]["content"][0]["text"] == "z"
+
+
+def test_backend_load_shape_unchanged(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    from openharness.services.session_backend import DEFAULT_SESSION_BACKEND
+
+    DEFAULT_SESSION_BACKEND.save_snapshot(
+        cwd=project, model="m", system_prompt="s", session_id="shape",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="q")])],
+        usage=UsageSnapshot(input_tokens=1, output_tokens=1),
+        tool_metadata={"permission_mode": "default"},
+    )
+    loaded = DEFAULT_SESSION_BACKEND.load_latest(project)
+    assert loaded is not None
+    # The public dict shape relied on by build_runtime / cli / app.
+    for key in ("session_id", "model", "messages", "usage", "tool_metadata", "message_count"):
+        assert key in loaded, f"missing key {key}"
+    listed = DEFAULT_SESSION_BACKEND.list_snapshots(project, limit=5)
+    for key in ("session_id", "summary", "message_count", "model", "created_at"):
+        assert key in listed[0], f"missing list key {key}"
