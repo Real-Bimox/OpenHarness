@@ -39,10 +39,10 @@ except ImportError:
     ChatbotMessage = None  # type: ignore[assignment,misc]
 
 
-class NanobotDingTalkHandler(CallbackHandler):
+class DingTalkCallbackHandler(CallbackHandler):
     """
     Standard DingTalk Stream SDK Callback Handler.
-    Parses incoming messages and forwards them to the Nanobot channel.
+    Parses incoming messages and forwards them to the channel.
     """
 
     def __init__(self, channel: "DingTalkChannel"):
@@ -74,7 +74,7 @@ class NanobotDingTalkHandler(CallbackHandler):
 
             logger.info("Received DingTalk message from %s (%s): %s", sender_name, sender_id, content)
 
-            # Forward to Nanobot via _on_message (non-blocking).
+            # Forward to the channel via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
                 self.channel._on_message(content, sender_id, sender_name)
@@ -143,7 +143,7 @@ class DingTalkChannel(BaseChannel):
             self._client = DingTalkStreamClient(credential)
 
             # Register standard handler
-            handler = NanobotDingTalkHandler(self)
+            handler = DingTalkCallbackHandler(self)
             self._client.register_callback_handler(ChatbotMessage.TOPIC, handler)
 
             logger.info("DingTalk bot started with Stream Mode")
@@ -340,7 +340,7 @@ class DingTalkChannel(BaseChannel):
             token,
             chat_id,
             "sampleMarkdown",
-            {"text": content, "title": "Nanobot Reply"},
+            {"text": content, "title": "Reply"},
         )
 
     async def _send_media_ref(self, token: str, chat_id: str, media_ref: str) -> bool:
@@ -425,7 +425,7 @@ class DingTalkChannel(BaseChannel):
             )
 
     async def _on_message(self, content: str, sender_id: str, sender_name: str) -> None:
-        """Handle incoming message (called by NanobotDingTalkHandler).
+        """Handle incoming message (called by DingTalkCallbackHandler).
 
         Delegates to BaseChannel._handle_message() which enforces allow_from
         permission checks before publishing to the bus.
