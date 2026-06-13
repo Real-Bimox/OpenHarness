@@ -53,7 +53,8 @@ def test_detect_session_format_ignores_the_setting(tmp_path: Path, monkeypatch):
     # this is what keeps a v1 session readable when the setting is "v2" and vice versa
     # ("every legacy file readable forever"). A sniffer that consulted the setting fails here.
     import json as _json
-    cfg = tmp_path / "cfg"; cfg.mkdir()
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(cfg))
     # setting=v1, on-disk is v2 (head present) -> must still detect v2
     (cfg / "settings.json").write_text(_json.dumps({"session_storage_format": "v1"}), encoding="utf-8")

@@ -251,7 +251,8 @@ def test_v2_cursor_ignores_head_message_count_even_when_head_present(tmp_path: P
     import openharness.services.session_storage as ss
     from openharness.services.session_format import head_path, load_v2_snapshot
 
-    project = tmp_path / "repo"; project.mkdir()
+    project = tmp_path / "repo"
+    project.mkdir()
 
     def save(texts):
         save_session_snapshot(
@@ -264,9 +265,11 @@ def test_v2_cursor_ignores_head_message_count_even_when_head_present(tmp_path: P
     session_dir = get_project_session_dir(project)
     # Head present but LYING: message_count=0. Clear the in-process cache to force a cold re-seed.
     hp = head_path(session_dir, "s2")
-    head = _json.loads(hp.read_text(encoding="utf-8")); head["message_count"] = 0
+    head = _json.loads(hp.read_text(encoding="utf-8"))
+    head["message_count"] = 0
     hp.write_text(_json.dumps(head), encoding="utf-8")
-    ss._v2_persisted_count.clear(); ss._v2_persisted_prefix_fp.clear()
+    ss._v2_persisted_count.clear()
+    ss._v2_persisted_prefix_fp.clear()
 
     save(["a", "b", "c"])  # must re-seed the cursor from the transcript (=2), NOT head.message_count (=0)
     assert [m["content"][0]["text"] for m in load_v2_snapshot(session_dir, "s2")] == ["a", "b", "c"]
@@ -308,7 +311,8 @@ def test_v2_save_uses_unlocked_index_core_not_the_locking_wrapper(tmp_path: Path
         return real_core(*a, **k)
     monkeypatch.setattr(ss, "_update_session_index_unlocked", _spy_core)
 
-    project = tmp_path / "repo"; project.mkdir()
+    project = tmp_path / "repo"
+    project.mkdir()
     save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="x",
                           messages=[ConversationMessage(role="user", content=[TextBlock(text="x")])], usage=UsageSnapshot())
     assert wrapper_calls == []          # never the locking wrapper (would self-deadlock under flock)
@@ -498,7 +502,8 @@ def test_backfill_dual_format_same_id_prefers_v2_and_is_idempotent(tmp_path: Pat
 
 def test_list_surfaces_v2_session_absent_from_index(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
-    project = tmp_path / "repo"; project.mkdir()
+    project = tmp_path / "repo"
+    project.mkdir()
     # A: indexed via save. B: v2 head+transcript on disk, NOT in index. C: HEAD-LESS v2 (transcript only).
     save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="A",
                           messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
@@ -531,7 +536,8 @@ def test_backfill_writes_index_exactly_once(tmp_path: Path, monkeypatch):
     import contextlib
     import openharness.services.session_storage as ss
     from openharness.services import session_format
-    project = tmp_path / "repo"; project.mkdir()
+    project = tmp_path / "repo"
+    project.mkdir()
     save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="A",
                           messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
     sdir = get_project_session_dir(project)
@@ -644,8 +650,10 @@ def test_retention_recency_window_protects_recent_from_count_prune(tmp_path: Pat
     # from under it (the P2-004 safety). The other retention tests AGE fixtures *past* the
     # window so pruning fires; this asserts the converse, which a count-only impl would fail.
     monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
-    project = tmp_path / "repo"; project.mkdir()
-    config_dir = tmp_path / "cfg"; config_dir.mkdir()
+    project = tmp_path / "repo"
+    project.mkdir()
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
     (config_dir / "settings.json").write_text(
         '{"session_retention_max_files": 1, "session_retention_max_age_days": 0}', encoding="utf-8")
     monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
@@ -837,7 +845,8 @@ def test_backend_load_shape_unchanged(tmp_path: Path, monkeypatch):
 def test_session_tag_export_is_full_snapshot_under_v2(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
     from openharness.services.session_backend import OpenHarnessSessionBackend
-    project = tmp_path / "repo"; project.mkdir()
+    project = tmp_path / "repo"
+    project.mkdir()
     backend = OpenHarnessSessionBackend()
     backend.save_snapshot(cwd=project, model="m", system_prompt="s",
                           messages=[ConversationMessage(role="user", content=[TextBlock(text="hello")])],

@@ -17,7 +17,6 @@ guaranteed-valid FTS5 expression instead of regex surgery.
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import re

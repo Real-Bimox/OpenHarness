@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from openharness.api.usage import UsageSnapshot
-from openharness.engine.messages import ConversationMessage, TextBlock
+from openharness.engine.messages import ConversationMessage
 
 from ohmo.session_storage import OhmoSessionBackend, get_session_dir, list_snapshots, save_session_snapshot
 from ohmo.workspace import initialize_workspace
