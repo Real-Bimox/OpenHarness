@@ -27,6 +27,104 @@
 
 ---
 
+## v2 Storage Contracts (canonical)
+
+> These are the canonical invariants for v2. Every task body below implements them and cites this section by name; no rule is restated as an independent source. Added in the gate-revision pass to resolve **P1-001, P1-003, P1-004, P1-005, P2-002, P2-003, P2-004, P2-005** (see the Quality Gate section for the finding-by-finding mapping).
+
+### C.1 Durability / fsync policy — canonical [P2-002]
+
+The transcript `session-<id>.jsonl` is the **only durable artifact and the commit point** for a turn. Everything else is derived from it and reconstructible.
+
+- **One fsync per turn.** The append path fsyncs the *final* appended line; the compaction path fsyncs the single full rewrite. Parent-directory fsync (Task 2) makes the create/rename itself durable.
+- **Derived artifacts are rename-only.** `session-<id>.head.json`, the `latest.json` pointer, and `sessions-index.json` are written with `atomic_write_text(..., fsync=False)` — atomic rename, no per-write fsync. A crash loses at most derived metadata, which is rebuilt on the next save (C.4) or tolerated on load (C.6).
+- **ohmo mirrors this policy verbatim.** ohmo's per-session transcript is its durable artifact (one fsync/turn); its head / `latest-<token>.json` pointer / index are rename-only. This single statement is canonical for both apps — Task 15 references it rather than restating it (resolves P2-002: the fsync policy is no longer stated only for openharness).
+
+### C.2 Writer authority & concurrency — canonical [P1-003]
+
+v1 needed no lock because every save was a full **idempotent rewrite**. v2 introduces (a) an *append* (not idempotent without a correct cursor — see C.4) and (b) a *read-modify-write* of the shared index plus a retention *delete*. Per-session artifacts stay single-writer by design; the store-wide artifacts are serialised with the same `exclusive_file_lock` (`utils/file_lock.py`) the rest of the codebase already uses for shared JSON registries (settings, auth, memory, cron, swarm mailbox).
+
+| Artifact | Scope | Writers | Concurrency | Guard |
+|---|---|---|---|---|
+| `session-<id>.jsonl` + `session-<id>.head.json` | one session id | the single process that owns `<id>` | **single-writer by design** — WS1 workers each get a distinct per-task session id; the foreground/interactive process owns its own id | none (per-id ownership). Same-id concurrent writers are **out of contract** — see the WS1↔WS4 note. |
+| `latest.json` pointer | project dir | any saver | multi-writer, last-writer-wins | atomic rename only (the race is benign — "latest" is by definition whoever saved last) |
+| `sessions-index.json` | project dir | every saver (v1 **and** v2), backfill, retention | **multi-writer read-modify-write** | **required:** `exclusive_file_lock(session_dir / ".sessions.lock")` |
+| retention prune (unlinks whole sessions + rewrites the index) | project dir | any saver | multi-writer | the **same** `.sessions.lock` — prune and the index update share one critical section |
+
+**Critical-section rule.** The transcript append + head write + pointer write happen **outside** the lock (per-id, atomic, and the slow fsync must never hold a store-wide lock). The index read-modify-write **and** the retention prune happen **inside one** `with exclusive_file_lock(session_dir / ".sessions.lock"):` block, acquired **once** per save. The index/retention helper *cores* assume the lock is held and never re-acquire it — `flock` is per-open-description, so a second acquisition in the same process would self-deadlock. (Concretely: a lock-free `_update_session_index_unlocked` / `_prune_retention_unlocked` core, with the public entry points or the save path acquiring the lock once around both.) This serialises concurrent savers — e.g. two WS1 workers plus a foreground save — on the only genuinely shared mutable state. Putting the lock on the index resource also closes a latent v1 same-file race for free.
+
+**Schema versioning (hot-reload / mixed-format safety).** `sessions-index.json` already carries `"version": 1`; the v2 head carries the v2 shape (presence of `.head.json` + `.jsonl` *is* the v2 on-disk signal — see C.3). The active format is decided **per save** from `session_storage_format`; a process never changes an id's format mid-write. A session started under v1 and continued under v2 produces the **CONFLICT** state (C.3), resolved by v2-precedence — it is not an undefined concurrent-writer state. Two processes writing *different* ids under different formats is fine (each owns its own files); two processes writing the *same* id is the out-of-contract case above.
+
+**WS1↔WS4 note** (the roadmap's `WS1 ↔ WS4` dependency). The contract holds because a worker and the foreground never share a session id, so their transcripts never collide and only the store-wide index/pointer are contended — which the lock covers. If a future change lets two writers target one session id, that violates this contract and would require a per-session transcript lock; that is explicitly **out of scope** and flagged here so the dependency is visible at merge time.
+
+### C.3 Format & lifecycle state machine — canonical [P1-005]
+
+**(A) On-disk format detection, per id.** `detect_session_format` reads on-disk *shape only* — never the setting (the setting gates writes; Design decision 2). It returns one of:
+
+| State | On disk | Load behavior |
+|---|---|---|
+| `ABSENT` | no session files | new session |
+| `V1` | `session-<id>.json` only | load the full v1 file |
+| `V2` | `.head.json` + `.jsonl`, no `.json` | load head + transcript |
+| `V2_HEADLESS` *(named halt)* | `.jsonl` present, `.head.json` missing/corrupt — the P1-001 crash state | load the transcript directly; head rebuilt on next save. Safe because the cursor comes from the transcript (C.4) |
+| `TRUNCATED_TAIL` *(named halt)* | final transcript line incomplete (crash mid-append) | `read_jsonl_complete_lines` drops the partial line; recover to the last complete record |
+| `CONFLICT` *(named branch — v1+v2 same id)* | both `session-<id>.json` **and** (`.head.json`/`.jsonl`) exist | **precedence: v2 wins** (the `.json` is a pre-migration leftover). A v2 save for an id that has a legacy `.json` removes the `.json` after the v2 write succeeds (supersede); read always prefers v2. Resolved by the migration contract (C.7) |
+
+**(B) Transcript lifecycle, per session.**
+
+```
+EMPTY ──first append──▶ APPENDING(N)
+APPENDING(N) ──turn (append-only)──▶ APPENDING(N+Δ)        cursor = live-record count read from the transcript
+APPENDING(N) ──compaction (len(messages) < N, or any non-append edit)──▶ REWRITING ──▶ APPENDING(M)
+                                                            marker line + post-compaction history; cursor = post-marker count
+APPENDING/any ──retention prune──▶ REMOVED (whole id)       unless protected: active id, latest-pointed id, or within the recency window (C.8)
+```
+
+**Cursor invariant (the spine of correctness).** The append cursor is *always* the transcript's post-last-marker live-record count — **never `head.message_count`**. This one rule makes `APPENDING` crash-safe (`V2_HEADLESS` recovers with no duplication) and removes the head from the correctness path entirely. See C.4 and the Task 8 / P1-001 edit.
+
+### C.4 Save partial-failure matrix — canonical [P1-001]
+
+The v2 save runs these steps. Step 1 (the transcript fsync) is the **commit point**; steps 2–6 write only derived state, so a crash after any of them is recoverable with **no duplication and no loss**:
+
+| # | Step | Durable? | Crash-after state | Recovery |
+|---|---|---|---|---|
+| 1 | Append delta to `.jsonl` (or full rewrite on compaction) | **yes (fsync)** | transcript has the new messages; head/pointer/index not yet updated | next save: cursor read from transcript → correct delta; load: `V2_HEADLESS` reads the transcript |
+| 2 | Rewrite `head.json` | no (rename) | head missing or stale | rebuilt next save (count from transcript); load tolerates a missing head |
+| 3 | Write `latest.json` pointer | no (rename) | pointer stale (points at the prior session) | benign; corrected next save; load fallback (C.6) |
+| 4 | *(under `.sessions.lock`)* update `sessions-index.json` | no (rename) | index missing this id | session still loads by id from the transcript; backfill / next save re-adds it |
+| 5 | *(under `.sessions.lock`)* retention prune | unlink + rename | partial delete | prune is idempotent; re-runs next save |
+| 6 | conversation index (best-effort) | swallowed | — | independent; never blocks a save |
+
+**The cursor fix.** `last_persisted` MUST be derived from the transcript — the count of live records returned by reading the transcript post-last-marker — **not** from `head.message_count`. This is what makes the matrix hold; without it, a lost head (step 2 crash) re-appends already-durable messages → duplicate history on resume. Implemented in Task 8 (P1-001).
+
+### C.5 Compaction-marker record schema — canonical [P2-003]
+
+The compaction marker shares the `.jsonl` line namespace with message records, so it must be **unambiguously typed**. A record is a marker **iff** it has the `__compacted_at__` key **and no `role` key** (message records always carry `role`). `load_v2_snapshot` treats only such records as markers; a message whose *content* merely contains the string `__compacted_at__` (nested inside content blocks) is never mistaken for a marker. Code edit + collision test in Task 7 (P2-003).
+
+### C.6 Read fallback & pointer precedence — canonical [P2-005]
+
+`load_session_snapshot` resolves `latest.json` as:
+
+1. v2 pointer (`{"session_id": x}`) → load session `x` through the C.3 state machine.
+2. legacy full payload (has a `messages` key) → load it directly (legacy path).
+3. pointer present but the target head is missing/corrupt → fall through to the transcript (`V2_HEADLESS`); if the transcript is also absent → return `None`.
+4. pointer target absent **and** a legacy `session-<id>.json` exists for that id → `CONFLICT` precedence (v2 first, then the `.json`).
+
+A missing/corrupt index never blocks a load: `load_session_by_id` sniffs on-disk shape directly, and `list_session_snapshots` falls back to globbing (existing behavior). Tests cover the v2-pointer, legacy-full, and missing-head cases.
+
+### C.7 Index backfill migration contract — canonical [P1-004]
+
+- **Trigger:** lazy and one-time — when the index is absent or missing entries for on-disk sessions (driven from `list_session_snapshots` / load).
+- **Idempotent:** re-running yields the same index. Entries are keyed by `session_id` and re-derived from each session's head (v2) or full file (v1); existing entries are never duplicated.
+- **Partial-state safe:** the whole index is written once, under `.sessions.lock`, via atomic rename — a reader sees either the old or the new index, never a torn one. A crash mid-backfill leaves the old index; the next trigger re-runs.
+- **Dual-format-same-id:** if both a v1 `.json` and a v2 head exist for one id, the entry is derived from the v2 head (v2-wins, per C.3); the stale `.json` is left in place (read prefers v2) and removed on the next v2 save (supersede).
+- **Forward-only:** there is no down-migration. The revert switch (`session_storage_format=v1`) stops new v2 *writes*; existing `.jsonl`/`.head` sessions stay readable because the sniffer is format-agnostic. Backfill never deletes data — retention (C.8) is the only deleter, and it runs separately under the same lock.
+
+### C.8 Retention safety — canonical [P2-004]
+
+Retention runs on save, **inside the `.sessions.lock` critical section** it shares with the index update, oldest-first by `created_at`. It never deletes: the session being saved (active id), the `latest.json`-pointed id, or any session whose transcript `mtime` is within a **recency window** (≥ the worker idle timeout, so a worker actively appending another id is never pruned out from under itself). `0` disables each limit. Because prune holds the lock, it cannot race a concurrent saver's index update or delete a session another saver is mid-append on.
+
+---
+
 ## Phase 0 — Pre-work
 
 ### Task 0: Branch and baseline
