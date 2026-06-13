@@ -1958,6 +1958,8 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 
 **Design decision:** ohmo reuses `session_format` for the transcript/head/pointer primitives but keeps its extra surface: the `app: "ohmo"` and `session_key` fields go into the head; `latest.json` AND `latest-<token>.json` become pointers `{"session_id": ...}`; `load_latest_for_session_key` resolves the token pointer then loads the v2 payload. Gated by the same `session_storage_format` setting (ohmo reads it via `openharness.config.load_settings`, the same source). Legacy ohmo files remain readable via the sniffer. We add an `_load_ohmo_v2_payload` mirroring `_load_v2_payload` but injecting `app`/`session_key` from the head.
 
+**fsync + cursor (mirrors openharness) [P2-002, P1-001]:** ohmo follows **C.1** verbatim — the `.jsonl` transcript is the only durable artifact (one fsync/turn, via the shared `append_messages_to_transcript` / `rewrite_transcript` primitives); the head, the `latest.json` / `latest-<token>.json` pointers, and the index are rename-only (`fsync=False`). This is what resolves P2-002 (the policy is C.1, not restated or silently dropped here). The append cursor comes from the transcript (C.4), **not** `head.message_count`. ohmo's index read-modify-write is serialised by `exclusive_file_lock` like openharness (C.2); ohmo runs no retention sweep, so the index is its only locked store-wide write.
+
 1. - [ ] Write the failing test. Add to `tests/test_ohmo/test_ohmo_session_storage.py`:
    ```python
    def test_ohmo_v2_save_and_load_round_trip(tmp_path: Path):
@@ -2019,6 +2021,11 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 3. - [ ] Write minimal implementation. In `ohmo/session_storage.py`, add to the imports (after `ohmo/session_storage.py:19`):
    ```python
    from openharness.services import session_format
+   from openharness.utils.file_lock import exclusive_file_lock
+   ```
+   Add a module-level in-process append cursor (C.4), mirroring openharness — the crash-correct cursor source that replaces `head.message_count`:
+   ```python
+   _v2_persisted_count: dict[tuple[str, str], int] = {}
    ```
    Replace the body of `save_session_snapshot` from `payload = {` (`ohmo/session_storage.py:115`) through `return latest_path` (`ohmo/session_storage.py:137`) with a v1/v2 router:
    ```python
@@ -2026,9 +2033,14 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 
        fmt = load_settings().session_storage_format
        if fmt == "v2":
+           # Cursor from the durable transcript, not the non-fsync'd head (C.4 / P1-001);
+           # seeded once, maintained in-process (single writer per id — C.2).
            prior_head = session_format.read_head(session_dir, sid)
-           last_persisted = int(prior_head.get("message_count", 0)) if prior_head else 0
            created_at = prior_head.get("created_at", now) if prior_head else now
+           key = (str(session_dir), sid)
+           last_persisted = _v2_persisted_count.get(key)
+           if last_persisted is None:
+               last_persisted = session_format.transcript_live_count(session_dir, sid)
            compacted = last_persisted > len(messages)
            if compacted:
                session_format.rewrite_transcript(session_dir, sid, messages)
@@ -2036,6 +2048,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
                session_format.append_messages_to_transcript(
                    session_dir, sid, messages, last_persisted_count=last_persisted
                )
+           _v2_persisted_count[key] = len(messages)  # transcript durable; maintain cursor (C.4)
            head = {
                "app": "ohmo",
                "session_id": sid,
@@ -2050,15 +2063,20 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
                "message_count": len(messages),
            }
            session_format.write_head(session_dir, sid, head)
+           # Pointer is derived/rename-only per C.1 (the transcript, fsynced once by
+           # the append/rewrite primitives above, is the durable artifact).
            pointer = json.dumps({"session_id": sid}) + "\n"
            latest_path = session_dir / "latest.json"
-           atomic_write_text(latest_path, pointer)
+           atomic_write_text(latest_path, pointer, fsync=False)
            if session_key:
-               atomic_write_text(_session_key_latest_path(workspace, session_key), pointer)
-           _update_session_index(
-               session_dir,
-               _session_index_entry({**head, "messages": []}, session_dir / f"session-{sid}.head.json"),
-           )
+               atomic_write_text(_session_key_latest_path(workspace, session_key), pointer, fsync=False)
+           # Store-wide index read-modify-write under the same lock as openharness
+           # (C.2); ohmo has no retention, so the index is its only locked store write.
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index(
+                   session_dir,
+                   _session_index_entry({**head, "messages": []}, session_dir / f"session-{sid}.head.json"),
+               )
            return latest_path
 
        payload = {
