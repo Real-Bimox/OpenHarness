@@ -63,3 +63,93 @@ Remote proposal branches are managed by status:
 Mechanically, archiving a branch is `git push origin <sha>:refs/heads/archive/proposal/<name>` followed by `git push origin --delete proposal/<name>`. Use the SHA-then-delete order; never delete first.
 
 Local branches are never auto-archived or deleted. Owner manages local branch hygiene at their own discretion.
+
+## 5. Operating memory — the repository is the record
+
+**Machine-local agent memory** (for example a harness's per-user state directory) does not travel between machines and must never be relied upon. This git repository, kept in sync with `origin`, is the only durable memory.
+
+- **Commit-and-push or it didn't happen.** Anything that matters — a decision, a finding, a question parked for later — must be captured in a committed file and pushed to `origin`. Content living only in a chat transcript or an unpushed local copy is not part of the record.
+- **Persist durable findings before seeking approval.** When you produce findings, analysis, a recommendation, or a proposed decision of record, first capture it in the appropriate committed document (`docs/proposals/` for a design in flight, `docs/reports/` for an analysis, the relevant status doc otherwise), commit and push it, and only then walk the owner through it. Do not ask the owner to approve a durable decision that exists only in chat.
+- **Live-answer exception.** Simple factual questions, status checks, and tactical advice are answered directly first; afterward, offer to preserve the exchange (`Document this? Y/N`) and persist it only if the owner agrees.
+- **Sync at session start, and before touching shared state.** Begin every session by syncing (`git pull`) so local `main` matches `origin/main`; reconcile any divergence before starting work. Re-fetch and re-read the current state from `origin` before editing a shared file or integrating work — never act on a stale local copy.
+
+## 6. Delegation — subagents and external agents
+
+**Adherence to these rules is not delegable.** Whenever you dispatch a subagent, spawn a background or external agent, or author a brief for any agent that will work on or assess this repository, you **must** instruct it to read and follow this `AGENTS.md` as its binding operating rules — not merely as background context. At minimum bind it to **§2** (no third-party attribution) and **§12** (halt-to-human conditions), and default it to **read-only**: no commits, pushes, branches, or file changes unless the owner has explicitly authorized them.
+
+## 7. Engineering tenets and the working loop
+
+Standing tenets every change must respect:
+
+- **Quality is invariant; throughput is variable.** Never weaken or skip a verification to go faster.
+- **Trust only what can be observed or computed.** What an agent reports is a hint; ground truth is what a check, test, or build independently confirms. Evidence before assertions, always.
+- **Author ≠ approver.** An agent does not approve or merge its own work; changes are independently reviewed (by the owner or a separate reviewer) before they land on `main`.
+
+The working loop:
+
+- **Substantial changes start as a proposal.** Brainstorm first, then a design document under `docs/proposals/` (see §4 for the proposal/branch lifecycle), then implementation. Each shipped behaviour change traces back to a proposal.
+- **Test-driven and verification-before-completion.** Run the project's real checks — its test suites, linters, and builds — and show the evidence before claiming anything works, is fixed, or is done.
+- **Keep documentation current.** Update affected docs, status, and version references as part of the change, not as a follow-up.
+- **Keep changes small, focused, and traceable.**
+
+## 8. Delivery drive
+
+**Carry the work as close as possible to a delivery-ready, fully tested solution before handing back.** Take the initiative to drive a task through to completion rather than stopping at the first open question. In practice: refine requirements iteratively as understanding improves; use parallel worktree lanes where they speed independent work (§9); integrate through review, never by self-approval (§7, §9); keep documentation, status, and version references current as you go (§7); and commit and push at each meaningful step so progress is durable (§5, §10).
+
+**Stop only for a true owner-gated blocker** — one of the halt-to-human conditions in §12 (secrets, security, legal/attribution, scope expansion, novel or irreversible decisions, no-ground-truth judgment, destructive operations) or a release/tag decision (§13). Exhaust autonomous recovery first; do not pause for choices you are competent to make and that only tighten a safety guarantee (decision altitude, §12).
+
+## 9. Concurrency and writer authority
+
+- **`main` is the integration target and source of truth**, always kept in sync with `origin`. A single agent working alone may commit to `main` directly; whenever more than one agent works concurrently, each works on its own lane branch and a single integrator merges into `main`.
+- **One writer per shared file.** Shared, owner-controlled files (this `AGENTS.md`, design-of-record docs, shared status files) have a single writing lane at a time; a file is never edited by two lanes at once.
+- **Concurrent agents own a branch *and* a worktree.** A branch isolates history; a separate `git worktree` (or clone) isolates the checkout and index. Both are required for concurrent work.
+
+## 10. Sync and safety
+
+Complements the archive mechanics in §4.
+
+- **Push completed work promptly** to its remote — your lane branch on `origin` (concurrent work) or `main` (working alone). Nothing of value stays local-only; only what is pushed to `origin` survives a fresh clone.
+- **The most destructive permitted action on an existing file is archiving it, and only after confirming with the owner.** No force-push, no history rewrite, and no deletion of existing files or branches without explicit owner confirmation.
+- **`origin` is the source of truth, always.** If any circumstance contradicts these rules, ask the owner before proceeding.
+
+## 11. End-of-day checkpoint
+
+At the end of a working day — or when winding down a working session — close out cleanly. Beyond the ongoing commit-and-push discipline (§5, §8, §10), the wind-down must:
+
+- **Record the day's work.** Write a brief end-of-day note — what was done, the decisions taken, and what remains open — as a session/handoff note under `docs/reports/` (following the existing `session-handoff-*.md` convention).
+- **Update the forward view.** Refresh `TODO.md` with the current open items and the next scheduled tasks, and update the roadmap and any status doc the project maintains.
+- **Commit and push.** Commit the closure artifacts locally and push them to `origin` — the owner's GitHub remote (`origin` only, per §1). If the repository has no remote, the local commit stands, but flag the missing remote.
+- **Verify full sync.** End with the working tree clean and local in sync with `origin` — nothing uncommitted, nothing unpushed — and every artifact (the end-of-day note, `TODO.md`, roadmap, status, version references) mutually consistent. `origin` is the source of truth (§10).
+
+This is a checkpoint, not a release: tagging or publishing a version remains owner-gated (§13).
+
+## 12. Halt-to-human conditions
+
+Stop and ask the owner — never guess — before:
+
+- Handling secrets or credentials, or pushing to a protected branch, without explicit authorization.
+- Acting on security findings, or making any license / legal / attribution decision.
+- Expanding scope beyond the agreed mandate or brief.
+- Making a novel or irreversible architecture decision, or any decision with **no ground truth** ("is this design sound?") — escalate rather than guess.
+- Any destructive operation (force-push, history rewrite, branch or file deletion).
+
+**Decision altitude — don't over-escalate.** Escalate the decisions that are genuinely the owner's: risk acceptance, business or legal calls, irreversible or novel architecture, no-ground-truth judgment. Do not make the owner adjudicate implementation detail you are competent to decide and that only *tightens* a safety guarantee — decide it, own the outcome, and surface it for review.
+
+**Phrase owner questions in plain terms.** The owner decides on the basis of product features and their functional or user impact. Frame every question and decision as that plain-language trade-off; translate any underlying technical choice into it rather than asking the owner to adjudicate jargon.
+
+## 13. Release policy
+
+A version is not released until **both** are true:
+
+- a **GitHub Release** exists for the tag (not merely a git tag), with release notes; and
+- **all relevant documentation is in sync** — the `README.md` version reference, `CHANGELOG.md`, the per-version release notes, and any other version references.
+
+Tag and release decisions are owner-only (§12).
+
+## 14. Context-usage reporting
+
+Once a session's context reaches **60% utilisation**, every subsequent message to the owner must end with a final line stating total context usage:
+
+- Format (last line of the message): `Context: NN% used`
+- Applies from the moment 60% is reached, for every message thereafter in that session.
+- **Source.** If your agent harness exposes session token usage, read the latest usage and divide by the context window. If no such source is available, say so and give a best estimate (e.g. `Context: ~65% used (estimate)`) rather than omit the line.
