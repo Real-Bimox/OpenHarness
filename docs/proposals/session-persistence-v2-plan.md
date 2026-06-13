@@ -1927,3 +1927,75 @@
 - **`watchdog.track` / `record` diagnostics calls** in the v2 save helper mirror the v1 ones verbatim; if the `watchdog` module's `track` signature has changed since `session_storage.py:152`, copy the current call exactly (it is lifted unmodified from the existing body, so it cannot drift unless the existing code does).
 
 No other open assumptions: the settings-override mechanism (`OPENHARNESS_CONFIG_DIR`), the no-read-back of `system_prompt` on resume, and the public loader dict shapes were all verified against the current code while writing this plan.
+
+---
+
+## Quality Gate (design-quality-gate v3 — Tier T2)
+
+> Ran 2026-06-13. **Tier T2** (storage-format migration · persisted-state shape change · multi-step save lifecycle · one-time backfill · retention deletion · format flag). **Status: NOT CLEARED — 5 open P1, 6 open P2.** Per AGENTS.md §7 this plan must not move DRAFT → APPROVED or be executed until every P1 is resolved and every P2 is resolved or explicitly owner-accepted.
+
+### Q.1 Canonical contract surfaces
+
+| Surface | Canonical? | Mirrors / references | Checked |
+|---|---|---|---|
+| `services/session_format.py` (new: sniffer, transcript primitives, head r/w, hash) | yes | the v2 format authority | [x] |
+| `services/session_storage.py` (save / load / list / retention routing) | yes | obeys `session_format` | [ ] (P1-003 writer authority; P1-005 states) |
+| `utils/fs.py` (atomic write + append + crash-safe read) | yes | — | [x] |
+| `ohmo/session_storage.py` (v2 twin) | no, mirrors `session_format` + §f | P2-002 fsync policy not mirrored | [ ] |
+| `config/settings.py` (format + retention settings) | yes | — | [x] |
+| `latest.json` / `latest-<token>.json` (pointer) | yes | P2-005 conflict / missing-head fallback unspecified | [ ] |
+| `sessions-index.json` (trusted + backfill) | yes | P1-004 migration contract missing | [ ] |
+| Tests (`test_session_format` / `test_session_storage` / `test_ohmo` / `test_fs`) | no, mirror | structural + behavioral; P2-006 proof types unclassified, P1 risks untested | [ ] |
+
+### Q.2 State / Handoff Invariants
+
+- [ ] Every entry shape has one parser + one dispatch behavior — **P2-003** (compaction marker shares the message namespace; a message containing `__compacted_at__` wipes history).
+- [ ] Every writer has an explicit allowlist — **P1-003** (no writer-authority / concurrency contract for the now-non-idempotent v2 writes; interacts with WS1 persistent workers).
+- [ ] Every multi-step handoff defines partial-failure behavior — **P1-001** (5-step save has no partial-failure matrix; lost-head crash → duplicate messages).
+- [ ] Every durable artifact has ownership, collision, recovery, deletion/supersede semantics — **P2-004** (retention can delete a session a concurrent process is appending).
+- [ ] Every repeated rule names its canonical source — **F-001 / P2** (v2 save algorithm duplicated across Task 8 and Task 15; compaction trigger restated 3×).
+
+### Q.3 Quality Checklist
+
+- [x] Touched surfaces listed (File Structure table) — *add read/write + conditional columns*
+- [ ] Canonical source for each rule declared — duplication across Task 8 / 15
+- [ ] Change type classified (additive / breaking / migration) — implicit only
+- [ ] Copyable prescriptions contain no known-bad text — **P3-002** (Task 8 known-wrong temporary clause)
+- [ ] Claim-to-evidence traceability table — mapping table exists but lacks required-behavior / proof-type / coverage columns
+- [ ] Proof type classified for every test — **P2-006**
+- [ ] Writer authority table — **P1-003** (missing)
+- [ ] Read/write fallback defined — **P2-005** (pointer conflict / missing-head unspecified)
+- [ ] Tests map to all P1/P2 risks — **P2-006** (P1-001, P1-003 untested)
+- [N/A — plan adds no CI job, workflow, or merge gate] CI classified signal-only vs merge-blocking
+- [ ] Hot-reload safety proven or schema bump declared — **P1-003** (no format-version field; concurrent v1/v2 writers undefined)
+- [ ] State machine included — **P1-005** (no enumeration; conflicting v1+v2 state unnamed)
+- [ ] Partial-failure matrix included — **P1-001** (absent)
+- [ ] Migration contract included — **P1-004** (backfill has no idempotency / partial-state / rollback)
+
+### Q.4 Review Findings
+
+| ID | Severity | Location | Finding | Status | Resolution / Evidence |
+|---|---|---|---|---|---|
+| P1-001 | P1 | Task 8 / Task 6 | Lost-head crash window → duplicate messages on resume (append cursor read from the non-fsync'd head, written after the fsync'd transcript) | open | Derive the cursor from the transcript itself (count post-marker complete lines), not `head.message_count`; add a behavioral lost-head test |
+| P1-002 | P1 | whole doc | No embedded gate section at T2 | **resolved** | This Quality Gate section |
+| P1-003 | P1 | Q.2 / writer authority | No writer-authority / concurrency contract for non-idempotent v2 writes (interacts with WS1) | open | Add a writer-authority table + single-writer lock (`exclusive_file_lock`) or cite the runtime guarantee |
+| P1-004 | P1 | Task 10 backfill | No migration contract (idempotency / partial-state / dual-format-same-id conflict / rollback) | open | Add the migration-contract block + dual-format precedence + tests |
+| P1-005 | P1 | decision 3 / Task 7 | No state machine (format detection incl. conflicting v1+v2; transcript append/compaction/prune lifecycle) | open | Add a state enumeration with named halt / conflict branches |
+| P2-001 | P2 | Task 9 / sub-item g | "Single-pass resume" claim is a no-op vs current code; the real double round-trip is the storage↔runtime boundary | open | Reword to `documents only`, or actually remove the cross-boundary re-validation |
+| P2-002 | P2 | ohmo Task 15 | ohmo v2 silently drops v1's fsync; policy stated only for openharness | open | State the fsync policy canonically; ohmo mirrors it |
+| P2-003 | P2 | Task 7 `load_v2_snapshot` | Compaction marker shares the record namespace → a message with `__compacted_at__` wipes history | open | Reserved sentinel or sidecar marker; add a collision test |
+| P2-004 | P2 | Task 11 prune | Retention can delete a session a concurrent process is appending | open | Gate behind the writer lock; protect recently-active sessions |
+| P2-005 | P2 | Task 9 / decision 6 | Pointer conflict (v2 pointer + legacy full file) and missing-head fallback unspecified | open | Specify precedence + missing-head behavior; test both |
+| P2-006 | P2 | test plan | No proof-type classification; the two P1 risks have no test | open | Classify every proof; add behavioral tests for P1-001 and P1-003 |
+| P3-001 | P3 | line ~1082 | Stale citation `session_storage.py:190` (blank line) — real read-filter is `:220` | open | Correct to `:220` |
+| P3-002 | P3 | Task 8 note | Known-wrong temporary clause in a copyable block (latent `or`/`and` precedence bug) | open | Ship the final `if compacted: rewrite else: append`; move rationale to prose |
+| P3-003 | P3 | Task 3 | Confusing duplicated `lines.pop()` in both branches | open | Collapse to one unconditional pop |
+
+### Q.5 Approval Criteria
+
+- [ ] No open P1 findings. — **5 open** (P1-001, P1-003, P1-004, P1-005; P1-002 resolved)
+- [ ] No open P2 findings unless explicitly accepted by owner. — **6 open**
+- [ ] Tests / verification cover every P1/P2 class found. — **no** (P2-006)
+- [x] Open questions resolved or explicitly deferred. — the plan has no open-questions section; the marked assumptions above are resolved/temporary
+- [ ] All "fully resolves / closes" claims have full source coverage, or reworded. — **partial** (P2-001 overclaim)
+- [ ] Conditional touched surfaces and merge-order deps resolved / deferred. — **note WS1 interaction** (P1-003)
