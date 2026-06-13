@@ -369,12 +369,11 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        if not text:
            return []
        lines = text.split("\n")
-       # split() leaves a trailing "" when the file ends in "\n" (complete);
-       # a non-empty trailing element means the last line was not terminated.
-       if lines and lines[-1] == "":
-           lines.pop()
-       else:
-           lines.pop()  # drop the incomplete trailing line
+       # split() always leaves a final element after the last "\n": "" when the
+       # file ended in "\n" (all records complete), or the unterminated trailing
+       # line (the signature of a crash mid-append). Either way it is not a
+       # complete record, so drop it unconditionally.
+       lines.pop()
        return [line for line in lines if line]
    ```
 4. - [ ] Run, verify pass:
@@ -397,7 +396,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 - Create: `src/openharness/services/session_format.py`
 - Test: `tests/test_services/test_session_format.py`
 
-**Design decision:** Format is detected from on-disk shape, not a settings flag (so a v1 file is still read correctly even when the setting is `v2`, and vice versa). Rule: a `latest.json` whose only meaningful key is `session_id` (no `messages` and no `model`) is a **v2 pointer**; the presence of a sibling `session-<id>.head.json` for an id marks that id as **v2**; everything else is **v1** (legacy full-format). The function operates on a parsed dict for `latest.json` and on a session dir + id for per-session detection.
+**Design decision:** Format is detected from on-disk shape, not a settings flag (so a v1 file is still read correctly even when the setting is `v2`, and vice versa — Design decision 2). Per **C.3**: a `latest.json` whose only meaningful key is `session_id` (no `messages`, no `model`) is a **v2 pointer**; for a session id, a `session-<id>.head.json` *or* a `session-<id>.jsonl` transcript marks it **v2** — this covers **V2_HEADLESS** (transcript present, head lost in a crash) and makes **v2 win** a v1+v2 **CONFLICT** (both a legacy `.json` and v2 files exist); only a lone `session-<id>.json` is **v1**. The function operates on a parsed dict for `latest.json` and on a session dir + id for per-session detection.
 
 1. - [ ] Write the failing test. Create `tests/test_services/test_session_format.py`:
    ```python
@@ -434,6 +433,19 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 
    def test_detect_session_format_missing_is_none(tmp_path: Path):
        assert detect_session_format(tmp_path, "ghost") is None
+
+
+   def test_detect_session_format_headless_transcript_is_v2(tmp_path: Path):
+       # V2_HEADLESS (C.3): transcript present, head lost in a crash -> still v2.
+       (tmp_path / "session-abc.jsonl").write_text("", encoding="utf-8")
+       assert detect_session_format(tmp_path, "abc") == "v2"
+
+
+   def test_detect_session_format_v1_v2_conflict_prefers_v2(tmp_path: Path):
+       # CONFLICT (C.3): a legacy .json and v2 files coexist -> v2 wins.
+       (tmp_path / "session-abc.json").write_text("{}", encoding="utf-8")
+       (tmp_path / "session-abc.head.json").write_text("{}", encoding="utf-8")
+       assert detect_session_format(tmp_path, "abc") == "v2"
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -479,11 +491,15 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 
 
    def detect_session_format(session_dir: Path, session_id: str) -> str | None:
-       """Classify a stored session by id, or ``None`` when neither file exists.
+       """Classify a stored session by id, or ``None`` when no files exist.
 
-       A ``session-<id>.head.json`` marks v2; a lone ``session-<id>.json`` is v1.
+       A ``session-<id>.head.json`` OR a ``session-<id>.jsonl`` transcript marks
+       v2 — this covers V2_HEADLESS (transcript present, head lost) and makes v2
+       win a v1+v2 CONFLICT (C.3). Only a lone ``session-<id>.json`` is v1.
        """
-       if (session_dir / f"session-{session_id}.head.json").exists():
+       head = (session_dir / f"session-{session_id}.head.json").exists()
+       transcript = (session_dir / f"session-{session_id}.jsonl").exists()
+       if head or transcript:
            return "v2"
        if (session_dir / f"session-{session_id}.json").exists():
            return "v1"
@@ -493,7 +509,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 6 passed.
+   Expected: 8 passed.
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add session format sniffer"
@@ -548,7 +564,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 8 passed.
+   Expected: 10 passed.
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add system_prompt_fingerprint helper for v2 heads"
@@ -635,7 +651,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 10 passed.
+   Expected: 12 passed.
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add v2 head read/write primitives"
@@ -830,7 +846,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 15 passed (adds the P2-003 dispatch test and the `transcript_live_count` test).
+   Expected: 17 passed (Task 4 adds the V2_HEADLESS + CONFLICT detection tests; Task 7 adds the P2-003 dispatch and `transcript_live_count` tests).
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add v2 transcript append, load, and compaction rewrite"
@@ -1166,7 +1182,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 - Modify: `src/openharness/services/session_storage.py` (`_sanitize_snapshot_payload` `session_storage.py:191-201`, `load_session_snapshot` `session_storage.py:204-209`, `load_session_by_id` `session_storage.py:297-310`; new `_load_v2_payload`)
 - Test: `tests/test_services/test_session_storage.py`
 
-**Design decision (single-pass resume — sub-item g):** the current `_sanitize_snapshot_payload` does validate → dump → re-validate (`session_storage.py:196-199`); messages are dumped back to dicts after sanitizing. We keep the *public shape* (messages as list-of-dicts) but drop the wasteful second dump by sanitizing once and reusing the already-`model_dump`ed list. Functionally identical output, half the pydantic work.
+**Design decision (resume load — sub-item g) [P2-001]:** This is a **documents-only / readability** change, not a speed-up. `_sanitize_snapshot_payload` stays a single validate→sanitize→dump pass and gains a clean v2 reassembly path. The earlier draft's "drop the wasteful second dump / half the pydantic work" claim was **inaccurate** — the current code (`session_storage.py:191-201`) already does exactly one `model_validate` and one `model_dump`, so the proposed restructure is operationally identical (verified against the source). The genuine resume redundancy is at the **storage↔runtime boundary**: storage dumps messages to dicts to preserve the public shape, then `build_runtime` re-validates those dicts into `ConversationMessage` objects on resume. Removing that round-trip would change the public loader shape (objects, not dicts) and is **explicitly deferred** — it is a one-time cost paid once at session start, and the refactor's regression risk is disproportionate to the gain (right-size / YAGNI). Revisit only if resume latency is ever a *measured* problem.
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_storage.py`:
    ```python
@@ -1215,6 +1231,29 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        snap = load_session_by_id(project, "byid")
        assert snap is not None and snap["session_id"] == "byid"
        assert snap["messages"][0]["content"][0]["text"] == "x"
+
+
+   def test_v2_load_via_pointer_recovers_when_head_missing(tmp_path: Path, monkeypatch):
+       # P2-005 / V2_HEADLESS (C.6): the head was lost in a crash but the transcript
+       # is durable — resume must still recover the history off the transcript.
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       import openharness.services.session_storage as ss
+       from openharness.services.session_format import head_path
+
+       project = tmp_path / "repo"
+       project.mkdir()
+       save_session_snapshot(
+           cwd=project, model="claude-test", system_prompt="s", session_id="hl",
+           messages=[ConversationMessage(role="user", content=[TextBlock(text="kept")])],
+           usage=UsageSnapshot(),
+       )
+       session_dir = get_project_session_dir(project)
+       head_path(session_dir, "hl").unlink()  # simulate the lost-head crash window
+       ss._v2_persisted_count.clear()
+
+       snap = load_session_snapshot(project)  # resolves the latest.json pointer
+       assert snap is not None
+       assert [m["content"][0]["text"] for m in snap["messages"]] == ["kept"]
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -1240,12 +1279,20 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
    Add a v2 payload assembler after `_sanitize_snapshot_payload`:
    ```python
    def _load_v2_payload(session_dir: Path, session_id: str) -> dict[str, Any] | None:
-       """Reassemble a v1-shaped snapshot dict from a v2 head + transcript."""
+       """Reassemble a v1-shaped snapshot dict from a v2 head + transcript.
+
+       Handles V2_HEADLESS (C.3 / C.6): if the head was lost in a crash but the
+       transcript is durable, resume still works off the transcript and the head
+       is rebuilt on the next save. Returns None only when BOTH are absent.
+       """
        head = session_format.read_head(session_dir, session_id)
-       if head is None:
-           return None
        raw_messages = session_format.load_v2_snapshot(session_dir, session_id)
-       payload = dict(head)
+       if head is None and not raw_messages:
+           return None
+       payload = dict(head) if head is not None else {
+           "session_id": session_id,
+           "message_count": len(raw_messages),
+       }
        payload["messages"] = raw_messages
        # system_prompt is rebuilt by build_runtime; loaders never read it back.
        payload.setdefault("system_prompt", "")
@@ -1301,7 +1348,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 - Modify: `src/openharness/services/session_storage.py` (`list_session_snapshots` `session_storage.py:212-294`; `_write_session_index` `session_storage.py:92-98` for stale compaction; new `_backfill_index`)
 - Test: `tests/test_services/test_session_storage.py`
 
-**Design decision (sub-item d):** when the index file exists, `list_session_snapshots` returns its entries (filtered to those whose backing file still exists) regardless of count — dropping the `len(sessions) >= limit` gate at `session_storage.py:234`. When the index does *not* exist, a one-time backfill scans both `session-*.json` (v1) and `session-*.head.json` (v2) files, builds the index, and writes it once; subsequent lists are index-only. Stale entries (backing file gone) are compacted out at the *next save's* `_write_session_index` (they are currently filtered on read but never removed, `session_storage.py:190`/`220`). `latest.json` is no longer scanned as a pseudo-session under v2 (it is a pointer); the legacy `latest.json` fallback is kept only when the index is empty AND it is a v1 full payload.
+**Design decision (sub-item d):** when the index file exists, `list_session_snapshots` returns its entries (filtered to those whose backing file still exists) regardless of count — dropping the `len(sessions) >= limit` gate at `session_storage.py:234`. When the index does *not* exist, a one-time backfill scans both `session-*.json` (v1) and `session-*.head.json` (v2) files, builds the index, and writes it once; subsequent lists are index-only. Stale entries (backing file gone) are compacted out at the *next save's* `_write_session_index` (they are currently filtered on read but never removed, `session_storage.py:220`). `latest.json` is no longer scanned as a pseudo-session under v2 (it is a pointer); the legacy `latest.json` fallback is kept only when the index is empty AND it is a v1 full payload.
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_storage.py`:
    ```python
