@@ -2338,7 +2338,7 @@ No other open assumptions: the settings-override mechanism (`OPENHARNESS_CONFIG_
 ## Quality Gate (design-quality-gate v3 — Tier T2)
 
 > **Tier T2** (storage-format migration · persisted-state shape change · multi-step save lifecycle · one-time backfill · retention deletion · format flag).
-> First run 2026-06-13 — NOT CLEARED (5 P1, 6 P2). **Re-run 2026-06-13 after the revision pass. Status: CLEARED — 0 open P1, 0 open P2, 0 unaccepted findings.** Every P1 is resolved in the design (canonical contracts C.1–C.8 plus the task-body fixes that cite them); every P2 is resolved (none merely accepted); the two items the first run flagged as owner-decisions were resolved by following existing codebase convention (`exclusive_file_lock`) and right-sizing (P2-001 documents-only). **Per AGENTS.md §7 the plan may now move DRAFT → APPROVED; execution (implementation) remains owner-gated.** This is a *design* gate: the tests below are *specified* as TDD steps and are executed when the plan is implemented, not as part of the gate.
+> First run 2026-06-13 — NOT CLEARED (5 P1, 6 P2). Revision pass + author self-re-run resolved all 14 original findings (C.1–C.8 contracts + task-body fixes). **Independent adversarial re-review 2026-06-13 (fresh agent): NOT CLEARED.** The original 14 are genuinely resolved, but the re-review found a load-bearing **P1 (R-001)** that the count-shrink compaction trigger misses, plus an ohmo crash-recovery **P2 (R-002)** and two **P3s (R-003/R-004)** — see Q.4.1. **Per AGENTS.md §7 the plan stays DRAFT and must not move to APPROVED or be executed until R-001 is resolved and R-002 resolved or owner-accepted.** This is a *design* gate: the tests below are *specified* as TDD steps and are executed when the plan is implemented, not as part of the gate.
 
 ### Q.1 Canonical contract surfaces
 
@@ -2414,13 +2414,22 @@ No other open assumptions: the settings-override mechanism (`OPENHARNESS_CONFIG_
 | P3-003 | P3 | **resolved** | Single unconditional `lines.pop()`. |
 | P3-004 | P3 | **accepted** | The in-process `_v2_persisted_count` cache grows with sessions a process saves; entries are tiny `(str,str)→int` and bounded per process (per-task ids), so the footprint is negligible — accepted, not fixed. (New; introduced by the P1-001 fix.) |
 
+### Q.4.1 Independent re-review findings (2026-06-13, fresh agent)
+
+| ID | Sev | Location | Finding | Status |
+|---|---|---|---|---|
+| R-001 | **P1** | C.5 / Design decision 3 / `_save_session_snapshot_v2` (+ ohmo) | The compaction trigger `compacted = last_persisted > len(messages)` only detects a count **shrink**. The engine's in-place compactions change message *content* without shrinking the count — `microcompact_messages` clears tool-result bodies in place (same count, `compact/__init__.py:854`) and `try_context_collapse` collapses content (same count). So the save takes the **append** path, `messages[last_persisted:]` is empty, nothing is written, and the durable transcript keeps **stale pre-compaction content** → resume shows stale history and the byte-budget is defeated. The plan's "engine messages are append-only otherwise" assumption is false (verified against the compaction code). **Must fix before APPROVED** — e.g. an explicit `compacted` signal from the runtime (the single writer knows when it compacted), or content-divergence detection; count-shrink alone is insufficient. | **open** |
+| R-002 | P2 | `_load_ohmo_v2_payload`; `_load_v2_payload` V2_HEADLESS payload | (a) ohmo's load returns `None` when the head is missing even if the transcript is durable, so a lost-head crash loses the whole ohmo session — the openharness V2_HEADLESS recovery (C.6) was **not mirrored** to ohmo (contradicts the "twin in lockstep" claim). (b) Even in openharness, the V2_HEADLESS payload reconstructs only `{session_id, message_count, messages}` — no `model`/`usage`/`tool_metadata`, so resume hands `build_runtime` a null model: history recovers, runtime config does not. Mirror the recovery to ohmo and define the head-less config fallback. | open |
+| R-003 | P3 | C.8 / `_prune_sessions_unlocked` | The recency window `max(3600s, idle)` = 1h protects every session touched in the last hour from **both** count and age pruning, so `session_retention_max_files` does not bound count in the common "many short sessions within an hour" case (age-pruning still bounds long-term). Disclose that `max_files` is a soft hint sub-hour, and/or lower the floor toward the worker idle timeout. | open |
+| R-004 | P3 | gate wording / P3-004 | The "0 unaccepted findings / none merely accepted" phrasing over-reads next to the accepted P3-004; and P3-004's "bounded per process" omits a long-lived foreground process that resumes many sessions (the cache never evicts). Tighten wording + add cache eviction or a bounded note. | open |
+
 ### Q.5 Approval Criteria
 
-- [x] No open P1 findings. — **0 open** (5 resolved).
-- [x] No open P2 findings unless explicitly accepted by owner. — **0 open** (6 resolved; none required owner-accept).
-- [x] Tests / verification cover every P1/P2 class found. — Q.3.1; specified as TDD steps, executed at implementation time.
-- [x] Open questions resolved or explicitly deferred. — the two first-run owner-decisions resolved by codebase convention + right-sizing; P2-001's optimization explicitly deferred; P3-004 accepted.
-- [x] All "fully resolves / closes" claims have full source coverage, or reworded. — P2-001 overclaim reworded.
-- [x] Conditional touched surfaces and merge-order deps resolved / deferred. — WS1↔WS4 interaction documented (C.2); ohmo twin updated in lockstep.
+- [ ] No open P1 findings. — **1 open (R-001)**; the original 5 resolved.
+- [ ] No open P2 findings unless explicitly accepted by owner. — **1 open (R-002)**; the original 6 resolved.
+- [x] Tests / verification cover every P1/P2 class found. — original 14 covered (Q.3.1); R-001 and R-002 need their own tests added with the fix.
+- [~] Open questions resolved or explicitly deferred. — original ones resolved/deferred; **R-001's fix approach (explicit compaction signal vs content-divergence) is an open design choice for the next pass.**
+- [ ] All "fully resolves / closes" claims have full source coverage. — the prior self-assessed "CLEARED" was premature (R-001); corrected here.
+- [x] Conditional touched surfaces and merge-order deps resolved / deferred. — WS1↔WS4 documented (C.2); **R-001's likely fix adds a runtime→storage compaction signal (a new touched surface) — to be scoped next pass.**
 
-**Gate verdict: CLEARED.** The plan is eligible to move DRAFT → APPROVED. It must still not be *executed* (implemented) without owner approval; the TDD steps above are the verification to run during implementation.
+**Gate verdict: NOT CLEARED.** The first revision resolved the original 14 findings; the independent re-review found a live P1 (R-001) in the compaction-detection design. Per AGENTS.md §7 the plan stays DRAFT; R-001 must be resolved and R-002 resolved/owner-accepted before DRAFT → APPROVED. **Recommended next pass:** replace the count-shrink compaction trigger with an explicit compaction signal from the runtime (the single writer knows when it compacted), mirror the V2_HEADLESS recovery to ohmo + define the head-less config fallback (R-002), and address R-003/R-004.
