@@ -743,3 +743,29 @@ def test_v2_in_place_compaction_same_count_rewrites_not_stale(tmp_path: Path, mo
     # ...and the transcript was actually rewritten smaller (a buggy no-op append
     # would leave it unchanged at size_before).
     assert transcript.stat().st_size < size_before
+
+
+def test_crash_truncated_transcript_loads_last_complete_history(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    from openharness.services.session_storage import load_session_by_id
+
+    msgs = [
+        ConversationMessage(role="user", content=[TextBlock(text="a")]),
+        ConversationMessage(role="assistant", content=[TextBlock(text="b")]),
+    ]
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="crash",
+                          messages=msgs, usage=UsageSnapshot())
+
+    session_dir = get_project_session_dir(project)
+    transcript = session_dir / "session-crash.jsonl"
+    # Simulate a crash mid-append: tack on a partial third record.
+    with open(transcript, "ab") as fh:
+        fh.write(b'{"role": "user", "content": [{"type": "text", "text": "c"')
+
+    snap = load_session_by_id(project, "crash")
+    assert snap is not None
+    # The partial line is dropped; the two complete messages survive.
+    assert [m["content"][0]["text"] for m in snap["messages"]] == ["a", "b"]
+    assert snap["message_count"] == 2
