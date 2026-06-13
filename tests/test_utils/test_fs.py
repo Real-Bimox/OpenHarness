@@ -211,3 +211,41 @@ def test_atomic_write_no_dir_fsync_when_fsync_false(tmp_path: Path, monkeypatch:
     monkeypatch.setattr("openharness.utils.fs.os.fsync", lambda fd: synced_fds.append(fd))
     atomic_write_text(tmp_path / "out.txt", "payload", fsync=False)
     assert synced_fds == []
+
+
+# ---------------------------------------------------------------------------
+# Append-only JSONL write + crash-safe read
+# ---------------------------------------------------------------------------
+
+
+def test_append_jsonl_line_appends_and_fsyncs(tmp_path: Path, monkeypatch) -> None:
+    from openharness.utils.fs import append_jsonl_line, read_jsonl_complete_lines
+
+    # C.1: the append's fsync is the per-turn COMMIT POINT, not just the write. Instrument
+    # os.fsync so an implementation that writes+flushes but drops fsync() cannot pass — a
+    # data-only assertion (page-cache readable) would not catch the lost durability.
+    synced: list[int] = []
+    monkeypatch.setattr("openharness.utils.fs.os.fsync", lambda fd: synced.append(fd))
+
+    path = tmp_path / "t.jsonl"
+    append_jsonl_line(path, '{"a": 1}', fsync=False)   # no commit requested...
+    assert synced == []                                 # ...so no fsync
+    append_jsonl_line(path, '{"a": 2}', fsync=True)     # the C.1 commit point
+    assert len(synced) >= 1                             # fsync WAS invoked on the fd (durability), not just write+flush
+    assert path.read_text() == '{"a": 1}\n{"a": 2}\n'
+    assert read_jsonl_complete_lines(path) == ['{"a": 1}', '{"a": 2}']
+
+
+def test_read_jsonl_drops_trailing_partial_line(tmp_path: Path) -> None:
+    from openharness.utils.fs import read_jsonl_complete_lines
+
+    path = tmp_path / "t.jsonl"
+    # Simulate a crash mid-append: last line has no terminating newline.
+    path.write_bytes(b'{"a": 1}\n{"a": 2}\n{"a": 3')
+    assert read_jsonl_complete_lines(path) == ['{"a": 1}', '{"a": 2}']
+
+
+def test_read_jsonl_missing_file_is_empty(tmp_path: Path) -> None:
+    from openharness.utils.fs import read_jsonl_complete_lines
+
+    assert read_jsonl_complete_lines(tmp_path / "nope.jsonl") == []

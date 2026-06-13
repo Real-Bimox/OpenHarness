@@ -33,7 +33,13 @@ import stat
 import tempfile
 from pathlib import Path
 
-__all__ = ["atomic_write_bytes", "atomic_write_text", "read_text_tail"]
+__all__ = [
+    "atomic_write_bytes",
+    "atomic_write_text",
+    "read_text_tail",
+    "append_jsonl_line",
+    "read_jsonl_complete_lines",
+]
 
 
 def atomic_write_bytes(
@@ -107,6 +113,58 @@ def read_text_tail(
         size = handle.tell()
         handle.seek(max(0, size - max_bytes), os.SEEK_SET)
         return handle.read(max_bytes).decode(encoding, errors="replace")
+
+
+def append_jsonl_line(
+    path: str | os.PathLike[str],
+    line: str,
+    *,
+    encoding: str = "utf-8",
+    fsync: bool = True,
+) -> None:
+    """Append one newline-terminated line to a JSONL file durably.
+
+    ``line`` must not already contain a trailing newline; exactly one is
+    added. With ``fsync=True`` (default) the file is flushed to stable
+    storage after the write — this is the single per-turn durability point
+    for the v2 transcript. The parent directory is created on first write.
+    """
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    payload = (line + "\n").encode(encoding)
+    with open(dst, "ab") as handle:
+        handle.write(payload)
+        handle.flush()
+        if fsync:
+            os.fsync(handle.fileno())
+
+
+def read_jsonl_complete_lines(
+    path: str | os.PathLike[str],
+    *,
+    encoding: str = "utf-8",
+) -> list[str]:
+    """Return every complete (newline-terminated) line of a JSONL file.
+
+    A line is "complete" only when it ends in ``\\n``. A trailing partial
+    line — the signature of a crash mid-append — is dropped, so callers
+    recover to the last fully-written record. A missing file yields ``[]``.
+    """
+    src = Path(path)
+    try:
+        raw = src.read_bytes()
+    except FileNotFoundError:
+        return []
+    text = raw.decode(encoding, errors="replace")
+    if not text:
+        return []
+    lines = text.split("\n")
+    # split() always leaves a final element after the last "\n": "" when the
+    # file ended in "\n" (all records complete), or the unterminated trailing
+    # line (the signature of a crash mid-append). Either way it is not a
+    # complete record, so drop it unconditionally.
+    lines.pop()
+    return [line for line in lines if line]
 
 
 def _resolve_target_mode(path: Path, explicit_mode: int | None) -> int:
