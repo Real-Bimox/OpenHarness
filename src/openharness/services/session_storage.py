@@ -218,6 +218,90 @@ def _backfill_index(session_dir: Path) -> list[dict[str, Any]]:
     return entries
 
 
+def _delete_session_files(session_dir: Path, session_id: str) -> None:
+    for suffix in (".jsonl", ".head.json", ".json"):
+        candidate = session_dir / f"session-{session_id}{suffix}"
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _transcript_mtime(session_dir: Path, session_id: str) -> float:
+    """Newest mtime across a session's files (0.0 if none exist)."""
+    newest = 0.0
+    for suffix in (".jsonl", ".head.json", ".json"):
+        try:
+            newest = max(newest, (session_dir / f"session-{session_id}{suffix}").stat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def _prune_sessions_unlocked(session_dir: Path, *, active_id: str, settings: Any) -> None:
+    """Prune oldest/aged-out sessions. Lock-free core — the caller holds
+    ``session_dir / ".sessions.lock"`` (C.2). Never deletes the active id, the
+    latest-pointed id, or a session modified within the recency window (C.8)."""
+    max_files = int(getattr(settings, "session_retention_max_files", 0) or 0)
+    max_age_days = int(getattr(settings, "session_retention_max_age_days", 0) or 0)
+    if max_files <= 0 and max_age_days <= 0:
+        return
+
+    protected = {active_id}
+    latest_path = session_dir / "latest.json"
+    if latest_path.exists():
+        try:
+            raw = json.loads(latest_path.read_text(encoding="utf-8"))
+            pointed = str(raw.get("session_id") or "")
+            if pointed:
+                protected.add(pointed)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    entries = sorted(
+        _load_session_index(session_dir),
+        key=lambda item: item.get("created_at", 0),
+        reverse=True,
+    )
+    to_delete: list[str] = []
+    cutoff = time.time() - max_age_days * 86400 if max_age_days > 0 else None
+    idle = float(getattr(settings, "task_worker_idle_timeout_s", 600) or 600)
+    # R-003: the window only needs to cover the *concurrent-writer* horizon — a
+    # worker idle longer than its timeout is reaped and won't append again — so
+    # base it on the idle timeout (2x margin for an append near the boundary, 60s
+    # absolute minimum), NOT a fixed hour. The old `max(3600s, idle)` floor meant
+    # max_files could not bound count for any session touched in the last hour.
+    recency_window = max(idle * 2.0, 60.0)
+    recency_floor = time.time() - recency_window
+    kept = 0
+    for entry in entries:
+        sid = str(entry.get("session_id") or "")
+        # C.8: never prune the active/latest id, nor a session whose files were
+        # touched within the recency window (a concurrent worker may be appending).
+        if sid in protected or _transcript_mtime(session_dir, sid) > recency_floor:
+            kept += 1
+            continue
+        created = float(entry.get("created_at", 0) or 0)
+        too_old = cutoff is not None and created < cutoff
+        over_count = max_files > 0 and kept >= max_files
+        if too_old or over_count:
+            to_delete.append(sid)
+        else:
+            kept += 1
+    if not to_delete:
+        return
+    for sid in to_delete:
+        _delete_session_files(session_dir, sid)
+    remaining = [
+        entry
+        for entry in entries
+        if str(entry.get("session_id") or "") not in set(to_delete)
+    ]
+    _write_session_index(session_dir, remaining)
+
+
 def save_session_snapshot(
     *,
     cwd: str | Path,
@@ -303,7 +387,14 @@ def _save_session_snapshot_v1(
         atomic_write_text(latest_path, data, fsync=False)
         session_path = session_dir / f"session-{sid}.json"
         atomic_write_text(session_path, data, fsync=False)
-        _update_session_index(session_dir, _session_index_entry(payload, session_path))
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            _update_session_index_unlocked(session_dir, _session_index_entry(payload, session_path))
+            try:  # retention is best-effort and must never break a save
+                from openharness.config import load_settings
+
+                _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+            except Exception:
+                pass
         _update_conversation_index(payload)
 
     from openharness.diagnostics import record
@@ -407,7 +498,12 @@ def _save_session_snapshot_v2(
                 session_dir,
                 _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"),
             )
-            # Task 11 inserts the retention prune here, inside this same lock.
+            try:  # retention is best-effort and must never break a save
+                from openharness.config import load_settings
+
+                _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+            except Exception:
+                pass
         _update_conversation_index({**head, "messages": [m.model_dump(mode="json") for m in messages]})
 
     from openharness.diagnostics import record

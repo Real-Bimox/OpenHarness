@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time as _time
 from pathlib import Path
 
 from openharness.api.usage import UsageSnapshot
@@ -563,3 +564,98 @@ def test_backfill_writes_index_exactly_once(tmp_path: Path, monkeypatch):
     assert lock_paths == [sdir / ".sessions.lock"]  # and only ONE store-lock acquisition
     assert write_lock_states == [True] # and that write happened WHILE .sessions.lock was held
     assert {"A", "B", "C"} <= writes[0]  # ...persisting both missing entries together (atomic)
+
+
+def test_retention_prunes_oldest_keeps_active_and_latest(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text('{"session_retention_max_files": 2, "session_retention_max_age_days": 0}', encoding="utf-8")
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+
+    import os
+    for i in range(3):  # s0, s1, s2 — the older sessions
+        save_session_snapshot(
+            cwd=project, model="m", system_prompt="s", session_id=f"s{i}",
+            messages=[ConversationMessage(role="user", content=[TextBlock(text=f"m{i}")])],
+            usage=UsageSnapshot(),
+        )
+        _time.sleep(0.01)  # distinct created_at ordering
+    # Age them past the recency window so count-pruning can reclaim them (C.8);
+    # without this they would be recency-protected as possibly-active.
+    session_dir = get_project_session_dir(project)
+    old = _time.time() - 7 * 86400
+    for i in range(3):
+        for suffix in (".jsonl", ".head.json"):
+            os.utime(session_dir / f"session-s{i}{suffix}", (old, old))
+    # The active save (s3) triggers the prune; max_files=2 keeps s3 + the newest aged.
+    save_session_snapshot(
+        cwd=project, model="m", system_prompt="s", session_id="s3",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="m3")])],
+        usage=UsageSnapshot(),
+    )
+
+    ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
+    # max_files=2 keeps the two newest; the active save (s3) is always kept.
+    assert "s3" in ids
+    assert len(ids) == 2
+    assert "s0" not in ids
+
+
+def test_retention_age_prunes_old_sessions(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text('{"session_retention_max_files": 0, "session_retention_max_age_days": 1}', encoding="utf-8")
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+
+    import os
+    session_dir = get_project_session_dir(project)
+    # Inject an ancient v1 session directly into the index.
+    (session_dir / "session-ancient.json").write_text(
+        json.dumps({"session_id": "ancient", "summary": "old", "message_count": 1,
+                    "model": "m", "created_at": 1.0, "messages": []}),
+        encoding="utf-8",
+    )
+    # Age its mtime too, so it falls outside the recency window (C.8) and the
+    # age limit can reclaim it (a fresh file would be recency-protected).
+    old = _time.time() - 5 * 86400
+    os.utime(session_dir / "session-ancient.json", (old, old))
+    from openharness.services.session_storage import _update_session_index, _session_index_entry
+    _update_session_index(session_dir, _session_index_entry(
+        {"session_id": "ancient", "summary": "old", "message_count": 1, "model": "m", "created_at": 1.0},
+        session_dir / "session-ancient.json"))
+
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="fresh",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="new")])],
+                          usage=UsageSnapshot())
+    ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
+    assert "ancient" not in ids
+    assert "fresh" in ids
+
+
+def test_retention_recency_window_protects_recent_from_count_prune(tmp_path: Path, monkeypatch):
+    # C.8 MECHANISM: a session within the recency window is NEVER count-pruned, even when
+    # over max_files — so a concurrent worker mid-append on another id is never pruned out
+    # from under it (the P2-004 safety). The other retention tests AGE fixtures *past* the
+    # window so pruning fires; this asserts the converse, which a count-only impl would fail.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"; project.mkdir()
+    config_dir = tmp_path / "cfg"; config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        '{"session_retention_max_files": 1, "session_retention_max_age_days": 0}', encoding="utf-8")
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="recent",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="r")])], usage=UsageSnapshot())
+    # 'recent' is freshly written (mtime inside the recency window). The active save of 'active'
+    # triggers the prune with max_files=1; both must survive — 'active' (active id) AND 'recent'
+    # (within the recency window) — even though the live count (2) exceeds max_files (1).
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="active",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
+    ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
+    assert {"recent", "active"} <= ids   # a count-only prune (ignoring the recency window) would drop 'recent'
