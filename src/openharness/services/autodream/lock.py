@@ -113,16 +113,29 @@ def list_sessions_touched_since(
     resolved_session_dir = Path(session_dir) if session_dir is not None else get_project_session_dir(cwd)
     session_ids: list[str] = []
     seen: set[str] = set()
-    # The session ID is embedded in the filename; parsing each snapshot just
-    # to re-read it made this periodic scan O(total session bytes).
-    for path in sorted(resolved_session_dir.glob("session-*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+    # The session ID is embedded in the filename; parsing each snapshot just to
+    # re-read it made this periodic scan O(total session bytes). Scan both v2
+    # transcripts (session-<id>.jsonl — the per-turn fsync'd artifact whose mtime
+    # tracks activity) and legacy v1 snapshots (session-<id>.json), skipping the
+    # v2 head files that the .json glob also matches (PMR-004 .head phantom).
+    candidates: list[tuple[float, str]] = []
+    for path in resolved_session_dir.glob("session-*.jsonl"):
         try:
             mtime = path.stat().st_mtime
         except OSError:
             continue
+        candidates.append((mtime, path.stem.removeprefix("session-")))
+    for path in resolved_session_dir.glob("session-*.json"):
+        if path.name.endswith(".head.json"):
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, path.stem.removeprefix("session-")))
+    for mtime, session_id in sorted(candidates, key=lambda item: item[0], reverse=True):
         if mtime <= since_ts:
             continue
-        session_id = path.stem.removeprefix("session-")
         if not session_id:
             continue
         if current_session_id and session_id == current_session_id:

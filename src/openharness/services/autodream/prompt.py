@@ -77,7 +77,7 @@ Use these categories:
 Look for information worth persisting. Sources in rough priority order:
 
 1. Existing memory files that may need updates or contradiction fixes.
-2. Recent session snapshots (`session-*.json`) when you need concrete context.
+2. Recent session transcripts (`session-*.jsonl`, or legacy `session-*.json`) when you need concrete context.
 3. Focused grep/search terms based on recent work; avoid exhaustive transcript reading.
 
 Skip idle chats, failed retry noise, implementation details that only matter for the current turn, and facts that cannot be supported.
