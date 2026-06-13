@@ -1,0 +1,26 @@
+{
+  "skill_name": "design-quality-gate",
+  "evals": [
+    {
+      "id": 0,
+      "name": "t0-trivial-additive",
+      "prompt": "Using the design-quality-gate skill at the given skill path, draft a short pre-implementation design note for this change: add a new OPTIONAL `--verbose` flag to a CLI logger. When set, it emits extra debug lines to stderr. It changes no existing output, no config file, no persisted state, no schema, and no other component reads it. Produce the design note plus whatever the gate requires for a change of this size. Keep it proportional to the risk.",
+      "expected_output": "A short note that classifies the change as low-risk / local / additive and does NOT fabricate inapplicable contract machinery (no invented migration contract, writer-authority table, or state machine). Agility case: should be concise and fast.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "t1-single-contract",
+      "prompt": "Using the design-quality-gate skill at the given skill path, draft a pre-implementation design for this change: add a new field `priority` (integer 1-5, default 3) to the existing task-queue entry JSON schema. The orchestrator writes queue entries; multiple worker processes read them. Older workers that don't know about `priority` must keep working. Produce the design and the gate section the skill requires.",
+      "expected_output": "Design that classifies the change, lists the schema as a touched contract surface, states writer authority (orchestrator writes, workers read), defines read fallback for workers that don't know the field, and embeds the gate section.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "t2-breaking-migration-with-claim",
+      "prompt": "Using the design-quality-gate skill at the given skill path, draft a pre-implementation design for this change: relocate persisted application state from a single `state.json` file to a `db/state/` directory of per-entity files. This requires a one-time migration on boot. The design CLAIMS to close audit finding #12 ('state writes are not crash-safe') and CLAIMS to be hot-reload safe. Produce the full design and the gate section the skill requires.",
+      "expected_output": "Design that: ties the 'closes #12' and 'hot-reload safe' claims to evidence of matching proof type (behavioral, not just structural); includes a partial-failure matrix for the migration; answers the hot-reload divergence questions; defines dirty-worktree / clean-tree behavior for the migration WITHOUT any broad force-restore (no `git checkout -- .`); and embeds the full gate section. Quality case: should force the hard questions.",
+      "files": []
+    }
+  ]
+}

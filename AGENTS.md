@@ -88,6 +88,7 @@ Standing tenets every change must respect:
 The working loop:
 
 - **Substantial changes start as a proposal.** Brainstorm first, then a design document under `docs/proposals/` (see §4 for the proposal/branch lifecycle), then implementation. Each shipped behaviour change traces back to a proposal.
+- **Design-quality-gate review (proposals & specs).** Draft and review every proposal/spec with the [Design Quality Gate](skills/design-quality-gate/SKILL.md) skill — triage to its tier, embed the gate section (copy [`skills/design-quality-gate/assets/quality-gate-template.md`](skills/design-quality-gate/assets/quality-gate-template.md)), and clear it (no open **P1**; no unaccepted **P2**) before a proposal moves DRAFT → APPROVED (§4). The optional, dependency-free [`gate-lint.py`](skills/design-quality-gate/scripts/gate-lint.py) clears the mechanical checks. Skill catalogue: [`skills/README.md`](skills/README.md).
 - **Test-driven and verification-before-completion.** Run the project's real checks — its test suites, linters, and builds — and show the evidence before claiming anything works, is fixed, or is done.
 - **Keep documentation current.** Update affected docs, status, and version references as part of the change, not as a follow-up.
 - **Keep changes small, focused, and traceable.**
