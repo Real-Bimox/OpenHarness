@@ -17,12 +17,18 @@ pure functions with no settings access.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from openharness.utils.fs import atomic_write_text
+from openharness.engine.messages import ConversationMessage
+from openharness.utils.fs import (
+    append_jsonl_line,
+    atomic_write_text,
+    read_jsonl_complete_lines,
+)
 
 
 def detect_latest_format(payload: dict[str, Any]) -> str:
@@ -96,3 +102,111 @@ def read_head(session_dir: Path, session_id: str) -> dict[str, Any] | None:
     except (json.JSONDecodeError, OSError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+_COMPACTION_MARKER = "__compacted_at__"
+
+
+def append_messages_to_transcript(
+    session_dir: Path,
+    session_id: str,
+    messages: list[ConversationMessage],
+    *,
+    last_persisted_count: int,
+) -> None:
+    """Append only the messages past ``last_persisted_count`` (one fsync).
+
+    The whole batch is written as individual lines and the file is fsynced
+    once at the end via the final ``append_jsonl_line`` call — the single
+    per-turn durability point.
+    """
+    session_dir.mkdir(parents=True, exist_ok=True)
+    new_messages = messages[last_persisted_count:]
+    if not new_messages:
+        return
+    path = transcript_path(session_dir, session_id)
+    last = len(new_messages) - 1
+    for index, message in enumerate(new_messages):
+        line = json.dumps(message.model_dump(mode="json"), separators=(",", ":"))
+        append_jsonl_line(path, line, fsync=(index == last))
+
+
+def rewrite_transcript(
+    session_dir: Path,
+    session_id: str,
+    messages: list[ConversationMessage],
+) -> None:
+    """Rewrite the transcript after a compaction.
+
+    Writes a compaction marker line followed by the post-compaction history,
+    atomically replacing the file. Readers keep only records after the last
+    marker, so the loaded history always matches the compacted state.
+    """
+    import time
+
+    lines = [json.dumps({_COMPACTION_MARKER: time.time()}, separators=(",", ":"))]
+    lines.extend(
+        json.dumps(message.model_dump(mode="json"), separators=(",", ":"))
+        for message in messages
+    )
+    atomic_write_text(
+        transcript_path(session_dir, session_id),
+        "\n".join(lines) + "\n",
+        fsync=True,
+    )
+
+
+def load_v2_snapshot(session_dir: Path, session_id: str) -> list[dict[str, Any]]:
+    """Return raw message dicts from a v2 transcript, post-last-compaction.
+
+    Skips marker lines, discards everything up to and including the last
+    marker, and ignores any malformed line. The result feeds the same
+    sanitize/validate path as v1 messages.
+    """
+    records: list[dict[str, Any]] = []
+    for raw in read_jsonl_complete_lines(transcript_path(session_dir, session_id)):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        # Typed dispatch (C.5, P2-003): a record is a compaction marker iff it
+        # carries the marker key AND lacks "role". Message records always have
+        # "role", so a message is never mistaken for a marker.
+        if _COMPACTION_MARKER in obj and "role" not in obj:
+            records.clear()  # drop pre-compaction history
+            continue
+        records.append(obj)
+    return records
+
+
+def transcript_live_count(session_dir: Path, session_id: str) -> int:
+    """Count the live records durable in the transcript (post-last-marker).
+
+    The crash-correct seed for the append cursor (C.4): it reflects what is
+    actually fsync'd in the transcript, independent of the non-durable head.
+    Called once per process per session — the writer then maintains the count
+    in-process (Task 8), so it is not an O(n) per-save read.
+    """
+    return len(load_v2_snapshot(session_dir, session_id))
+
+
+def fingerprint_messages(messages: list[ConversationMessage] | list[dict[str, Any]]) -> str:
+    """Stable content fingerprint of an ordered message history (R-001 / C.5-trigger).
+
+    Detects an in-place compaction that rewrites message *content* without
+    changing the count: two histories fingerprint equal iff their ordered,
+    canonicalized JSON content is identical. Accepts either ConversationMessage
+    objects (the in-memory list) or already-serialized dicts (``load_v2_snapshot``'s
+    output) and canonicalizes both the same way — a message and the dict it was
+    persisted as (``json.loads`` of ``json.dumps(model_dump(mode="json"))``) round-trip
+    to equal ``sort_keys`` JSON, so an in-memory prefix compares equal to the durable
+    prefix it became. Pure; no I/O, no settings.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for message in messages:
+        payload = message.model_dump(mode="json") if hasattr(message, "model_dump") else message
+        digest.update(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        digest.update(b"\x1e")  # record separator: makes the hash order- and boundary-sensitive
+    return digest.hexdigest()

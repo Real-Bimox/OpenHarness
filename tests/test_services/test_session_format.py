@@ -103,3 +103,96 @@ def test_read_head_missing_returns_none(tmp_path: Path):
     from openharness.services.session_format import read_head
 
     assert read_head(tmp_path, "ghost") is None
+
+
+def _msgs(*texts):
+    from openharness.engine.messages import ConversationMessage, TextBlock
+
+    return [ConversationMessage(role="user", content=[TextBlock(text=t)]) for t in texts]
+
+
+def test_append_messages_delta_only(tmp_path: Path):
+    from openharness.services.session_format import (
+        append_messages_to_transcript,
+        load_v2_snapshot,
+    )
+
+    append_messages_to_transcript(tmp_path, "s1", _msgs("a", "b"), last_persisted_count=0)
+    append_messages_to_transcript(tmp_path, "s1", _msgs("a", "b", "c"), last_persisted_count=2)
+    snap = load_v2_snapshot(tmp_path, "s1")
+    assert [m["content"][0]["text"] for m in snap] == ["a", "b", "c"]
+
+
+def test_compaction_rewrites_and_load_keeps_post_marker(tmp_path: Path):
+    from openharness.services.session_format import (
+        append_messages_to_transcript,
+        load_v2_snapshot,
+        rewrite_transcript,
+    )
+
+    append_messages_to_transcript(tmp_path, "s1", _msgs("a", "b", "c"), last_persisted_count=0)
+    # Compaction collapses history to a single summary message.
+    rewrite_transcript(tmp_path, "s1", _msgs("summary"))
+    snap = load_v2_snapshot(tmp_path, "s1")
+    assert [m["content"][0]["text"] for m in snap] == ["summary"]
+
+
+def test_load_v2_recovers_from_truncated_final_line(tmp_path: Path):
+    from openharness.services.session_format import load_v2_snapshot, transcript_path
+
+    # Two complete records then a crash mid-third (no newline).
+    transcript_path(tmp_path, "s1").write_bytes(
+        b'{"role": "user", "content": [{"type": "text", "text": "a"}]}\n'
+        b'{"role": "user", "content": [{"type": "text", "text": "b"}]}\n'
+        b'{"role": "user", "content": [{"type": "text", "text": "c"'
+    )
+    snap = load_v2_snapshot(tmp_path, "s1")
+    assert [m["content"][0]["text"] for m in snap] == ["a", "b"]
+
+
+def test_record_with_marker_key_but_role_is_a_message_not_a_marker(tmp_path: Path):
+    # Typed dispatch (C.5, P2-003): a record carrying both the marker key and a
+    # "role" is a message, not a marker, so it must NOT wipe history. Written as
+    # a raw line to bypass the message schema and exercise the discriminator.
+    from openharness.services.session_format import load_v2_snapshot, transcript_path
+
+    transcript_path(tmp_path, "s1").write_bytes(
+        b'{"role": "user", "content": [{"type": "text", "text": "a"}]}\n'
+        b'{"__compacted_at__": 123, "role": "user", "content": [{"type": "text", "text": "b"}]}\n'
+    )
+    snap = load_v2_snapshot(tmp_path, "s1")
+    assert [m["content"][0]["text"] for m in snap] == ["a", "b"]
+
+
+def test_transcript_live_count_counts_post_marker_records(tmp_path: Path):
+    from openharness.services.session_format import (
+        append_messages_to_transcript,
+        rewrite_transcript,
+        transcript_live_count,
+    )
+
+    assert transcript_live_count(tmp_path, "s1") == 0  # absent transcript
+    append_messages_to_transcript(tmp_path, "s1", _msgs("a", "b"), last_persisted_count=0)
+    assert transcript_live_count(tmp_path, "s1") == 2
+    rewrite_transcript(tmp_path, "s1", _msgs("summary"))  # compaction
+    assert transcript_live_count(tmp_path, "s1") == 1  # only the post-marker record
+
+
+def test_fingerprint_messages_detects_in_place_content_change(tmp_path: Path):
+    # R-001: the signal a count test misses. Same message COUNT, changed content
+    # (an in-place compaction) MUST yield a different fingerprint; and a message
+    # object must fingerprint equal to the dict it was persisted as (the seed path
+    # reads dicts via load_v2_snapshot, the compare path uses live objects).
+    from openharness.services.session_format import (
+        append_messages_to_transcript,
+        fingerprint_messages,
+        load_v2_snapshot,
+    )
+
+    original = _msgs("tool-output-aaaa", "b")
+    cleared_same_count = _msgs("cleared", "b")  # in place: count unchanged, content changed
+    assert len(original) == len(cleared_same_count)
+    assert fingerprint_messages(original) != fingerprint_messages(cleared_same_count)
+    assert fingerprint_messages(original) == fingerprint_messages(original)  # stable
+    append_messages_to_transcript(tmp_path, "s1", original, last_persisted_count=0)
+    assert fingerprint_messages(load_v2_snapshot(tmp_path, "s1")) == fingerprint_messages(original)
