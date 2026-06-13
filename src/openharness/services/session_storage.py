@@ -12,6 +12,8 @@ from uuid import uuid4
 from openharness.api.usage import UsageSnapshot
 from openharness.config.paths import get_sessions_dir
 from openharness.engine.messages import ConversationMessage, sanitize_conversation_messages
+from openharness.services import session_format
+from openharness.utils.file_lock import exclusive_file_lock
 from openharness.utils.fs import atomic_write_text
 
 
@@ -98,7 +100,9 @@ def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> No
     )
 
 
-def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
+def _update_session_index_unlocked(session_dir: Path, entry: dict[str, Any]) -> None:
+    # The read-modify-write core — NO lock; the caller must hold
+    # session_dir / ".sessions.lock".
     session_id = str(entry.get("session_id") or "")
     if not session_id:
         return
@@ -109,6 +113,49 @@ def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
     ]
     entries.append(entry)
     _write_session_index(session_dir, entries)
+
+
+def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
+    # Locking wrapper for callers not already under the store lock (e.g. v1).
+    with exclusive_file_lock(session_dir / ".sessions.lock"):
+        _update_session_index_unlocked(session_dir, entry)
+
+
+# In-process per-session persistence state, keyed by (session_dir, session_id):
+#   _v2_persisted_count     -> count of live records the owning writer has
+#                              persisted (the crash-correct append cursor —
+#                              C.4 / P1-001; seeded from the durable transcript,
+#                              NEVER from the non-durable head).
+#   _v2_persisted_prefix_fp -> content fingerprint of those same persisted live
+#                              records, used to detect an *in-place* compaction
+#                              that rewrites content WITHOUT changing the count
+#                              (C.5-trigger / R-001). Always written together
+#                              with the count, via _v2_remember_persisted.
+# Process-local: a crash discards both and the next process re-seeds from the
+# transcript. Bounded (R-004): a long-lived foreground process that resumes many
+# sessions evicts the oldest entry past _V2_CURSOR_CACHE_MAX; an evicted session
+# simply re-seeds (count + fp) from its transcript on its next save — correct,
+# one extra read.
+_V2_CURSOR_CACHE_MAX = 1024
+_v2_persisted_count: dict[tuple[str, str], int] = {}
+_v2_persisted_prefix_fp: dict[tuple[str, str], str] = {}
+
+
+def _v2_remember_persisted(key: tuple[str, str], count: int, prefix_fp: str) -> None:
+    """Record the durable (count, fingerprint) for a session, bounding the cache.
+
+    Re-inserts the key at the most-recent position (write-LRU) and evicts the
+    oldest entries past the cap; eviction is safe because the next save for an
+    evicted id re-seeds from the transcript (the cold-seed path).
+    """
+    _v2_persisted_count.pop(key, None)
+    _v2_persisted_prefix_fp.pop(key, None)
+    _v2_persisted_count[key] = count
+    _v2_persisted_prefix_fp[key] = prefix_fp
+    while len(_v2_persisted_count) > _V2_CURSOR_CACHE_MAX:
+        oldest = next(iter(_v2_persisted_count))
+        _v2_persisted_count.pop(oldest, None)
+        _v2_persisted_prefix_fp.pop(oldest, None)
 
 
 def save_session_snapshot(
@@ -122,17 +169,59 @@ def save_session_snapshot(
     tool_metadata: dict[str, object] | None = None,
 ) -> Path:
     """Persist a session snapshot. Saves both by ID and as latest."""
+    from openharness.config import load_settings
+
     session_dir = get_project_session_dir(cwd)
     sid = session_id or uuid4().hex[:12]
     now = time.time()
     messages = sanitize_conversation_messages(messages)
-    # Extract a summary from the first user message
     summary = ""
     for msg in messages:
         if msg.role == "user" and msg.text.strip():
             summary = msg.text.strip()[:80]
             break
 
+    fmt = load_settings().session_storage_format
+    if fmt == "v2":
+        return _save_session_snapshot_v2(
+            session_dir=session_dir,
+            sid=sid,
+            cwd=cwd,
+            model=model,
+            system_prompt=system_prompt,
+            messages=messages,
+            usage=usage,
+            tool_metadata=tool_metadata,
+            summary=summary,
+            now=now,
+        )
+    return _save_session_snapshot_v1(
+        session_dir=session_dir,
+        sid=sid,
+        cwd=cwd,
+        model=model,
+        system_prompt=system_prompt,
+        messages=messages,
+        usage=usage,
+        tool_metadata=tool_metadata,
+        summary=summary,
+        now=now,
+    )
+
+
+def _save_session_snapshot_v1(
+    *,
+    session_dir: Path,
+    sid: str,
+    cwd: str | Path,
+    model: str,
+    system_prompt: str,
+    messages: list[ConversationMessage],
+    usage: UsageSnapshot,
+    tool_metadata: dict[str, object] | None,
+    summary: str,
+    now: float,
+) -> Path:
     payload = {
         "session_id": sid,
         "cwd": str(Path(cwd).resolve()),
@@ -150,12 +239,8 @@ def save_session_snapshot(
     from openharness.diagnostics import watchdog
 
     with watchdog.track("snapshot_write", session_id=sid):
-        # Save as latest
         latest_path = session_dir / "latest.json"
-        # Per-line state cache: rename-atomic, no fsync (see atomic_write_bytes).
         atomic_write_text(latest_path, data, fsync=False)
-
-        # Save by session ID
         session_path = session_dir / f"session-{sid}.json"
         atomic_write_text(session_path, data, fsync=False)
         _update_session_index(session_dir, _session_index_entry(payload, session_path))
@@ -170,6 +255,110 @@ def save_session_snapshot(
         duration_ms=(time.time() - now) * 1000.0,
         session_id=sid,
         attrs={"app": "openharness", "size_bytes": len(data), "message_count": len(messages)},
+    )
+    return latest_path
+
+
+def _save_session_snapshot_v2(
+    *,
+    session_dir: Path,
+    sid: str,
+    cwd: str | Path,
+    model: str,
+    system_prompt: str,
+    messages: list[ConversationMessage],
+    usage: UsageSnapshot,
+    tool_metadata: dict[str, object] | None,
+    summary: str,
+    now: float,
+) -> Path:
+    from openharness.diagnostics import watchdog
+
+    prior_head = session_format.read_head(session_dir, sid)
+    created_at = prior_head.get("created_at", now) if prior_head else now
+    # Cursor + fingerprint invariant (C.4 / C.5-trigger): the append cursor is
+    # the count of live records already durable in the transcript — NOT
+    # head.message_count, which is rename-written (no fsync) after the fsync'd
+    # transcript and so can be lost in a crash (P1-001). Alongside it we keep a
+    # content fingerprint of that durable prefix. Both are seeded once from the
+    # transcript (a single load_v2_snapshot read — same I/O the count seed used)
+    # and then maintained in-process (single writer per C.2).
+    key = (str(session_dir), sid)
+    last_persisted = _v2_persisted_count.get(key)
+    persisted_fp = _v2_persisted_prefix_fp.get(key)
+    if last_persisted is None or persisted_fp is None:
+        durable = session_format.load_v2_snapshot(session_dir, sid)
+        last_persisted = len(durable)
+        persisted_fp = session_format.fingerprint_messages(durable)
+    # R-001: count alone is a LOSSY proxy for "was the history compacted". The
+    # engine compacts IN PLACE — microcompact clears old tool-result bodies and
+    # context-collapse shrinks text, both rewriting message *content* while the
+    # count stays the same (verified: compact/__init__.py:854 / :348). A count
+    # test would take the append path and leave stale content on disk. Compare
+    # the durable prefix's content fingerprint instead: the prefix is stale iff
+    # the in-memory prefix no longer matches what we persisted, OR the history
+    # shrank. Either way rewrite the transcript in full (C.5 marker + full
+    # history); otherwise append only the delta (C.3).
+    compacted = (
+        len(messages) < last_persisted
+        or session_format.fingerprint_messages(messages[:last_persisted]) != persisted_fp
+    )
+
+    with watchdog.track("snapshot_write", session_id=sid):
+        if compacted:
+            session_format.rewrite_transcript(session_dir, sid, messages)
+        else:
+            session_format.append_messages_to_transcript(
+                session_dir, sid, messages, last_persisted_count=last_persisted
+            )
+        # Transcript is now durable; record the new live count AND the fingerprint
+        # of the now-persisted history (the whole list, after either path) before
+        # the derived head/pointer/index writes (C.4 matrix). Bounded cache (R-004).
+        _v2_remember_persisted(
+            key, len(messages), session_format.fingerprint_messages(messages)
+        )
+
+        head = {
+            "session_id": sid,
+            "cwd": str(Path(cwd).resolve()),
+            "model": model,
+            "system_prompt_sha256": session_format.system_prompt_fingerprint(system_prompt),
+            "usage": usage.model_dump(),
+            "tool_metadata": _persistable_tool_metadata(tool_metadata),
+            "created_at": created_at,
+            "summary": summary,
+            "message_count": len(messages),
+        }
+        session_format.write_head(session_dir, sid, head)
+
+        latest_path = session_dir / "latest.json"
+        atomic_write_text(
+            latest_path, json.dumps({"session_id": sid}) + "\n", fsync=False
+        )
+
+        index_payload = {**head, "messages": []}
+        # Store-wide critical section (C.2): the index read-modify-write — and,
+        # added in Task 11, the retention prune — run under ONE acquisition of
+        # the store lock. Call the *_unlocked core, never the locking
+        # _update_session_index (flock is per-open-description → a second
+        # acquire in this process self-deadlocks).
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            _update_session_index_unlocked(
+                session_dir,
+                _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"),
+            )
+            # Task 11 inserts the retention prune here, inside this same lock.
+        _update_conversation_index({**head, "messages": [m.model_dump(mode="json") for m in messages]})
+
+    from openharness.diagnostics import record
+
+    record(
+        "storage",
+        "snapshot_save",
+        "completed",
+        duration_ms=(time.time() - now) * 1000.0,
+        session_id=sid,
+        attrs={"app": "openharness", "message_count": len(messages), "format": "v2"},
     )
     return latest_path
 
