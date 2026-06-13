@@ -664,6 +664,14 @@ class Settings(BaseModel):
     # Derived FTS index over saved sessions powering session_search and the
     # search_sessions surfaces. Kill switch only; the index is rebuildable.
     conversation_index_enabled: bool = True
+    # Session persistence on-disk format. "v2" = append-only transcript +
+    # head file + pointer latest.json (default). "v1" = legacy full-history
+    # rewrite. Revert switch only; v1 files are always readable regardless.
+    session_storage_format: str = "v2"
+    # Retention: prune oldest saved sessions on save. Never prunes the active
+    # session or the one latest.json points at. 0 disables the limit.
+    session_retention_max_files: int = 50
+    session_retention_max_age_days: int = 30
     voice_mode: bool = False
     fast_mode: bool = False
     effort: str = "medium"

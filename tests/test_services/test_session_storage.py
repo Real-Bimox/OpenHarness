@@ -145,3 +145,12 @@ def test_load_session_snapshot_sanitizes_legacy_empty_assistant_messages(tmp_pat
     assert snapshot["message_count"] == 2
     assert [message["role"] for message in snapshot["messages"]] == ["user", "assistant"]
     assert snapshot["messages"][1]["content"][0]["text"] == "world"
+
+
+def test_settings_session_storage_defaults():
+    from openharness.config.settings import Settings
+
+    settings = Settings()
+    assert settings.session_storage_format == "v2"
+    assert settings.session_retention_max_files == 50
+    assert settings.session_retention_max_age_days == 30
