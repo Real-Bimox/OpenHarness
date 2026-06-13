@@ -4,12 +4,14 @@
 
 | Field | Value |
 |---|---|
-| Status | DRAFT |
+| Status | IMPLEMENTED |
 | Proposal branch | `proposal/headless-permission-enforcement` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-04 |
 | Doc review | pending |
 | Related | [headless-resume](headless-resume.md) |
+
+> **Implemented.** The headless ask-path is deny-by-default outside `full_auto` / `--dangerously-skip-permissions`; `--allowed-tools` / `--disallowed-tools` are wired through interactive, print, task-worker, and headless modes (no longer dead flags); denials surface as `permission_denied` events and `denied_tools` / `permission_denials` in machine-readable output. See `_noninteractive_permission` in `src/openharness/ui/app.py` and the flag wiring in `src/openharness/cli.py`. Folded into [headless-local-control-api](headless-local-control-api.md).
 
 ## Summary
 

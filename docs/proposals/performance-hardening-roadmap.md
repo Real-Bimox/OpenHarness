@@ -4,12 +4,14 @@
 
 | Field | Value |
 |---|---|
-| Status | DRAFT |
+| Status | PARTIALLY IMPLEMENTED |
 | Proposal branch | `proposal/performance-hardening-roadmap` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-10 |
 | Baseline | `v0.1.12` (`841e3e5`) |
 | Related | [release-architecture-hardening](release-architecture-hardening.md), [headless-local-control-api](headless-local-control-api.md) |
+
+> **Partially implemented.** WS1 (persistent task workers) and WS6 (quick wins) shipped in v0.1.13; WS3 (config/prompt-stability caching) and WS2 (prompt-caching breakpoints) shipped in v0.1.14. **WS4 (append-only session persistence + retention) and WS5 (parallel MCP connect + per-channel dispatchers) are not yet implemented** — verified absent from `services/session_storage.py`, `config/settings.py`, `mcp/client.py`, and `channels/impl/manager.py`. The Sequencing table below is the original plan; the `0.1.15` row did not happen (0.1.15 shipped unrelated features), so WS4/WS5 remain unscheduled.
 
 ## Summary
 

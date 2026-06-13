@@ -27,7 +27,7 @@ uv run oh -p "List files that define the permission system" --output-format stre
 
 ## 3. Skill and plugin playground
 
-OpenHarness can load Markdown skills and Claude-style plugin layouts, which makes it useful for experimentation with custom workflows.
+OpenHarness can load Markdown skills and portable plugin layouts, which makes it useful for experimentation with custom workflows.
 
 Examples:
 

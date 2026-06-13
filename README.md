@@ -6,11 +6,6 @@
   <code>oh</code> — OpenHarness &amp; <code>ohmo</code>
 </h1>
 
-<p align="center">
-  <a href="README.md"><strong>English</strong></a> ·
-  <a href="README.zh-CN.md"><strong>简体中文</strong></a>
-</p>
-
 **OpenHarness** delivers core lightweight agent infrastructure: tool-use, skills, memory, and multi-agent coordination.
 
 **ohmo** is a personal AI agent built on OpenHarness — not another chatbot, but an assistant that actually works for you over long sessions. Chat with ohmo in Feishu / Slack / Telegram / Discord, and it forks branches, writes code, runs tests, and opens PRs on its own using your configured OpenHarness runtime.
@@ -38,7 +33,7 @@
 
 One Command (**oh**) to Launch **OpenHarness** and Unlock All Agent Harnesses. 
 
-Supports CLI agent integration including OpenClaw, nanobot, Cursor, and more.
+Agent-agnostic by design — bring your own provider, models, tools, and skills.
 
 <p align="center">
   <img src="assets/cli-typing.gif" alt="OpenHarness Terminal Demo" width="800">
@@ -533,7 +528,7 @@ oh auth copilot-logout
 |---------|---------|
 | **Auth method** | GitHub OAuth device flow (no API key needed) |
 | **Token management** | Automatic refresh of short-lived session tokens |
-| **Enterprise** | Supports GitHub Enterprise via `--github-domain` flag |
+| **Enterprise** | Supports GitHub Enterprise; the enterprise domain is entered interactively during `oh auth copilot-login` |
 | **Models** | Uses Copilot's default model selection |
 | **API** | OpenAI-compatible chat completions under the hood |
 
@@ -696,15 +691,15 @@ The proxy URL must be HTTP/HTTPS and cannot contain embedded credentials.
 # Manage plugins
 oh plugin list
 oh plugin install <source>
-oh plugin enable <name>
+oh plugin uninstall <name>
 ```
 
 ### 🤝 Ecosystem Workflows
 
-OpenHarness is useful as a lightweight harness layer around Claude-style tooling conventions:
+OpenHarness is a lightweight, agent-agnostic harness layer around Markdown-first tooling conventions:
 
-- **OpenClaw-oriented workflows** can reuse Markdown-first knowledge and command-driven collaboration patterns.
-- **Claude-style plugins and skills** stay portable because OpenHarness keeps those formats familiar.
+- **Markdown-first knowledge and command-driven collaboration** patterns can be reused directly.
+- **Portable plugins and skills** stay portable because OpenHarness keeps those formats familiar and tool-neutral.
 - **Multi-agent work** maps well onto the built-in team, task, and background execution primitives.
 
 For concrete usage ideas instead of generic claims, see [`docs/SHOWCASE.md`](docs/SHOWCASE.md).
@@ -713,11 +708,11 @@ For concrete usage ideas instead of generic claims, see [`docs/SHOWCASE.md`](doc
 
 Multi-level safety with fine-grained control:
 
-| Mode | Behavior | Use Case |
+| Mode (`--permission-mode`) | Behavior | Use Case |
 |------|----------|----------|
-| **Default** | Ask before write/execute | Daily development |
-| **Auto** | Allow everything | Sandboxed environments |
-| **Plan Mode** | Block all writes | Large refactors, review first |
+| **`default`** | Ask before write/execute | Daily development |
+| **`full_auto`** | Auto-approve tool calls (read-only always allowed; built-in sensitive-path protection still enforced) | Sandboxed / unattended environments |
+| **`plan`** | Block all writes | Large refactors, review first |
 
 **Path-level rules** in `settings.json`:
 ```json
@@ -748,13 +743,59 @@ oh [OPTIONS] COMMAND [ARGS]
 
 Session:     -c/--continue, -r/--resume, -n/--name
 Model:       -m/--model, --effort, --max-turns
-Output:      -p/--print, --output-format text|json|stream-json, --headless
-Permissions: --permission-mode, --dangerously-skip-permissions
+Modes:       (default interactive) | -p/--print | --headless | --mcp-serve
+Output:      --output-format text|json|stream-json
+Permissions: --permission-mode default|plan|full_auto, --allowed-tools, --disallowed-tools, --dangerously-skip-permissions
 Context:     -s/--system-prompt, --append-system-prompt, --settings
-Advanced:    -d/--debug, --mcp-config, --bare, --health-server
+Advanced:    -d/--debug, --mcp-config, --bare, --dry-run, --health-server, --health-server-port
 
-Subcommands: oh setup | oh provider | oh auth | oh mcp | oh plugin
+Subcommands: oh setup | oh provider | oh auth | oh mcp | oh plugin | oh config
+             oh sessions | oh fallback | oh skills | oh diagnostics | oh cron | oh autopilot
 ```
+
+### 🧭 Automation, Search & Resilience
+
+Beyond the core agent loop, OpenHarness ships several feature subsystems. Quick overview below — see the full **[CLI / Settings / Tools reference »](docs/REFERENCE.md)** for every command, flag, and setting.
+
+**🔁 Repo Autopilot** — queue work items, scan sources, run the next item, and export a static kanban dashboard.
+```bash
+oh autopilot status          # autopilot state for the current repo
+oh autopilot scan <target>   # pull in new work items
+oh autopilot run-next        # execute the next queued item
+oh autopilot export-dashboard
+```
+
+**⏰ Cron Scheduler** — a local scheduler daemon for recurring jobs (autopilot's `install-cron` registers here).
+```bash
+oh cron start                # start the scheduler daemon
+oh cron list                 # list scheduled jobs
+oh cron history              # recent run history
+```
+
+**🔎 Conversation Search** — zero-cost full-text search over past sessions (SQLite FTS5; `conversation_index_enabled`, default on). Also exposed to the agent as the `session_search` tool.
+```bash
+oh sessions search "permission checker"
+oh sessions list --limit 20
+oh sessions reindex
+```
+
+**🛟 Provider Fallback & Resilience** — declarative failover chains with mid-turn switching and per-provider API-key cooldown pools.
+```bash
+oh fallback list
+oh fallback add <provider> --base-url <url> --api-format openai --api-key-env MY_KEY
+oh fallback clear
+```
+
+**🧠 Skill Learning & Lifecycle** — usage telemetry plus a staged loop that proposes new or improved skills for your approval (`skills.*` settings).
+```bash
+oh skills usage              # active / stale / archived
+oh skills pending            # proposed changes awaiting approval
+oh skills diff <id>          # review a faithful diff
+oh skills approve <id>       # or: oh skills discard <id>
+oh skills curator            # run the periodic curator now
+```
+
+**🎙️ Voice Mode** — speech-to-text input in the terminal UI; enable via the `voice_mode` setting or the `/voice` command.
 
 ### 🧑‍💼 ohmo Personal Agent
 
@@ -897,7 +938,7 @@ OpenHarness is most useful when treated as a small, inspectable harness you can 
 
 - **Repo coding assistant** for reading code, patching files, and running checks locally.
 - **Headless scripting tool** for `json` and `stream-json` output in automation flows.
-- **Plugin and skill testbed** for experimenting with Claude-style extensions.
+- **Plugin and skill testbed** for experimenting with portable, Markdown-first extensions.
 - **Multi-agent prototype harness** for task delegation and background execution.
 - **Provider comparison sandbox** across Anthropic-compatible backends.
 

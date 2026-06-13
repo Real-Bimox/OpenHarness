@@ -4,12 +4,14 @@
 
 | Field | Value |
 |---|---|
-| Status | DRAFT |
+| Status | IMPLEMENTED |
 | Proposal branch | `proposal/headless-resume` |
 | Owner | Bahram Boutorabi |
 | Created | 2026-06-04 |
 | Doc review | pending |
 | Related | [headless-permission-enforcement](headless-permission-enforcement.md) |
+
+> **Implemented.** `-p --resume <id>` / `-p --continue` load the snapshot and run in print mode (no longer forced into the interactive REPL); bare `-p --resume` errors instead of opening a picker; the `session_id` is emitted in `json` and `stream-json` output. See `run_print_mode` in `src/openharness/ui/app.py` and the print-mode resume dispatch in `src/openharness/cli.py`. Folded into [headless-local-control-api](headless-local-control-api.md).
 
 ## Summary
 
