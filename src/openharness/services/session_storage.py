@@ -92,10 +92,19 @@ def _load_session_index(session_dir: Path) -> list[dict[str, Any]]:
 
 
 def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> None:
-    entries = sorted(entries, key=lambda item: item.get("created_at", 0), reverse=True)
+    # Stale-compaction: keep an entry only if its session still exists. Use the
+    # sniffer, not the head-file path, so a V2_HEADLESS session (head lost in a
+    # crash, transcript still present — C.3) is NOT dropped. Caller holds the
+    # store lock (this is part of a read-modify-write).
+    live = [
+        entry
+        for entry in entries
+        if session_format.detect_session_format(session_dir, str(entry.get("session_id") or "")) is not None
+    ]
+    live = sorted(live, key=lambda item: item.get("created_at", 0), reverse=True)
     atomic_write_text(
         _session_index_path(session_dir),
-        json.dumps({"version": 1, "sessions": entries}, indent=2) + "\n",
+        json.dumps({"version": 1, "sessions": live}, indent=2) + "\n",
         fsync=False,
     )
 
@@ -156,6 +165,57 @@ def _v2_remember_persisted(key: tuple[str, str], count: int, prefix_fp: str) -> 
         oldest = next(iter(_v2_persisted_count))
         _v2_persisted_count.pop(oldest, None)
         _v2_persisted_prefix_fp.pop(oldest, None)
+
+
+def session_ids_on_disk(session_dir: Path) -> list[str]:
+    """v1 + v2 session ids present on disk (deduped; v2 and v1 share the id space).
+
+    Shared enumerator for listing (PMR-002) and conversation-index rebuild
+    (PMR-003). ``glob("session-*.json")`` also matches ``session-<id>.head.json``,
+    so derive v1 ids precisely by skipping the head files.
+    """
+    ids: dict[str, None] = {}  # insertion-ordered set
+    for p in session_dir.glob("session-*.head.json"):      # v2 head
+        ids.setdefault(p.name[len("session-"):-len(".head.json")], None)
+    for p in session_dir.glob("session-*.jsonl"):           # v2 transcript (headless too)
+        ids.setdefault(p.stem[len("session-"):], None)
+    for p in session_dir.glob("session-*.json"):            # v1 — but this ALSO matches *.head.json
+        if p.name.endswith(".head.json"):
+            continue
+        ids.setdefault(p.stem[len("session-"):], None)
+    return list(ids)
+
+
+def _backfill_index(session_dir: Path) -> list[dict[str, Any]]:
+    """Build the index once from legacy v1 and v2 files, then persist it."""
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for head_file in session_dir.glob("session-*.head.json"):
+        sid = head_file.stem[len("session-"):-len(".head")]
+        head = session_format.read_head(session_dir, sid)
+        if head is None or sid in seen:
+            continue
+        seen.add(sid)
+        entries.append(_session_index_entry({**head, "messages": []}, head_file))
+    for json_file in session_dir.glob("session-*.json"):
+        if json_file.name.endswith(".head.json"):
+            continue
+        sid = json_file.stem.replace("session-", "")
+        if sid in seen:  # a v2 head already claimed this id — v2 wins (C.3 / C.7)
+            continue
+        try:
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        seen.add(sid)
+        entries.append(_session_index_entry(data, json_file))
+    if entries:
+        # Write the whole index once under the store lock (C.7): atomic rename
+        # means a reader sees the old or the new index, never a torn one; a
+        # crash mid-backfill leaves the prior state and the next trigger re-runs.
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            _write_session_index(session_dir, entries)
+    return entries
 
 
 def save_session_snapshot(
@@ -432,99 +492,82 @@ def load_session_snapshot(cwd: str | Path) -> dict[str, Any] | None:
 
 
 def list_session_snapshots(cwd: str | Path, limit: int = 20) -> list[dict[str, Any]]:
-    """List saved sessions for the project, newest first."""
+    """List saved sessions for the project, newest first.
+
+    Trusts the index whenever it exists, builds it once via a backfill when
+    absent, and surfaces any on-disk session a present-but-incomplete index is
+    still missing — v1 ``session-*.json`` AND v2 head/transcript (incl. a
+    head-less transcript) — via the sniffer + loader, persisting the merged
+    index once under the store lock (C.7 lazy one-time backfill, all-or-nothing).
+    Subsequent lists are index-only.
+    """
     session_dir = get_project_session_dir(cwd)
-    sessions: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     indexed = _load_session_index(session_dir)
-    if indexed:
-        for item in indexed:
-            if not (session_dir / str(item.get("path") or "")).exists():
-                continue
-            sid = str(item.get("session_id") or "")
-            if sid:
-                seen_ids.add(sid)
-            sessions.append(
-                {
-                    "session_id": item.get("session_id", ""),
-                    "summary": item.get("summary", ""),
-                    "message_count": item.get("message_count", 0),
-                    "model": item.get("model", ""),
-                    "created_at": item.get("created_at", 0),
-                }
-            )
-        if len(sessions) >= limit:
-            sessions.sort(key=lambda item: item.get("created_at", 0), reverse=True)
-            return sessions[:limit]
-
-    # Named session files
-    for path in sorted(session_dir.glob("session-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            sid = data.get("session_id", path.stem.replace("session-", ""))
-            if sid in seen_ids:
-                continue
-            seen_ids.add(sid)
-            summary = data.get("summary", "")
-            if not summary:
-                # Extract from first user message
-                for msg in data.get("messages", []):
-                    if msg.get("role") == "user":
-                        texts = [b.get("text", "") for b in msg.get("content", []) if b.get("type") == "text"]
-                        summary = " ".join(texts).strip()[:80]
-                        if summary:
-                            break
-            sessions.append({
-                "session_id": sid,
-                "summary": summary,
-                "message_count": data.get("message_count", len(data.get("messages", []))),
-                "model": data.get("model", ""),
-                "created_at": data.get("created_at", path.stat().st_mtime),
-            })
-        except (json.JSONDecodeError, OSError):
+    if not indexed:
+        indexed = _backfill_index(session_dir)
+    by_id: dict[str, dict[str, Any]] = {}
+    for entry in indexed:
+        sid = str(entry.get("session_id") or "")
+        if sid:
+            by_id[sid] = entry
+    # Surface on-disk sessions a present-but-incomplete index is missing
+    # (PMR-002). Derive each via the v2-aware loader core so a head-less v2
+    # session (transcript present, head lost — C.6) still surfaces, degraded.
+    derived_any = False
+    for sid in session_ids_on_disk(session_dir):
+        if sid in by_id:
             continue
-        if len(sessions) >= limit:
-            break
-
-    # Also include latest.json if it has no corresponding session file
-    latest_path = session_dir / "latest.json"
-    if latest_path.exists() and len(sessions) < limit:
-        try:
-            data = json.loads(latest_path.read_text(encoding="utf-8"))
-            sid = data.get("session_id", "latest")
-            if sid not in seen_ids:
-                summary = data.get("summary", "")
-                if not summary:
-                    for msg in data.get("messages", []):
-                        if msg.get("role") == "user":
-                            texts = [b.get("text", "") for b in msg.get("content", []) if b.get("type") == "text"]
-                            summary = " ".join(texts).strip()[:80]
-                            if summary:
-                                break
-                sessions.append({
-                    "session_id": sid,
-                    "summary": summary or "(latest session)",
-                    "message_count": data.get("message_count", len(data.get("messages", []))),
-                    "model": data.get("model", ""),
-                    "created_at": data.get("created_at", latest_path.stat().st_mtime),
-                })
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Sort by created_at descending
-    sessions.sort(key=lambda s: s.get("created_at", 0), reverse=True)
+        payload = _load_snapshot_in_dir(session_dir, sid)
+        if payload is None:
+            continue
+        fmt = session_format.detect_session_format(session_dir, sid)
+        sp = session_dir / (f"session-{sid}.head.json" if fmt == "v2" else f"session-{sid}.json")
+        by_id[sid] = _session_index_entry(payload, sp)
+        derived_any = True
+    if derived_any:
+        # C.7: persist the merged index ONCE under .sessions.lock (atomic, not
+        # per-entry, not merge-on-read), so the next listing is index-only.
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            _write_session_index(session_dir, list(by_id.values()))
+    sessions: list[dict[str, Any]] = []
+    for sid, item in by_id.items():
+        if session_format.detect_session_format(session_dir, sid) is None:
+            continue  # session truly gone (V2_HEADLESS counts as live — C.3)
+        sessions.append(
+            {
+                "session_id": item.get("session_id", ""),
+                "summary": item.get("summary", ""),
+                "message_count": item.get("message_count", 0),
+                "model": item.get("model", ""),
+                "created_at": item.get("created_at", 0),
+            }
+        )
+    sessions.sort(key=lambda item: item.get("created_at", 0), reverse=True)
     return sessions[:limit]
 
 
-def load_session_by_id(cwd: str | Path, session_id: str) -> dict[str, Any] | None:
-    """Load a specific session by ID."""
-    session_dir = get_project_session_dir(cwd)
+def _load_snapshot_in_dir(session_dir: Path, session_id: str) -> dict[str, Any] | None:
+    """Load a session by id from a known session dir (sniffer → v2/v1).
+
+    The dir-based core shared by ``load_session_by_id`` and the conversation
+    index rebuild (PMR-003). Returns None when neither a v2 nor a v1 session
+    exists for the id.
+    """
     fmt = session_format.detect_session_format(session_dir, session_id)
     if fmt == "v2":
         return _load_v2_payload(session_dir, session_id)
     if fmt == "v1":
         path = session_dir / f"session-{session_id}.json"
         return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+    return None
+
+
+def load_session_by_id(cwd: str | Path, session_id: str) -> dict[str, Any] | None:
+    """Load a specific session by ID."""
+    session_dir = get_project_session_dir(cwd)
+    snap = _load_snapshot_in_dir(session_dir, session_id)
+    if snap is not None:
+        return snap
     # Fallback to latest.json if it resolves to this id.
     snap = load_session_snapshot(cwd)
     if snap is not None and (snap.get("session_id") == session_id or session_id == "latest"):

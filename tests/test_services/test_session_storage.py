@@ -7,6 +7,7 @@ from pathlib import Path
 
 from openharness.api.usage import UsageSnapshot
 from openharness.engine.messages import ConversationMessage, TextBlock
+from openharness.services import session_format
 from openharness.services.session_storage import (
     export_session_markdown,
     get_project_session_dir,
@@ -410,3 +411,155 @@ def test_v2_load_via_pointer_recovers_when_head_missing(tmp_path: Path, monkeypa
     snap = load_session_snapshot(project)  # resolves the latest.json pointer
     assert snap is not None
     assert [m["content"][0]["text"] for m in snap["messages"]] == ["kept"]
+
+
+def test_index_trusted_below_limit(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    for i in range(3):
+        save_session_snapshot(
+            cwd=project, model="m", system_prompt="s", session_id=f"s{i}",
+            messages=[ConversationMessage(role="user", content=[TextBlock(text=f"m{i}")])],
+            usage=UsageSnapshot(),
+        )
+    # limit far above count: index path must still return all three without
+    # falling through to a file scan.
+    got = list_session_snapshots(project, limit=50)
+    assert {s["session_id"] for s in got} == {"s0", "s1", "s2"}
+
+
+def test_backfill_builds_index_from_legacy_files(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    session_dir = get_project_session_dir(project)
+    for sid in ("leg1", "leg2"):
+        (session_dir / f"session-{sid}.json").write_text(
+            json.dumps({"session_id": sid, "summary": sid, "message_count": 1,
+                        "model": "m", "created_at": 1.0, "messages": []}),
+            encoding="utf-8",
+        )
+    assert not (session_dir / "sessions-index.json").exists()
+    got = list_session_snapshots(project, limit=10)
+    assert {s["session_id"] for s in got} == {"leg1", "leg2"}
+    # Backfill persisted the index.
+    assert (session_dir / "sessions-index.json").exists()
+
+
+def test_stale_index_entry_compacted_on_next_write(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="keep",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])],
+                          usage=UsageSnapshot())
+    session_dir = get_project_session_dir(project)
+    # Inject a stale entry pointing at a now-missing file.
+    from openharness.services.session_storage import _load_session_index, _write_session_index
+    entries = _load_session_index(session_dir)
+    entries.append({"session_id": "gone", "path": "session-gone.head.json",
+                    "model": "m", "summary": "", "message_count": 0, "created_at": 1.0})
+    _write_session_index(session_dir, entries)
+    # Next save must compact the stale entry out.
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="keep2",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="b")])],
+                          usage=UsageSnapshot())
+    ids = {e["session_id"] for e in _load_session_index(session_dir)}
+    assert "gone" not in ids
+    assert {"keep", "keep2"} <= ids
+
+
+def test_backfill_dual_format_same_id_prefers_v2_and_is_idempotent(tmp_path: Path, monkeypatch):
+    # P1-004 / C.7: a legacy .json and a v2 head for the same id -> v2 wins;
+    # re-running the backfill yields the same single entry (idempotent).
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    session_dir = get_project_session_dir(project)
+    (session_dir / "session-dup.json").write_text(
+        json.dumps({"session_id": "dup", "summary": "v1", "message_count": 9,
+                    "model": "v1model", "created_at": 1.0, "messages": []}),
+        encoding="utf-8",
+    )
+    from openharness.services.session_format import write_head
+    write_head(session_dir, "dup", {"session_id": "dup", "summary": "v2",
+               "message_count": 2, "model": "v2model", "created_at": 2.0})
+
+    from openharness.services.session_storage import _backfill_index, _load_session_index
+    first = _backfill_index(session_dir)
+    dup = [e for e in first if e["session_id"] == "dup"]
+    assert len(dup) == 1 and dup[0]["model"] == "v2model"  # v2 won the conflict
+    second = _backfill_index(session_dir)  # idempotent
+    assert {e["session_id"] for e in second} == {e["session_id"] for e in first}
+    assert len(_load_session_index(session_dir)) == len(first)
+
+
+def test_list_surfaces_v2_session_absent_from_index(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"; project.mkdir()
+    # A: indexed via save. B: v2 head+transcript on disk, NOT in index. C: HEAD-LESS v2 (transcript only).
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="A",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
+    sdir = get_project_session_dir(project)
+    session_format.append_messages_to_transcript(sdir, "B", [ConversationMessage(role="user", content=[TextBlock(text="b")])], last_persisted_count=0)
+    session_format.write_head(sdir, "B", {"session_id": "B", "message_count": 1, "created_at": 1.0, "model": "m", "summary": ""})
+    session_format.append_messages_to_transcript(sdir, "C", [ConversationMessage(role="user", content=[TextBlock(text="c")])], last_persisted_count=0)
+    # C has NO head.json — the V2_HEADLESS case; it must still surface via the loader.
+    from openharness.services.session_storage import _load_session_index
+    ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
+    assert {"A", "B", "C"} <= ids   # head-less C surfaces too (loader-based derivation, not read_head)
+    # .head.json trap: `glob("session-*.json")` ALSO matches `session-<id>.head.json`, yielding phantom
+    # ids "B.head" etc. (a lone `.head.json` sniffs as v1). The shared enumerator skips them — assert so.
+    assert not any(i.endswith(".head") for i in ids)
+    # C.7: the backfill must be PERSISTED to the index under lock, not just returned (merge-on-read
+    # would pass the line above yet leave sessions-index.json incomplete). After listing once, the
+    # index itself contains the headed (B) AND head-less (C) v2 sessions, and a 2nd listing is index-only.
+    indexed_ids = {e["session_id"] for e in _load_session_index(sdir)}
+    assert {"A", "B", "C"} <= indexed_ids
+
+
+def test_backfill_writes_index_exactly_once(tmp_path: Path, monkeypatch):
+    # C.7 ATOMICITY: backfilling N missing entries must write the index ONCE (all-or-nothing),
+    # NOT once per entry. A per-entry loop (_update_session_index_unlocked per id) writes the
+    # whole index on each call, so an interruption between B and C leaves a PARTIALLY backfilled
+    # index — violating C.7 ("a crash mid-backfill leaves the OLD index, not a partial one").
+    # Instrument _write_session_index AND the lock: exactly one write, while .sessions.lock
+    # is held, covering BOTH missing sessions.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    import contextlib
+    import openharness.services.session_storage as ss
+    from openharness.services import session_format
+    project = tmp_path / "repo"; project.mkdir()
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="A",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
+    sdir = get_project_session_dir(project)
+    for sid in ("B", "C"):  # two index-missing v2 sessions on disk
+        session_format.append_messages_to_transcript(sdir, sid, [ConversationMessage(role="user", content=[TextBlock(text=sid)])], last_persisted_count=0)
+        session_format.write_head(sdir, sid, {"session_id": sid, "message_count": 1, "created_at": 1.0})
+    lock_held = {"v": False}
+    lock_paths: list[Path] = []
+    real_lock = ss.exclusive_file_lock
+    @contextlib.contextmanager
+    def _tracking_lock(path):
+        with real_lock(path):
+            lock_paths.append(path)
+            lock_held["v"] = True
+            try:
+                yield
+            finally:
+                lock_held["v"] = False
+    monkeypatch.setattr(ss, "exclusive_file_lock", _tracking_lock)
+    writes: list[set] = []
+    write_lock_states: list[bool] = []
+    real_write = ss._write_session_index
+    def _spy(session_dir, entries):
+        writes.append({e["session_id"] for e in entries})
+        write_lock_states.append(lock_held["v"])
+        return real_write(session_dir, entries)
+    monkeypatch.setattr(ss, "_write_session_index", _spy)
+    list_session_snapshots(project, limit=50)
+    assert len(writes) == 1            # ONE write for the whole backfill, not one per entry
+    assert lock_paths == [sdir / ".sessions.lock"]  # and only ONE store-lock acquisition
+    assert write_lock_states == [True] # and that write happened WHILE .sessions.lock was held
+    assert {"A", "B", "C"} <= writes[0]  # ...persisting both missing entries together (atomic)
