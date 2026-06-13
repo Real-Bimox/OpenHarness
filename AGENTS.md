@@ -7,8 +7,8 @@
 
 This repository (`Real-Bimox/OpenHarness`) is an **independent fork** of `HKUDS/OpenHarness` and is the sole authority for this project going forward.
 
-- All pushes, branches, tags, and PRs target `origin` (`Real-Bimox/OpenHarness`) only.
-- **Never push to upstream** (`HKUDS/OpenHarness`) in any way — no pushes, no PRs, no issues filed on the project's behalf. Upstream is fetch-only reference material.
+- **Push only to the owner's own repository.** All pushes, branches, tags, and PRs target `origin` (`Real-Bimox/OpenHarness`) — the owner's repo — and nowhere else.
+- **Never push to a repository the owner does not own — ever.** `upstream` (`HKUDS/OpenHarness`) and any other third-party or external remote are **fetch-only**: no pushes, no PRs, no issues filed on the project's behalf. Judge by *who owns the repository*, not the remote's name — if a remote points anywhere other than the owner's own repo, it is push-forbidden.
 - Merging or cherry-picking upstream changes into this fork is an owner decision, never a default.
 
 ## 2. No third-party attribution — ever
