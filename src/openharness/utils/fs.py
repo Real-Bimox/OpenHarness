@@ -127,16 +127,25 @@ def append_jsonl_line(
     ``line`` must not already contain a trailing newline; exactly one is
     added. With ``fsync=True`` (default) the file is flushed to stable
     storage after the write — this is the single per-turn durability point
-    for the v2 transcript. The parent directory is created on first write.
+    for the v2 transcript. The parent directory is created on first write,
+    and the directory entry is fsynced on that first write so the *create*
+    itself is durable (otherwise a crash could lose a brand-new transcript
+    whose data was fsynced but whose directory entry was not).
     """
     dst = Path(path)
     dst.parent.mkdir(parents=True, exist_ok=True)
+    is_new = not dst.exists()
     payload = (line + "\n").encode(encoding)
     with open(dst, "ab") as handle:
         handle.write(payload)
         handle.flush()
         if fsync:
             os.fsync(handle.fileno())
+    if fsync and is_new:
+        # Only on create: a new file's directory entry is not durable until the
+        # parent dir is flushed. Appends to an existing transcript keep the
+        # one-fsync-per-turn cost (the dir entry is already durable).
+        _fsync_dir(dst.parent)
 
 
 def read_jsonl_complete_lines(

@@ -253,3 +253,55 @@ def test_ohmo_legacy_v1_latest_still_loads(tmp_path: Path):
     assert snap is not None
     assert snap["session_id"] == "oleg"
     assert snap["messages"][0]["content"][0]["text"] == "hi"
+
+
+def test_ohmo_v1_revert_supersedes_existing_v2_files_for_same_id(tmp_path: Path, monkeypatch):
+    # Revert safety (ohmo mirror): a v1-revert save of an existing id must drop the
+    # stale v2 files so load_by_id does not keep serving the old v2 content.
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+    import openharness.config.settings as _cfg
+    from ohmo.session_storage import get_session_dir, load_by_id, save_session_snapshot
+    from ohmo.workspace import initialize_workspace
+    from openharness.engine.messages import ConversationMessage, TextBlock
+    from openharness.api.usage import UsageSnapshot
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_session_snapshot(cwd=tmp_path, workspace=workspace, model="m", system_prompt="s", session_id="same",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="old v2")])],
+                          usage=UsageSnapshot())
+    session_dir = get_session_dir(workspace)
+    assert (session_dir / "session-same.jsonl").exists()
+
+    (config_dir / "settings.json").write_text('{"session_storage_format": "v1"}', encoding="utf-8")
+    _cfg._SETTINGS_FILE_CACHE.clear()
+    _cfg._INLINE_SETTINGS_CACHE.clear()
+    save_session_snapshot(cwd=tmp_path, workspace=workspace, model="m", system_prompt="s", session_id="same",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="new v1")])],
+                          usage=UsageSnapshot())
+    assert (session_dir / "session-same.json").exists()
+    assert not (session_dir / "session-same.jsonl").exists()
+    assert load_by_id(workspace, "same")["messages"][0]["content"][0]["text"] == "new v1"
+
+
+def test_ohmo_v2_pointer_falls_back_to_legacy_v1_when_v2_target_absent(tmp_path: Path):
+    # C.6 step 4 (ohmo mirror): a v2 pointer whose v2 target is gone falls back to
+    # a same-id legacy session-<id>.json, not None.
+    import json
+    from ohmo.session_storage import get_session_dir, load_latest
+    from ohmo.workspace import initialize_workspace
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    session_dir = get_session_dir(workspace)
+    (session_dir / "latest.json").write_text(json.dumps({"session_id": "same"}), encoding="utf-8")
+    (session_dir / "session-same.json").write_text(
+        json.dumps({"app": "ohmo", "session_id": "same", "model": "v1", "message_count": 1,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "legacy"}]}]}),
+        encoding="utf-8",
+    )
+    snap = load_latest(workspace)
+    assert snap is not None
+    assert snap["messages"][0]["content"][0]["text"] == "legacy"

@@ -895,3 +895,57 @@ def test_list_tolerates_corrupt_legacy_v1_file(tmp_path: Path, monkeypatch):
     ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
     assert "good" in ids        # listing did not crash; the good session surfaces
     assert "bad" not in ids     # the corrupt file is skipped, not surfaced
+
+
+def test_v1_revert_supersedes_existing_v2_files_for_same_id(tmp_path: Path, monkeypatch):
+    # Revert safety: saving an existing id under the v1 revert switch must make the
+    # v1 file authoritative — otherwise the sniffer makes the stale v2 files win
+    # for load_session_by_id, silently serving OLD content after a revert.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    config_dir = tmp_path / "cfg"
+    config_dir.mkdir()
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
+    project = tmp_path / "repo"
+    project.mkdir()
+    import openharness.config.settings as _cfg
+    from openharness.services.session_storage import load_session_by_id
+
+    # First save under v2 (the default).
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="same",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="old v2")])],
+                          usage=UsageSnapshot())
+    session_dir = get_project_session_dir(project)
+    assert (session_dir / "session-same.jsonl").exists()
+
+    # Flip the revert switch to v1 and save the SAME id again.
+    (config_dir / "settings.json").write_text('{"session_storage_format": "v1"}', encoding="utf-8")
+    _cfg._SETTINGS_FILE_CACHE.clear()
+    _cfg._INLINE_SETTINGS_CACHE.clear()
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="same",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="new v1")])],
+                          usage=UsageSnapshot())
+
+    assert (session_dir / "session-same.json").exists()         # v1 file written
+    assert not (session_dir / "session-same.jsonl").exists()    # stale v2 superseded
+    assert not (session_dir / "session-same.head.json").exists()
+    # Both load paths agree on the NEW v1 content (no stale-v2 shadow).
+    assert load_session_snapshot(project)["messages"][0]["content"][0]["text"] == "new v1"
+    assert load_session_by_id(project, "same")["messages"][0]["content"][0]["text"] == "new v1"
+
+
+def test_v2_pointer_falls_back_to_legacy_v1_when_v2_target_absent(tmp_path: Path, monkeypatch):
+    # C.6 step 4: a latest.json v2 pointer whose v2 target files are gone must fall
+    # back to a same-id legacy session-<id>.json, not return None.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    session_dir = get_project_session_dir(project)
+    (session_dir / "latest.json").write_text(json.dumps({"session_id": "same"}), encoding="utf-8")
+    (session_dir / "session-same.json").write_text(
+        json.dumps({"session_id": "same", "model": "v1", "message_count": 1,
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "legacy"}]}]}),
+        encoding="utf-8",
+    )
+    snap = load_session_snapshot(project)
+    assert snap is not None  # the bug returned None here
+    assert snap["messages"][0]["content"][0]["text"] == "legacy"

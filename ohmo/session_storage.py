@@ -273,6 +273,16 @@ def save_session_snapshot(
         atomic_write_text(_session_key_latest_path(workspace, session_key), data)
     session_path = session_dir / f"session-{sid}.json"
     atomic_write_text(session_path, data)
+    # Revert-switch supersede (symmetric to the v2-save supersede, C.3): remove a
+    # now-stale v2 transcript/head for this id so the sniffer does not make the
+    # stale v2 win over this authoritative full v1 file for load_by_id / listing.
+    for suffix in (".jsonl", ".head.json"):
+        stale = session_dir / f"session-{sid}{suffix}"
+        if stale.exists():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     # ohmo's index is multi-writer too (many chat channels); serialise its RMW
     # under the same store lock (C.2). ohmo has no retention, so a direct
     # call-site lock is sufficient (no core/wrapper split needed).
@@ -292,7 +302,9 @@ def load_latest(workspace: str | Path | None = None) -> dict[str, Any] | None:
         return None
     if session_format.detect_latest_format(raw) == "v2":
         sid = str(raw.get("session_id") or "")
-        return _load_ohmo_v2_payload(session_dir, sid) if sid else None
+        # Sniffer/loader core (C.6): v2 first (incl. head-less recovery), then a
+        # same-id legacy session-<id>.json when the v2 target is absent.
+        return _load_ohmo_snapshot_in_dir(session_dir, sid) if sid else None
     return _sanitize_snapshot_payload(raw)
 
 
@@ -306,9 +318,16 @@ def load_latest_for_session_key(workspace: str | Path | None, session_key: str) 
         return None
     if session_format.detect_latest_format(raw) == "v2":
         sid = str(raw.get("session_id") or "")
+        if not sid:
+            return None
+        session_dir = get_session_dir(workspace)
         # Pass session_key so a head-less recovery (R-002a) still carries it — the
         # lookup knows the key even when the crashed-away head did not survive.
-        return _load_ohmo_v2_payload(get_session_dir(workspace), sid, session_key=session_key) if sid else None
+        payload = _load_ohmo_v2_payload(session_dir, sid, session_key=session_key)
+        if payload is not None:
+            return payload
+        # C.6 fallback: the v2 target is gone — try a same-id legacy v1 file.
+        return _load_ohmo_snapshot_in_dir(session_dir, sid)
     return _sanitize_snapshot_payload(raw)
 
 

@@ -249,3 +249,20 @@ def test_read_jsonl_missing_file_is_empty(tmp_path: Path) -> None:
     from openharness.utils.fs import read_jsonl_complete_lines
 
     assert read_jsonl_complete_lines(tmp_path / "nope.jsonl") == []
+
+
+def test_append_jsonl_line_fsyncs_parent_dir_on_create(tmp_path: Path, monkeypatch) -> None:
+    # C.1: the first append that CREATES a transcript fsyncs the parent directory
+    # so the create itself is durable; a later append to the existing file does
+    # not (one fsync/turn for an ongoing session); fsync=False never fsyncs the dir.
+    from openharness.utils import fs as fs_mod
+
+    dir_fsyncs: list[Path] = []
+    monkeypatch.setattr(fs_mod, "_fsync_dir", lambda d: dir_fsyncs.append(Path(d)))
+    path = tmp_path / "t.jsonl"
+    fs_mod.append_jsonl_line(path, '{"a": 1}', fsync=True)   # creates the file
+    assert dir_fsyncs == [tmp_path]
+    fs_mod.append_jsonl_line(path, '{"a": 2}', fsync=True)   # file already exists
+    assert dir_fsyncs == [tmp_path]                          # not fsynced again
+    fs_mod.append_jsonl_line(tmp_path / "u.jsonl", '{"b": 1}', fsync=False)
+    assert dir_fsyncs == [tmp_path]                          # fsync=False -> no dir fsync

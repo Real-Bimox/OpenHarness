@@ -399,6 +399,18 @@ def _save_session_snapshot_v1(
         atomic_write_text(latest_path, data, fsync=False)
         session_path = session_dir / f"session-{sid}.json"
         atomic_write_text(session_path, data, fsync=False)
+        # Revert-switch supersede (symmetric to the v2-save supersede, C.3): a
+        # prior v2 transcript/head for this id is now stale — this full v1 file
+        # is the authoritative state — and the sniffer would otherwise make the
+        # stale v2 win for load_session_by_id / listing. Remove them so the v1
+        # write is the live session and there is no CONFLICT.
+        for suffix in (".jsonl", ".head.json"):
+            stale = session_dir / f"session-{sid}{suffix}"
+            if stale.exists():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
         with exclusive_file_lock(session_dir / ".sessions.lock"):
             _update_session_index_unlocked(session_dir, _session_index_entry(payload, session_path))
             try:  # retention is best-effort and must never break a save
@@ -606,7 +618,10 @@ def load_session_snapshot(cwd: str | Path) -> dict[str, Any] | None:
         return None
     if session_format.detect_latest_format(raw) == "v2":
         sid = str(raw.get("session_id") or "")
-        return _load_v2_payload(session_dir, sid) if sid else None
+        # Resolve through the sniffer/loader core (C.6): prefers v2 (incl.
+        # head-less recovery off the transcript), then falls back to a same-id
+        # legacy session-<id>.json when the pointer's v2 target is absent.
+        return _load_snapshot_in_dir(session_dir, sid) if sid else None
     return _sanitize_snapshot_payload(raw)
 
 
