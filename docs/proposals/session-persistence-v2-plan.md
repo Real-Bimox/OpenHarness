@@ -150,10 +150,10 @@ Changing the on-disk session shape (v1 full `session-<id>.json` / full `latest.j
 
 | Consumer | v1 assumption | v2 break | Fix | Finding |
 |---|---|---|---|---|
-| `commands/registry.py` `/session tag` (`:914`) | `copy2(save_snapshot()→latest.json, <tag>.json)` is a full snapshot | copies a pointer | export via `export_snapshot_json` (full v1-shaped, loader-built) | PMR-001 / Task 18 |
-| `session_storage.list_session_snapshots` (`:212-294`) + ohmo `list_snapshots` (`:179`) | legacy `session-*.json` glob surfaces un-indexed sessions | v2 sessions (`.jsonl`/`.head`) never surfaced when the index is incomplete | sniffer-based missing-entry merge (v1 + v2) | PMR-002 / Task 19 |
-| `conversation_index.rebuild` (`:354`) | `glob("*/session-*.json")` + `json.loads` | indexes zero v2 sessions; wipe-then-rebuild empties search | enumerate v1+v2 per project, reassemble via the loader | PMR-003 / Task 20 |
-| `autodream/lock.list_sessions_touched_since` (`:118`) + `autodream/prompt.py` (`:80`) | `glob("session-*.json")` by mtime; prompt says inspect `session-*.json` | empty list → auto-dream never triggers; prompt points at absent files | scan `.json` + `.jsonl`; prompt references both shapes | PMR-004 / Task 21 |
+| `commands/registry.py` `/session tag` (`:914`) | `copy2(save_snapshot()→latest.json, <tag>.json)` is a full snapshot | copies a pointer | export via `export_snapshot_json` (full v1-shaped, loader-built) | PMR-001 / Task 19 |
+| `session_storage.list_session_snapshots` (`:212-294`) + ohmo `list_snapshots` (`:179`) | legacy `session-*.json` glob surfaces un-indexed sessions | v2 sessions (`.jsonl`/`.head`) never surfaced when the index is incomplete | sniffer-based missing-entry merge (v1 + v2) | PMR-002 / Task 20 |
+| `conversation_index.rebuild` (`:354`) | `glob("*/session-*.json")` + `json.loads` | indexes zero v2 sessions; wipe-then-rebuild empties search | enumerate v1+v2 per project, reassemble via the loader | PMR-003 / Task 21 |
+| `autodream/lock.list_sessions_touched_since` (`:118`) + `autodream/prompt.py` (`:80`) | `glob("session-*.json")` by mtime; prompt says inspect `session-*.json` | empty list → auto-dream never triggers; prompt points at absent files | scan `.json` + `.jsonl`; prompt references both shapes | PMR-004 / Task 22 |
 
 This inventory is the gate's blast-radius checklist for contract/format changes (see the Quality Gate "consumer enumeration" check).
 
@@ -2589,15 +2589,15 @@ No other open assumptions: the settings-override mechanism (`OPENHARNESS_CONFIG_
 
 These close the C.9 blast-radius gap: code that reads sessions *by file shape* instead of through the loader, which v2-as-default would silently break. All four verified against the real code (file:line in C.9). Each is a small, explicit, test-first change.
 
-### Task 18: `/session tag` exports a full snapshot under v2 (PMR-001)
+### Task 19: `/session tag` exports a full snapshot under v2 (PMR-001)
 
 **Files:**
 - Modify: `src/openharness/services/session_backend.py` (protocol + `OpenHarnessSessionBackend`), `ohmo/session_storage.py` (ohmo backend), `src/openharness/commands/registry.py` (`registry.py:914`)
-- Test: `tests/test_services/test_session_storage.py`
+- Test: `tests/test_services/test_session_storage.py` (backend unit) **and `tests/test_commands/test_registry.py` (command-level — the PMR-001 regression that exercises the actual `/session tag` handler)**
 
-**Design decision:** `/session tag NAME` does `shutil.copy2(save_snapshot()→latest_path, <tag>.json)`. Under v2 `latest_path` is the pointer, so the export becomes `{"session_id": ...}`. Add an explicit `export_snapshot_json(*, cwd, dest)` to the backend (parallel to the existing `export_markdown`) that obtains the **full v1-shaped payload from the v2-aware loader** and writes it — correct for both formats (v1: loader reads the full `latest.json`; v2: loader reassembles head+transcript). `/session tag` calls it instead of copying the pointer. The just-saved session is the project's latest, so `load_session_snapshot(cwd)` returns it.
+**Design decision:** `/session tag NAME` does `shutil.copy2(save_snapshot()→latest_path, <tag>.json)`. Under v2 `latest_path` is the pointer, so the export becomes `{"session_id": ...}`. Add an explicit `export_snapshot_json(*, cwd, dest)` to the backend (parallel to the existing `export_markdown`) that obtains the **full v1-shaped payload from the v2-aware loader** and writes it — correct for both formats (v1: loader reads the full `latest.json`; v2: loader reassembles head+transcript). `/session tag` calls it instead of copying the pointer. The just-saved session is the project's latest, so `load_session_snapshot(cwd)` returns it. **PMR-001 is specifically about the command**, so the binding regression runs the `/session tag` handler end-to-end and asserts the tagged file is a full snapshot — proving the raw `.json` copy is gone (a backend-only test would not exercise `registry.py`).
 
-1. - [ ] Failing test:
+1. - [ ] Failing tests. **(a) Backend unit** (`tests/test_services/test_session_storage.py`):
    ```python
    def test_session_tag_export_is_full_snapshot_under_v2(tmp_path: Path, monkeypatch):
        monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
@@ -2613,6 +2613,26 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
        assert payload["session_id"] == "t1"
        assert payload["messages"][0]["content"][0]["text"] == "hello"  # full snapshot, not a pointer
    ```
+   **(b) Command-level regression** (`tests/test_commands/test_registry.py` — the PMR-001 binding proof; mirrors that file's `_make_context`/`registry.lookup` pattern):
+   ```python
+   @pytest.mark.asyncio
+   async def test_session_tag_command_exports_full_snapshot_under_v2(tmp_path: Path, monkeypatch):
+       # PMR-001 at the COMMAND level: exercises registry.py's /session tag handler and
+       # proves it no longer does a raw .json copy (which under v2 = the pointer).
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))  # v2 is the default format
+       from openharness.services.session_backend import OpenHarnessSessionBackend
+       from openharness.services.session_storage import get_project_session_dir
+       ctx = _make_context(tmp_path)              # existing helper (engine, cwd, tool_registry, app_state)
+       ctx.session_backend = OpenHarnessSessionBackend()   # the handler reads context.session_backend
+       command, args = registry.lookup("/session tag mytag")
+       await command.handler(args, ctx)
+       tagged = get_project_session_dir(tmp_path) / "mytag.json"
+       payload = json.loads(tagged.read_text())
+       # The discriminator: a v2 pointer is exactly {"session_id": ...}; a full snapshot has "messages".
+       assert "messages" in payload and payload.get("session_id")
+       assert set(payload) != {"session_id"}   # NOT a raw copy of the pointer latest.json
+   ```
+   (If `_make_context` doesn't expose `session_backend`, set it on the context or extend the helper — the point is the real handler runs against a v2 store.)
 2. - [ ] Implement. In `session_backend.py` add to the `SessionBackend` protocol and `OpenHarnessSessionBackend`:
    ```python
    def export_snapshot_json(self, *, cwd: str | Path, dest: Path) -> Path:
@@ -2626,36 +2646,37 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
    (ohmo backend mirrors it via `ohmo.session_storage.load_latest`.) In `registry.py` replace `shutil.copy2(snapshot_path, tagged_json)` with `context.session_backend.export_snapshot_json(cwd=context.cwd, dest=tagged_json)`.
 3. - [ ] Run + commit (`Export full snapshot for /session tag under v2 (PMR-001)`).
 
-### Task 19: `list_session_snapshots` surfaces index-missing sessions via the sniffer (PMR-002)
+### Task 20: `list_session_snapshots` surfaces index-missing sessions via the sniffer (PMR-002)
 
 **Files:**
 - Modify: `src/openharness/services/session_storage.py` (`list_session_snapshots`, amends Task 10), `ohmo/session_storage.py` (`list_snapshots`, `:179`)
 - Test: `tests/test_services/test_session_storage.py`, `tests/test_ohmo/test_ohmo_session_storage.py`
 
-**Design decision:** **Amends Task 10.** C.7 says backfill triggers when the index is absent **or missing entries**, but the copyable `list_session_snapshots` only scans disk when `_load_session_index()` is empty, and it scans only `session-*.json` — so a present-but-incomplete index hides on-disk sessions, and under v2 the `.json` glob finds nothing. Replace the empty-only trigger with a **sniffer-based missing-entry merge**: after adding indexed entries, enumerate on-disk session ids (v1 `session-*.json` stems **and** v2 `session-*.head.json` / `session-*.jsonl` stems, deduped — C.3 v2-wins), and for each id not already present, derive an entry via `detect_session_format` → `read_head` (v2) or the `.json` payload (v1). Drop the `len(sessions) >= limit` early-return that currently short-circuits the legacy scan. Keeps `test_list_session_snapshots_merges_index_with_legacy_files` green and adds the v2 case. Mirror the same in ohmo's `list_snapshots`.
+**Design decision:** **Amends Task 10.** C.7 says backfill triggers when the index is absent **or missing entries**, but the copyable `list_session_snapshots` only scans disk when `_load_session_index()` is empty, and it scans only `session-*.json` — so a present-but-incomplete index hides on-disk sessions, and under v2 the `.json` glob finds nothing. Replace the empty-only trigger with a **sniffer-based missing-entry merge**: after adding indexed entries, enumerate on-disk session ids via the shared `session_ids_on_disk` (Task 21 — v1 `session-*.json` **and** v2 `session-*.head.json`/`session-*.jsonl`, deduped v2-wins, with the `.head.json` skip), and for each id not already present, build an entry **from the v2-aware loader core `_load_snapshot_in_dir` (Task 21)** — `_session_index_entry(loaded_payload, ...)` — **not** `read_head`. This matters for **head-less v2** (transcript present, head lost in a crash — C.6): `read_head` returns `None` for it, which would silently drop a recoverable session from listing; the loader reassembles it (degraded `model`/`summary` per C.6) so it still appears. Drop the `len(sessions) >= limit` early-return that currently short-circuits the legacy scan. Mirror the same in ohmo's `list_snapshots`.
 
-1. - [ ] Failing test (v2 session missing from a non-empty index still lists):
+1. - [ ] Failing test (v2 session missing from a non-empty index still lists — **including a head-less one**):
    ```python
    def test_list_surfaces_v2_session_absent_from_index(tmp_path: Path, monkeypatch):
        monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
        project = tmp_path / "repo"; project.mkdir()
-       # session A indexed via save; session B written to disk (v2 head+transcript) but NOT in the index
+       # A: indexed via save. B: v2 head+transcript on disk, NOT in index. C: HEAD-LESS v2 (transcript only).
        save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="A",
                              messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
        sdir = get_project_session_dir(project)
        session_format.append_messages_to_transcript(sdir, "B", [ConversationMessage(role="user", content=[TextBlock(text="b")])], last_persisted_count=0)
        session_format.write_head(sdir, "B", {"session_id": "B", "message_count": 1, "created_at": 1.0, "model": "m", "summary": ""})
+       session_format.append_messages_to_transcript(sdir, "C", [ConversationMessage(role="user", content=[TextBlock(text="c")])], last_persisted_count=0)
+       # C has NO head.json — the V2_HEADLESS case; it must still surface via the loader.
        ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
-       assert {"A", "B"} <= ids   # B is surfaced via the sniffer despite a non-empty index
-       # .head.json trap: `glob("session-*.json")` ALSO matches `session-<id>.head.json`,
-       # so a naive enumerator yields phantom ids "A.head"/"B.head" (the sniffer does NOT
-       # filter them — a lone `.head.json` reads as v1). Assert they never surface.
+       assert {"A", "B", "C"} <= ids   # head-less C surfaces too (loader-based derivation, not read_head)
+       # .head.json trap: `glob("session-*.json")` ALSO matches `session-<id>.head.json`, yielding phantom
+       # ids "B.head" etc. (a lone `.head.json` sniffs as v1). The shared enumerator skips them — assert so.
        assert not any(i.endswith(".head") for i in ids)
    ```
-2. - [ ] Implement the missing-entry merge via `session_ids_on_disk` (Task 20 — the shared enumerator that strips/skips `.head.json` correctly); mirror in ohmo. Task 10's body backfills only when the index is **absent**; this extends it to **missing entries** (C.7). The existing legacy-merge test must stay green.
-3. - [ ] Run + commit (`Surface index-missing v1+v2 sessions in listing (PMR-002)`).
+2. - [ ] Implement the missing-entry merge via `session_ids_on_disk` + `_load_snapshot_in_dir` (Task 21 — the shared enumerator/loader that strip/skip `.head.json` and reassemble head-less v2); mirror in ohmo. Task 10's body backfills only when the index is **absent**; this extends it to **missing entries** (C.7). The existing legacy-merge test must stay green.
+3. - [ ] Run + commit (`Surface index-missing v1+v2 (incl. head-less) sessions in listing (PMR-002)`).
 
-### Task 20: `conversation_index.rebuild` is v2-aware (PMR-003)
+### Task 21: `conversation_index.rebuild` is v2-aware (PMR-003)
 
 **Files:**
 - Modify: `src/openharness/services/conversation_index.py` (`rebuild`, `:343-361`), `src/openharness/services/session_storage.py` (expose a dir-based loader core)
@@ -2694,10 +2715,10 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
            ids.setdefault(p.stem[len("session-"):], None)
        return list(ids)
    ```
-   This is the same `.head`-stripping/skip pattern Task 10's `_backfill_index` already uses; `list_session_snapshots` (Task 19) and `rebuild` (here) share this one enumerator so the trap is fixed in a single place.
+   This is the same `.head`-stripping/skip pattern Task 10's `_backfill_index` already uses; `list_session_snapshots` (Task 20) and `rebuild` (here) share this one enumerator so the trap is fixed in a single place.
 3. - [ ] Run + commit (`Make conversation-index rebuild v2-aware (PMR-003)`).
 
-### Task 21: auto-dream discovers and prompts for v1+v2 sessions (PMR-004)
+### Task 22: auto-dream discovers and prompts for v1+v2 sessions (PMR-004)
 
 **Files:**
 - Modify: `src/openharness/services/autodream/lock.py` (`list_sessions_touched_since`, `:118`), `src/openharness/services/autodream/prompt.py` (`:80`)
@@ -2720,7 +2741,7 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 2. - [ ] Implement: glob `session-*.jsonl` (v2) + `session-*.json` (v1, **skipping `*.head.json`**), sort merged by mtime, dedupe by id. In `prompt.py:80` change to: ``2. Recent session transcripts (`session-*.jsonl`, or legacy `session-*.json`) when you need concrete context.``
 3. - [ ] Run + commit (`Auto-dream discovers v1+v2 sessions and prompts for both (PMR-004)`).
 
-### Task 22: full regression re-run (post-PMR)
+### Task 23: full regression re-run (post-PMR)
 
 1. - [ ] `python -m pytest tests/test_services/ tests/test_ohmo/ -q` — all green, including the previously-failing `test_rebuild_from_snapshots`, the legacy-merge listing test, and the new PMR regression tests.
 
@@ -2729,7 +2750,7 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 ## Quality Gate (design-quality-gate v3 — Tier T2)
 
 > **Tier T2** (storage-format migration · persisted-state shape change · multi-step save lifecycle · one-time backfill · retention deletion · format flag).
-> First run 2026-06-13 — NOT CLEARED (5 P1, 6 P2). Revision pass + author self-re-run resolved all 14 original findings (C.1–C.8 contracts + task-body fixes). **1st independent adversarial re-review 2026-06-13 (fresh agent): NOT CLEARED** — the original 14 were genuinely resolved, but it found a load-bearing **P1 (R-001)** the count-shrink compaction trigger misses, an ohmo crash-recovery **P2 (R-002)**, and two **P3s (R-003/R-004)** — see Q.4.1. **Fix pass 2026-06-13 (fresh session): all four resolved** — R-001 by a storage-local durable-prefix content fingerprint (explicit-signal alternative considered and rejected; mirrored to ohmo), R-002 by mirroring V2_HEADLESS recovery to ohmo + a defined head-less degradation contract, R-003/R-004 as recorded. **2nd independent adversarial re-review 2026-06-13: CLEARED** — verified every fix against the real source (incl. empirically confirming the fingerprint-equality assumption) and could not break them. **Owner promoted DRAFT → APPROVED 2026-06-13** (gate cleared was the prerequisite); merged to `main`. **Post-merge review 2026-06-13 (owner): four P1 format-consumer breaks (PMR-001..004, Q.4.2)** — code reading sessions by old file shape (`/session tag`, `list_session_snapshots`, `conversation_index.rebuild`, auto-dream) that v2-default would silently break; the first three gate runs missed the whole class because none enumerated the blast radius. **PMR fix pass 2026-06-13 (fresh session): all four resolved** — added the **C.9 format-consumer inventory** (root-cause fix) + Phase 7 (Tasks 18–22) + ohmo mirror. **3rd independent adversarial re-gate: CLEARED** — independently confirmed C.9 is exhaustive (no other consumer) and verified the fixes; one P2 it raised (the `.head.json` glob collision) is closed. This is a *design* gate: the tests below are *specified* as TDD steps and are executed when the plan is implemented, not as part of the gate.
+> First run 2026-06-13 — NOT CLEARED (5 P1, 6 P2). Revision pass + author self-re-run resolved all 14 original findings (C.1–C.8 contracts + task-body fixes). **1st independent adversarial re-review 2026-06-13 (fresh agent): NOT CLEARED** — the original 14 were genuinely resolved, but it found a load-bearing **P1 (R-001)** the count-shrink compaction trigger misses, an ohmo crash-recovery **P2 (R-002)**, and two **P3s (R-003/R-004)** — see Q.4.1. **Fix pass 2026-06-13 (fresh session): all four resolved** — R-001 by a storage-local durable-prefix content fingerprint (explicit-signal alternative considered and rejected; mirrored to ohmo), R-002 by mirroring V2_HEADLESS recovery to ohmo + a defined head-less degradation contract, R-003/R-004 as recorded. **2nd independent adversarial re-review 2026-06-13: CLEARED** — verified every fix against the real source (incl. empirically confirming the fingerprint-equality assumption) and could not break them. **Owner promoted DRAFT → APPROVED 2026-06-13** (gate cleared was the prerequisite); merged to `main`. **Post-merge review 2026-06-13 (owner): four P1 format-consumer breaks (PMR-001..004, Q.4.2)** — code reading sessions by old file shape (`/session tag`, `list_session_snapshots`, `conversation_index.rebuild`, auto-dream) that v2-default would silently break; the first three gate runs missed the whole class because none enumerated the blast radius. **PMR fix pass 2026-06-13 (fresh session): all four resolved** — added the **C.9 format-consumer inventory** (root-cause fix) + Phase 7 (Tasks 19–23) + ohmo mirror. **3rd independent adversarial re-gate: CLEARED** — independently confirmed C.9 is exhaustive (no other consumer) and verified the fixes; one P2 it raised (the `.head.json` glob collision) is closed. This is a *design* gate: the tests below are *specified* as TDD steps and are executed when the plan is implemented, not as part of the gate.
 
 ### Q.1 Canonical contract surfaces
 
@@ -2742,7 +2763,13 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 | `config/settings.py` (format + retention settings) | yes | — | [x] |
 | `latest.json` / `latest-<token>.json` (pointer) | yes | P2-005 — precedence + missing-head fallback (C.6) | [x] |
 | `sessions-index.json` (trusted + backfill + lock) | yes | P1-004 migration contract (C.7); store lock (C.2) | [x] |
-| Tests (`test_session_format` / `test_session_storage` / `test_ohmo` / `test_fs`) | mirror | P2-006 — proof types classified (Q.3.1); P1-001 + P1-003 behavioral tests added | [x] |
+| **Format-consumer inventory (C.9)** — every code path reading sessions by shape | yes | C.9 enumerates them; first three gate runs lacked this (PMR-001..004) | [x] |
+| `commands/registry.py` (`/session tag` export; `/session ls`) | consumer (C.9-B) | PMR-001 / Task 19 — `export_snapshot_json`, command-level test; `/session ls` P3 cosmetic | [x] |
+| `services/session_backend.py` (`export_snapshot_json`) | consumer (C.9-B) | PMR-001 / Task 19 — full v1-shaped export via the loader (OpenHarness + ohmo) | [x] |
+| `services/conversation_index.py` (`rebuild`) | consumer (C.9-B) | PMR-003 / Task 21 — v2-aware rebuild via `session_ids_on_disk` + `_load_snapshot_in_dir` | [x] |
+| `services/autodream/lock.py` + `autodream/prompt.py` | consumer (C.9-B) | PMR-004 / Task 22 — v1+v2 discovery scan + prompt | [x] |
+| `ohmo/session_storage.py` `list_snapshots` (PMR-002 mirror) | mirrors C.9-B | PMR-002 / Task 20 — same missing-entry merge as openharness | [x] |
+| Tests (`test_session_format` / `test_session_storage` / `test_ohmo` / `test_fs` / `test_commands` / `test_conversation_index` / `test_autodream`) | mirror | P2-006 — proof types classified (Q.3.1); P1-001/P1-003 + R-fix + PMR regression tests | [x] |
 
 ### Q.2 State / Handoff Invariants
 
@@ -2780,6 +2807,10 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 | R-001 in-place compaction → fingerprint differs | behavioral | `test_fingerprint_messages_detects_in_place_content_change` |
 | R-001 same-count in-place compaction → rewrite, not stale-append | behavioral | `test_v2_in_place_compaction_same_count_rewrites_not_stale` |
 | R-002a ohmo lost-head → recovers off transcript | behavioral | `test_ohmo_v2_recovers_when_head_lost` |
+| PMR-001 `/session tag` exports a full snapshot (command-level + backend) | behavioral | `test_session_tag_command_exports_full_snapshot_under_v2` (command), `test_session_tag_export_is_full_snapshot_under_v2` (backend) |
+| PMR-002 listing surfaces index-missing v2 sessions, incl. **head-less**, no `.head` phantom | behavioral | `test_list_surfaces_v2_session_absent_from_index` (+ ohmo mirror) |
+| PMR-003 conversation-index rebuild indexes v2 sessions | behavioral | `test_rebuild_indexes_v2_sessions` (extends `test_rebuild_from_snapshots`) |
+| PMR-004 auto-dream discovers v2 transcripts, no `.head` phantom | behavioral | `test_list_sessions_touched_since_finds_v2_transcripts` |
 | P1-004 dual-format precedence + idempotency | behavioral | `test_backfill_dual_format_same_id_prefers_v2_and_is_idempotent` |
 | P1-005 format detection (V2_HEADLESS / CONFLICT) | behavioral | `test_detect_session_format_headless_transcript_is_v2`, `…_v1_v2_conflict_prefers_v2` |
 | P2-004 retention (count + age, protect active/latest/recent) | behavioral | `test_retention_prunes_oldest_keeps_active_and_latest`, `test_retention_age_prunes_old_sessions` |
@@ -2821,10 +2852,10 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 
 | ID | Sev | Location | Finding | Status |
 |---|---|---|---|---|
-| PMR-001 | **P1** | Task 8 return-path claim; `commands/registry.py` `/session tag` | The plan says the v2 save return value can stay `latest_path` because callers only use it as a truthy path, but `/session tag NAME` calls `save_snapshot()`, then `shutil.copy2(snapshot_path, tagged_json)`. Under v2 that copies the pointer-only `latest.json` into `<tag>.json`, silently replacing a full tagged snapshot export with `{"session_id": ...}`. Add a concrete prescription and regression test for `/session tag` under v2, either by making the command write a v1-shaped export from the loader or by adding an explicit snapshot-export API. | **resolved** — Task 18: explicit `export_snapshot_json` backend API (loader-built full v1-shaped payload, v2-aware) replaces the pointer copy in `/session tag`; regression test asserts the tag file is a full snapshot, not a pointer. Listed in C.9. |
-| PMR-002 | **P1** | C.7 trigger; Task 10 `_backfill_index` / `list_session_snapshots`; existing `test_list_session_snapshots_merges_index_with_legacy_files` | C.7 says backfill triggers when the index is absent **or missing entries**, and Task 10 says the existing legacy-merge test must still pass. The copyable `list_session_snapshots` only calls `_backfill_index()` when `_load_session_index()` returns empty, so an existing/incomplete index hides legacy files that are present on disk. With v2 as default, the existing test path (legacy file first, then a save that writes an index) drops the legacy session. Add missing-entry detection/merge semantics, or explicitly change and approve the user-visible listing contract. | **resolved** — Task 19 (amends Task 10): sniffer-based missing-entry merge — after indexed entries, enumerate on-disk ids (v1 `.json` + v2 `.head`/`.jsonl`, deduped v2-wins) and surface any not in the index; drop the `>= limit` early-return that hid the legacy scan. Mirrored in ohmo `list_snapshots`. Keeps the legacy-merge test green + new v2 test. |
-| PMR-003 | **P1** | Task 17 includes `tests/test_services/test_conversation_index.py`; `services/conversation_index.py::rebuild` | The plan keeps feeding the conversation index on live saves, but the rebuild path still scans only `*/session-*.json`. After Task 1 makes v2 the default, `test_rebuild_from_snapshots` saves a v2 transcript/head with no `.json`, then `rebuild()` indexes zero sessions. Add `conversation_index.py` as a touched surface and make rebuild v2-aware by reassembling snapshots through session storage/session format. | **resolved** — Task 20: `conversation_index.py` added as a touched surface; `rebuild()` enumerates v1+v2 sessions per project and reassembles each via a new `session_storage._load_snapshot_in_dir` core (lazy-imported to avoid the import cycle); `test_rebuild_from_snapshots` extended for v2. |
-| PMR-004 | **P1** | Missing touched surface: `services/autodream/lock.py`; `services/autodream/prompt.py` | Auto-dream still treats `session-*.json` as the saved-session contract: `list_sessions_touched_since()` only scans full JSON snapshots, and the consolidation prompt tells workers to inspect `session-*.json`. With v2 default writes, recent sessions no longer create those files, so auto-dream can stop triggering from session activity and can point workers at the wrong artifact shape. Add autodream as a touched surface, update the scan/prompt for v1+v2, and cover it with a v2 regression test. | **resolved** — Task 21: `autodream/lock.py` + `autodream/prompt.py` added as touched surfaces; `list_sessions_touched_since` scans `session-*.json` **and** `session-*.jsonl` (by mtime, deduped); prompt references both shapes; new test asserts a v2 transcript is discovered. |
+| PMR-001 | **P1** | Task 8 return-path claim; `commands/registry.py` `/session tag` | The plan says the v2 save return value can stay `latest_path` because callers only use it as a truthy path, but `/session tag NAME` calls `save_snapshot()`, then `shutil.copy2(snapshot_path, tagged_json)`. Under v2 that copies the pointer-only `latest.json` into `<tag>.json`, silently replacing a full tagged snapshot export with `{"session_id": ...}`. Add a concrete prescription and regression test for `/session tag` under v2, either by making the command write a v1-shaped export from the loader or by adding an explicit snapshot-export API. | **resolved** — Task 19: explicit `export_snapshot_json` backend API (loader-built full v1-shaped payload, v2-aware) replaces the pointer copy in `/session tag`; a **command-level** regression (`tests/test_commands/test_registry.py`) runs the handler and asserts the tag file is a full snapshot, not a pointer. Listed in C.9. |
+| PMR-002 | **P1** | C.7 trigger; Task 10 `_backfill_index` / `list_session_snapshots`; existing `test_list_session_snapshots_merges_index_with_legacy_files` | C.7 says backfill triggers when the index is absent **or missing entries**, and Task 10 says the existing legacy-merge test must still pass. The copyable `list_session_snapshots` only calls `_backfill_index()` when `_load_session_index()` returns empty, so an existing/incomplete index hides legacy files that are present on disk. With v2 as default, the existing test path (legacy file first, then a save that writes an index) drops the legacy session. Add missing-entry detection/merge semantics, or explicitly change and approve the user-visible listing contract. | **resolved** — Task 20 (amends Task 10): sniffer-based missing-entry merge — after indexed entries, enumerate on-disk ids (v1 `.json` + v2 `.head`/`.jsonl`, deduped v2-wins) and surface any not in the index, building each entry from the v2-aware **loader** (so head-less v2 sessions surface too, not just headed ones); drop the `>= limit` early-return that hid the legacy scan. Mirrored in ohmo `list_snapshots`. Keeps the legacy-merge test green + new v2 (incl. head-less) test. |
+| PMR-003 | **P1** | Task 17 includes `tests/test_services/test_conversation_index.py`; `services/conversation_index.py::rebuild` | The plan keeps feeding the conversation index on live saves, but the rebuild path still scans only `*/session-*.json`. After Task 1 makes v2 the default, `test_rebuild_from_snapshots` saves a v2 transcript/head with no `.json`, then `rebuild()` indexes zero sessions. Add `conversation_index.py` as a touched surface and make rebuild v2-aware by reassembling snapshots through session storage/session format. | **resolved** — Task 21: `conversation_index.py` added as a touched surface; `rebuild()` enumerates v1+v2 sessions per project (shared `session_ids_on_disk`) and reassembles each via a new `session_storage._load_snapshot_in_dir` core (local/lazy import); `test_rebuild_from_snapshots` extended for v2. |
+| PMR-004 | **P1** | Missing touched surface: `services/autodream/lock.py`; `services/autodream/prompt.py` | Auto-dream still treats `session-*.json` as the saved-session contract: `list_sessions_touched_since()` only scans full JSON snapshots, and the consolidation prompt tells workers to inspect `session-*.json`. With v2 default writes, recent sessions no longer create those files, so auto-dream can stop triggering from session activity and can point workers at the wrong artifact shape. Add autodream as a touched surface, update the scan/prompt for v1+v2, and cover it with a v2 regression test. | **resolved** — Task 22: `autodream/lock.py` + `autodream/prompt.py` added as touched surfaces; `list_sessions_touched_since` scans `session-*.json` (skipping `.head.json`) **and** `session-*.jsonl` (by mtime, deduped); prompt references both shapes; new test asserts a v2 transcript is discovered and no `.head` phantom. |
 
 ### Q.5 Approval Criteria
 
@@ -2836,8 +2867,8 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 - [x] Conditional touched surfaces and merge-order deps resolved / deferred. — WS1↔WS4 documented (C.2); R-001's fix is **storage-local**. **Format-consumer blast radius now enumerated in C.9** (the gap that produced PMR-001..004): every code path that reads sessions by file shape is listed and routed through the loader or made format-aware (Phase 7).
 - [x] **Contract/format-change consumer enumeration (C.9).** For a shape change, every consumer of the old shape is inventoried and shown handling v1+v2 — not just the changing module's internal correctness. This check was **absent** in the first three gate runs and is the root-cause fix for the PMR class.
 
-**Gate verdict (post-PMR): CLEARED — implementation-ready.** The prior "CLEARED" (2026-06-13, pre-PMR) was **superseded**: the post-merge review found four P1 format-consumer breaks (PMR-001..004, Q.4.2) the first three gate runs missed because none enumerated the blast radius. This revision adds the **C.9 consumer inventory** (the root-cause fix for the class) and Phase 7 (Tasks 18–22) resolving all four + the ohmo `list_snapshots` mirror. A **third independent adversarial re-gate** (fresh agent, blind) then (a) **independently confirmed C.9's inventory is exhaustive** — its own codebase sweep found no session-shape consumer outside the four, so no new P1 — and (b) verified each fix against the real source. It surfaced one **P2** — the `glob("session-*.json")` / `session-<id>.head.json` collision (a phantom `<id>.head` id the sniffer doesn't filter) — which is now **closed**: a single shared `session_ids_on_disk` enumerator with the `.head.json` skip (Task 20), reused by listing (Task 19) and rebuild, plus negative assertions in the Task 19/21 tests and corrected prose. No open P1, no unaccepted P2; the format-change blast radius is fully covered and enumerated.
+**Gate verdict (post-PMR): CLEARED — implementation-ready.** The prior "CLEARED" (2026-06-13, pre-PMR) was **superseded**: the post-merge review found four P1 format-consumer breaks (PMR-001..004, Q.4.2) the first three gate runs missed because none enumerated the blast radius. This revision adds the **C.9 consumer inventory** (the root-cause fix for the class) and Phase 7 (Tasks 19–23) resolving all four + the ohmo `list_snapshots` mirror. A **third independent adversarial re-gate** (fresh agent, blind) then (a) **independently confirmed C.9's inventory is exhaustive** — its own codebase sweep found no session-shape consumer outside the four, so no new P1 — and (b) verified each fix against the real source. It surfaced one **P2** — the `glob("session-*.json")` / `session-<id>.head.json` collision (a phantom `<id>.head` id the sniffer doesn't filter) — which is now **closed**: a single shared `session_ids_on_disk` enumerator with the `.head.json` skip (Task 21), reused by listing (Task 20) and rebuild, plus negative assertions in the Task 20/22 tests and corrected prose. A **fourth review (owner, 2026-06-13)** added: a command-level `/session tag` regression (PMR-001 is a command, not just a backend API — Task 19), loader-based listing so **head-less** v2 sessions surface (Task 20), Q.1/Q.3.1 updated for the Phase 7 surfaces/tests, the stale "blocked" note removed, and Phase 7 renumbered (18→19..) to clear the duplicate-Task-18 collision. No open P1, no unaccepted P2; the format-change blast radius is fully covered and enumerated.
 
 This remains a **design** gate: the tests above are *specified* as TDD steps to run at implementation, not executed as part of the gate. **Owner promoted DRAFT → APPROVED on 2026-06-13** and this plan is on `main`. The plan is now **implementation-ready** (the PMR blockers that made it not-ready are resolved); implementation is a separate, not-yet-started effort (execute the tasks via TDD, Phase 7 last).
 
-> **Post-merge review note (2026-06-13):** Q.5 and the gate verdict record the pre-merge approval state. The PMR-001..PMR-004 findings above are new open P1 findings discovered after merge; treat implementation as blocked until they are resolved and the gate is re-run.
+> **Post-merge review note (2026-06-13, RESOLVED):** PMR-001..PMR-004 were found after the prior merge; they are now **resolved** (Phase 7, Tasks 19–23) and re-gated **CLEARED** — Q.4.2, Q.5, and the gate verdict reflect the resolved state. A fourth owner review then added the command-level `/session tag` regression (Task 19), head-less listing coverage (Task 20), the Q.1/Q.3.1 updates, the Phase 7 renumber, and this correction. No implementation block remains.
