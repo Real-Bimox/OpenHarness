@@ -171,3 +171,85 @@ def test_ohmo_v2_session_key_pointer_round_trip(tmp_path: Path):
     assert loaded["session_id"] == "o3"
     assert loaded["session_key"] == "feishu:chat-7"
     assert loaded["messages"][0]["content"][0]["text"] == "yo"
+
+
+def test_ohmo_v2_recovers_from_truncated_transcript(tmp_path: Path):
+    from ohmo.session_storage import get_session_dir, load_by_id, save_session_snapshot
+    from ohmo.workspace import initialize_workspace
+    from openharness.engine.messages import ConversationMessage, TextBlock
+    from openharness.api.usage import UsageSnapshot
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_session_snapshot(
+        cwd=tmp_path, workspace=workspace, model="gpt-5.4", system_prompt="s",
+        session_id="oc",
+        messages=[
+            ConversationMessage(role="user", content=[TextBlock(text="a")]),
+            ConversationMessage(role="assistant", content=[TextBlock(text="b")]),
+        ],
+        usage=UsageSnapshot(),
+    )
+    transcript = get_session_dir(workspace) / "session-oc.jsonl"
+    with open(transcript, "ab") as fh:
+        fh.write(b'{"role": "user", "content": [{"type": "text", "text": "c"')
+    snap = load_by_id(workspace, "oc")
+    assert snap is not None
+    assert [m["content"][0]["text"] for m in snap["messages"]] == ["a", "b"]
+
+
+def test_ohmo_v2_recovers_when_head_lost(tmp_path: Path):
+    # R-002a: a lost-head crash must NOT lose the whole ohmo session — the
+    # V2_HEADLESS recovery is now mirrored from openharness. History recovers off
+    # the durable transcript; the session-key lookup re-injects the key.
+    from ohmo.session_storage import (
+        get_session_dir, load_by_id, load_latest_for_session_key, save_session_snapshot,
+    )
+    from ohmo.workspace import initialize_workspace
+    from openharness.engine.messages import ConversationMessage, TextBlock
+    from openharness.api.usage import UsageSnapshot
+    from openharness.services.session_format import head_path
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_session_snapshot(
+        cwd=tmp_path, workspace=workspace, model="gpt-5.4", system_prompt="s",
+        session_id="oh", session_key="feishu:chat-3",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="kept")])],
+        usage=UsageSnapshot(),
+    )
+    # Lost-head crash window: the head (rename, no fsync) is gone; transcript durable.
+    head_path(get_session_dir(workspace), "oh").unlink()
+
+    by_id = load_by_id(workspace, "oh")
+    assert by_id is not None  # was None before R-002a — the whole session was lost
+    assert by_id["app"] == "ohmo"
+    assert [m["content"][0]["text"] for m in by_id["messages"]] == ["kept"]
+
+    by_key = load_latest_for_session_key(workspace, "feishu:chat-3")
+    assert by_key is not None
+    assert by_key["session_key"] == "feishu:chat-3"  # re-injected on head-less recovery
+    assert [m["content"][0]["text"] for m in by_key["messages"]] == ["kept"]
+
+
+def test_ohmo_legacy_v1_latest_still_loads(tmp_path: Path):
+    import json
+    from ohmo.session_storage import get_session_dir, load_latest
+    from ohmo.workspace import initialize_workspace
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    (get_session_dir(workspace) / "latest.json").write_text(
+        json.dumps({
+            "app": "ohmo", "session_id": "oleg", "session_key": "feishu:chat-1",
+            "cwd": str(tmp_path), "model": "gpt-legacy", "system_prompt": "old",
+            "summary": "hi", "created_at": 1.0, "message_count": 1,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "tool_metadata": {},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        }),
+        encoding="utf-8",
+    )
+    snap = load_latest(workspace)
+    assert snap is not None
+    assert snap["session_id"] == "oleg"
+    assert snap["messages"][0]["content"][0]["text"] == "hi"
