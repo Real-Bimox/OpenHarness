@@ -421,3 +421,11 @@ class OhmoSessionBackend(SessionBackend):
         messages: list[ConversationMessage],
     ) -> Path:
         return export_session_markdown(cwd=cwd, workspace=self._workspace, messages=messages)
+
+    def export_snapshot_json(self, *, cwd: str | Path, dest: Path) -> Path:
+        """Write a full v1-shaped ohmo snapshot (loader-built, v2-aware) to ``dest`` (PMR-001)."""
+        payload = load_latest(self._workspace)
+        if payload is None:
+            raise FileNotFoundError("no session to export")
+        dest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return dest

@@ -832,3 +832,18 @@ def test_backend_load_shape_unchanged(tmp_path: Path, monkeypatch):
     listed = DEFAULT_SESSION_BACKEND.list_snapshots(project, limit=5)
     for key in ("session_id", "summary", "message_count", "model", "created_at"):
         assert key in listed[0], f"missing list key {key}"
+
+
+def test_session_tag_export_is_full_snapshot_under_v2(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    from openharness.services.session_backend import OpenHarnessSessionBackend
+    project = tmp_path / "repo"; project.mkdir()
+    backend = OpenHarnessSessionBackend()
+    backend.save_snapshot(cwd=project, model="m", system_prompt="s",
+                          messages=[ConversationMessage(role="user", content=[TextBlock(text="hello")])],
+                          usage=UsageSnapshot(), session_id="t1")
+    dest = get_project_session_dir(project) / "mytag.json"
+    backend.export_snapshot_json(cwd=project, dest=dest)
+    payload = json.loads(dest.read_text())
+    assert payload["session_id"] == "t1"
+    assert payload["messages"][0]["content"][0]["text"] == "hello"  # full snapshot, not a pointer

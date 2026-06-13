@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -46,6 +47,9 @@ class SessionBackend(Protocol):
         messages: list[ConversationMessage],
     ) -> Path:
         """Export the current transcript as markdown."""
+
+    def export_snapshot_json(self, *, cwd: str | Path, dest: Path) -> Path:
+        """Write a full v1-shaped snapshot (loader-built, v2-aware) to ``dest``."""
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,19 @@ class OpenHarnessSessionBackend:
         messages: list[ConversationMessage],
     ) -> Path:
         return session_storage.export_session_markdown(cwd=cwd, messages=messages)
+
+    def export_snapshot_json(self, *, cwd: str | Path, dest: Path) -> Path:
+        """Write a full v1-shaped snapshot (loader-built, v2-aware) to ``dest``.
+
+        Resolves the just-saved session through the v2-aware loader, so a tag
+        export is a real full snapshot under both formats — never the v2
+        pointer ``latest.json`` (PMR-001).
+        """
+        payload = session_storage.load_session_snapshot(cwd)
+        if payload is None:
+            raise FileNotFoundError("no session to export")
+        dest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return dest
 
 
 DEFAULT_SESSION_BACKEND: SessionBackend = OpenHarnessSessionBackend()
