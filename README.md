@@ -148,6 +148,10 @@ OpenHarness is an open-source Python implementation designed for **researchers, 
 
 ## 📰 What's New
 
+- **2026-06-13** 🗄️ **v0.1.20** — Append-only session persistence (v2):
+  - Replaces the O(n²) full-history rewrite with an append-only `session-<id>.jsonl` transcript + `session-<id>.head.json` + pointer `latest.json`, a trusted session index with one-time backfill, and on-save retention pruning — all behind `session_storage_format=v2` (default; set `v1` to revert new writes).
+  - The transcript is the single per-turn durability point (one fsync/turn); a crash recovers to the last complete record. Every legacy v1 session file stays readable via an on-disk format sniffer, and public loader shapes are unchanged. Mirrored in `ohmo`.
+  - Details: [RELEASE_NOTES_v0.1.20.md](RELEASE_NOTES_v0.1.20.md); design: [docs/proposals/session-persistence-v2-plan.md](docs/proposals/session-persistence-v2-plan.md).
 - **2026-06-13** 🩺 **v0.1.19** — Optional health/status HTTP server:
   - Adds an opt-in `openharness-ai[health-server]` extra with FastAPI + plain uvicorn for a local-only JSON health API. The base install remains unchanged.
   - `oh --health-server` serves `GET /health`, `GET /health/detailed`, `GET /api/status`, `GET /api/system/stats`, and `GET /v1/capabilities` on `127.0.0.1`.

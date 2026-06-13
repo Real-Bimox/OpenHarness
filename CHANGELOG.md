@@ -4,6 +4,20 @@ All notable changes to OpenHarness should be recorded in this file.
 
 The format is based on Keep a Changelog, and this project currently tracks changes in a lightweight, repository-oriented way.
 
+## [0.1.20] - 2026-06-13
+
+### Added
+
+- **Append-only session persistence (v2).** Replaces the O(n²) full-history rewrite with an append-only per-session transcript (`session-<id>.jsonl`, delta appends) plus a small head file (`session-<id>.head.json`) and a pointer `latest.json`, a trusted session index with a lazy one-time backfill, and on-save retention pruning — all behind a new `session_storage_format` setting (default `"v2"`; set `"v1"` to revert new writes). Adds `session_retention_max_files` (default 50) and `session_retention_max_age_days` (default 30) settings (`0` disables each rule; the active, latest-pointed, and recently-touched sessions are never pruned). Mirrored in `ohmo`. Every legacy v1 session file remains readable forever via an on-disk format sniffer, and the public loader dict shapes are unchanged. See `docs/proposals/session-persistence-v2-plan.md` (roadmap WS4).
+
+### Changed
+
+- The session transcript is the single per-turn durability point (one fsync per turn); the head, pointer, and index are atomic-rename only and rebuilt on the next save. `atomic_write_bytes` now fsyncs the parent directory on durable writes, and the first transcript append fsyncs the parent dir so a brand-new session's create is durable.
+
+### Fixed
+
+- Made every session consumer format-aware so v2-as-default does not break them: `/session tag` exports a full snapshot (not the pointer `latest.json`), session listing surfaces on-disk v1+v2 sessions an incomplete index is missing, conversation-index rebuild indexes v2 sessions, and auto-dream discovers v2 transcripts.
+
 ## [0.1.19] - 2026-06-13
 
 ### Added
