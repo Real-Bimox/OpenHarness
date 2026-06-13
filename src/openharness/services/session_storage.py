@@ -378,24 +378,57 @@ def _update_conversation_index(payload: dict[str, Any]) -> None:
 
 
 def _sanitize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Normalize persisted messages for forward compatibility."""
+    """Normalize persisted messages for forward compatibility (single pass)."""
     raw_messages = payload.get("messages", [])
-    if isinstance(raw_messages, list):
-        messages = sanitize_conversation_messages(
-            [ConversationMessage.model_validate(item) for item in raw_messages]
-        )
-        payload = dict(payload)
-        payload["messages"] = [message.model_dump(mode="json") for message in messages]
-        payload["message_count"] = len(messages)
+    if not isinstance(raw_messages, list):
+        return payload
+    sanitized = sanitize_conversation_messages(
+        [ConversationMessage.model_validate(item) for item in raw_messages]
+    )
+    payload = dict(payload)
+    payload["messages"] = [message.model_dump(mode="json") for message in sanitized]
+    payload["message_count"] = len(sanitized)
     return payload
+
+
+def _load_v2_payload(session_dir: Path, session_id: str) -> dict[str, Any] | None:
+    """Reassemble a v1-shaped snapshot dict from a v2 head + transcript.
+
+    Handles V2_HEADLESS (C.3 / C.6): if the head was lost in a crash but the
+    transcript is durable, resume still works off the transcript and the head
+    is rebuilt on the next save. Returns None only when BOTH are absent.
+    """
+    head = session_format.read_head(session_dir, session_id)
+    raw_messages = session_format.load_v2_snapshot(session_dir, session_id)
+    if head is None and not raw_messages:
+        return None
+    # Head-less branch: history is preserved; head-only fields (model, usage,
+    # tool_metadata) are deliberately omitted and degrade per the C.6 contract
+    # (R-002) — model falls back to the runtime default, NOT null.
+    payload = dict(head) if head is not None else {
+        "session_id": session_id,
+        "message_count": len(raw_messages),
+    }
+    payload["messages"] = raw_messages
+    # system_prompt is rebuilt by build_runtime; loaders never read it back.
+    payload.setdefault("system_prompt", "")
+    return _sanitize_snapshot_payload(payload)
 
 
 def load_session_snapshot(cwd: str | Path) -> dict[str, Any] | None:
     """Load the most recent session snapshot for the project."""
-    path = get_project_session_dir(cwd) / "latest.json"
+    session_dir = get_project_session_dir(cwd)
+    path = session_dir / "latest.json"
     if not path.exists():
         return None
-    return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if session_format.detect_latest_format(raw) == "v2":
+        sid = str(raw.get("session_id") or "")
+        return _load_v2_payload(session_dir, sid) if sid else None
+    return _sanitize_snapshot_payload(raw)
 
 
 def list_session_snapshots(cwd: str | Path, limit: int = 20) -> list[dict[str, Any]]:
@@ -486,16 +519,16 @@ def list_session_snapshots(cwd: str | Path, limit: int = 20) -> list[dict[str, A
 def load_session_by_id(cwd: str | Path, session_id: str) -> dict[str, Any] | None:
     """Load a specific session by ID."""
     session_dir = get_project_session_dir(cwd)
-    # Try named session first
-    path = session_dir / f"session-{session_id}.json"
-    if path.exists():
+    fmt = session_format.detect_session_format(session_dir, session_id)
+    if fmt == "v2":
+        return _load_v2_payload(session_dir, session_id)
+    if fmt == "v1":
+        path = session_dir / f"session-{session_id}.json"
         return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
-    # Fallback to latest.json if session_id matches
-    latest = session_dir / "latest.json"
-    if latest.exists():
-        data = _sanitize_snapshot_payload(json.loads(latest.read_text(encoding="utf-8")))
-        if data.get("session_id") == session_id or session_id == "latest":
-            return data
+    # Fallback to latest.json if it resolves to this id.
+    snap = load_session_snapshot(cwd)
+    if snap is not None and (snap.get("session_id") == session_id or session_id == "latest"):
+        return snap
     return None
 
 

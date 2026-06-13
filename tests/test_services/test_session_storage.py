@@ -339,3 +339,74 @@ def test_concurrent_v2_saves_preserve_all_index_entries(tmp_path: Path, monkeypa
     from openharness.services.session_storage import _load_session_index
     ids = {e["session_id"] for e in _load_session_index(get_project_session_dir(project))}
     assert ids == {f"c{i}" for i in range(12)}
+
+
+def test_v2_load_latest_via_pointer_round_trip(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    save_session_snapshot(
+        cwd=project,
+        model="claude-test",
+        system_prompt="system",
+        session_id="v2sess",
+        messages=[
+            ConversationMessage(role="user", content=[TextBlock(text="hello")]),
+            ConversationMessage(role="assistant", content=[TextBlock(text="world")]),
+        ],
+        usage=UsageSnapshot(input_tokens=3, output_tokens=4),
+        tool_metadata={"recent_verified_work": ["did a thing"]},
+    )
+
+    snap = load_session_snapshot(project)
+    assert snap is not None
+    assert snap["session_id"] == "v2sess"
+    assert snap["model"] == "claude-test"
+    assert snap["message_count"] == 2
+    assert [m["role"] for m in snap["messages"]] == ["user", "assistant"]
+    assert snap["usage"]["output_tokens"] == 4
+    assert snap["tool_metadata"]["recent_verified_work"] == ["did a thing"]
+
+
+def test_v2_load_by_id_round_trip(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(
+        cwd=project,
+        model="claude-test",
+        system_prompt="system",
+        session_id="byid",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="x")])],
+        usage=UsageSnapshot(),
+    )
+    from openharness.services.session_storage import load_session_by_id
+
+    snap = load_session_by_id(project, "byid")
+    assert snap is not None and snap["session_id"] == "byid"
+    assert snap["messages"][0]["content"][0]["text"] == "x"
+
+
+def test_v2_load_via_pointer_recovers_when_head_missing(tmp_path: Path, monkeypatch):
+    # P2-005 / V2_HEADLESS (C.6): the head was lost in a crash but the transcript
+    # is durable — resume must still recover the history off the transcript.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    import openharness.services.session_storage as ss
+    from openharness.services.session_format import head_path
+
+    project = tmp_path / "repo"
+    project.mkdir()
+    save_session_snapshot(
+        cwd=project, model="claude-test", system_prompt="s", session_id="hl",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="kept")])],
+        usage=UsageSnapshot(),
+    )
+    session_dir = get_project_session_dir(project)
+    head_path(session_dir, "hl").unlink()  # simulate the lost-head crash window
+    ss._v2_persisted_count.clear()
+    ss._v2_persisted_prefix_fp.clear()  # both halves of the in-process cursor vanish on crash
+
+    snap = load_session_snapshot(project)  # resolves the latest.json pointer
+    assert snap is not None
+    assert [m["content"][0]["text"] for m in snap["messages"]] == ["kept"]
