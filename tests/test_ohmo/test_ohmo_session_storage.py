@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from openharness.api.usage import UsageSnapshot
-from openharness.engine.messages import ConversationMessage
+from openharness.engine.messages import ConversationMessage, TextBlock
 
 from ohmo.session_storage import OhmoSessionBackend, get_session_dir, list_snapshots, save_session_snapshot
 from ohmo.workspace import initialize_workspace
@@ -119,3 +119,55 @@ def test_ohmo_session_backend_sanitizes_legacy_empty_assistant_messages(tmp_path
     assert loaded is not None
     assert loaded["message_count"] == 1
     assert loaded["messages"][0]["role"] == "user"
+
+
+def test_ohmo_v2_save_and_load_round_trip(tmp_path: Path):
+    from ohmo.session_storage import load_by_id, load_latest, save_session_snapshot
+    from ohmo.workspace import initialize_workspace
+    from openharness.engine.messages import ConversationMessage, TextBlock
+    from openharness.api.usage import UsageSnapshot
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_session_snapshot(
+        cwd=tmp_path, workspace=workspace, model="gpt-5.4", system_prompt="SYS",
+        session_id="o2", session_key="feishu:chat-9",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="hi")])],
+        usage=UsageSnapshot(input_tokens=2, output_tokens=3),
+        tool_metadata={"permission_mode": "default"},
+    )
+    from ohmo.session_storage import get_session_dir
+
+    session_dir = get_session_dir(workspace)
+    assert (session_dir / "session-o2.jsonl").exists()
+    assert (session_dir / "session-o2.head.json").exists()
+    import json
+    assert json.loads((session_dir / "latest.json").read_text())["session_id"] == "o2"
+
+    latest = load_latest(workspace)
+    assert latest is not None and latest["session_id"] == "o2"
+    assert latest["messages"][0]["content"][0]["text"] == "hi"
+    assert latest["usage"]["output_tokens"] == 3
+    byid = load_by_id(workspace, "o2")
+    assert byid is not None and byid["session_id"] == "o2"
+
+
+def test_ohmo_v2_session_key_pointer_round_trip(tmp_path: Path):
+    from ohmo.session_storage import load_latest_for_session_key, save_session_snapshot
+    from ohmo.workspace import initialize_workspace
+    from openharness.engine.messages import ConversationMessage, TextBlock
+    from openharness.api.usage import UsageSnapshot
+
+    workspace = tmp_path / ".ohmo-home"
+    initialize_workspace(workspace)
+    save_session_snapshot(
+        cwd=tmp_path, workspace=workspace, model="gpt-5.4", system_prompt="SYS",
+        session_id="o3", session_key="feishu:chat-7",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="yo")])],
+        usage=UsageSnapshot(),
+    )
+    loaded = load_latest_for_session_key(workspace, "feishu:chat-7")
+    assert loaded is not None
+    assert loaded["session_id"] == "o3"
+    assert loaded["session_key"] == "feishu:chat-7"
+    assert loaded["messages"][0]["content"][0]["text"] == "yo"
