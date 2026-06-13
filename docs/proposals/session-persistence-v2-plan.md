@@ -1083,25 +1083,44 @@ This inventory is the gate's blast-radius checklist for contract/format changes 
 
 
    def test_v2_save_uses_unlocked_index_core_not_the_locking_wrapper(tmp_path: Path, monkeypatch):
-       # C.2 MECHANISM: the v2 save holds .sessions.lock ONCE and calls the lock-free
-       # *_unlocked core. Calling the locking _update_session_index from inside its own
-       # critical section would re-acquire flock (per-open-description) and self-deadlock.
-       # The 12-thread test proves serialization but not single-acquisition / no-nesting.
+       # C.2 MECHANISM: the v2 save runs the lock-free *_unlocked index core EXACTLY ONCE and
+       # WHILE .sessions.lock is held. Three failure modes this must catch:
+       #  (a) calling the locking _update_session_index wrapper from inside the critical section
+       #      (re-acquires flock, per-open-description -> self-deadlock);
+       #  (b) calling the unlocked core OUTSIDE the lock (no serialization — passes a wrapper-only test);
+       #  (c) acquiring/writing more than once.
+       # The 12-thread test proves serialization but none of (a)-(c). We wrap exclusive_file_lock
+       # to track whether it is active, and record that state at the moment the core runs.
        monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       import contextlib
        import openharness.services.session_storage as ss
 
+       lock_held = {"v": False}
+       real_lock = ss.exclusive_file_lock
+       @contextlib.contextmanager
+       def _tracking_lock(path):
+           with real_lock(path):
+               lock_held["v"] = True
+               try:
+                   yield
+               finally:
+                   lock_held["v"] = False
+       monkeypatch.setattr(ss, "exclusive_file_lock", _tracking_lock)
+
        wrapper_calls: list[int] = []
-       core_calls: list[int] = []
+       core_lock_states: list[bool] = []
        real_core = ss._update_session_index_unlocked
        monkeypatch.setattr(ss, "_update_session_index", lambda *a, **k: wrapper_calls.append(1))
-       monkeypatch.setattr(ss, "_update_session_index_unlocked",
-                           lambda *a, **k: (core_calls.append(1), real_core(*a, **k))[1])
+       def _spy_core(*a, **k):
+           core_lock_states.append(lock_held["v"])  # was .sessions.lock held when the core ran?
+           return real_core(*a, **k)
+       monkeypatch.setattr(ss, "_update_session_index_unlocked", _spy_core)
 
        project = tmp_path / "repo"; project.mkdir()
        save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="x",
                              messages=[ConversationMessage(role="user", content=[TextBlock(text="x")])], usage=UsageSnapshot())
-       assert wrapper_calls == []     # v2 save must NOT call the locking wrapper (would self-deadlock under flock)
-       assert len(core_calls) == 1    # exactly one lock-free index write, inside the single .sessions.lock block
+       assert wrapper_calls == []          # never the locking wrapper (would self-deadlock under flock)
+       assert core_lock_states == [True]   # core ran EXACTLY ONCE, and the lock WAS held while it ran (C.2)
 
 
    def test_concurrent_v2_saves_preserve_all_index_entries(tmp_path: Path, monkeypatch):
@@ -2758,7 +2777,7 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 - Modify: `src/openharness/services/session_storage.py` (`list_session_snapshots`, amends Task 10), `ohmo/session_storage.py` (`list_snapshots`, `:179`)
 - Test: `tests/test_services/test_session_storage.py`, `tests/test_ohmo/test_ohmo_session_storage.py`
 
-**Design decision:** **Amends Task 10.** C.7 says backfill triggers when the index is absent **or missing entries**, but the copyable `list_session_snapshots` only scans disk when `_load_session_index()` is empty, and it scans only `session-*.json` — so a present-but-incomplete index hides on-disk sessions, and under v2 the `.json` glob finds nothing. Replace the empty-only trigger with a **sniffer-based missing-entry merge**: after adding indexed entries, enumerate on-disk session ids via the shared `session_ids_on_disk` (Task 21 — v1 `session-*.json` **and** v2 `session-*.head.json`/`session-*.jsonl`, deduped v2-wins, with the `.head.json` skip), and for each id not already present, build an entry **from the v2-aware loader core `_load_snapshot_in_dir` (Task 21)** — `_session_index_entry(loaded_payload, ...)` — **not** `read_head`. This matters for **head-less v2** (transcript present, head lost in a crash — C.6): `read_head` returns `None` for it, which would silently drop a recoverable session from listing; the loader reassembles it (degraded `model`/`summary` per C.6) so it still appears. Drop the `len(sessions) >= limit` early-return that currently short-circuits the legacy scan. **Persist the backfill, do not merge-on-read (C.7):** when any missing entry is derived, write the merged index (indexed + derived entries) **once under `.sessions.lock`** via atomic rename — this *is* C.7's lazy one-time backfill, so the next listing is index-only and idempotent. Use a single lock acquisition over the read-modify-write (`_update_session_index_unlocked` per derived entry, or build the merged list and `_write_session_index` once — C.2: never nest the lock). **Surfacing entries in the returned list without persisting them would pass the listing test yet still violate C.7's "whole index written under lock" contract** — that is the gap this task closes. Mirror the same in ohmo's `list_snapshots`.
+**Design decision:** **Amends Task 10.** C.7 says backfill triggers when the index is absent **or missing entries**, but the copyable `list_session_snapshots` only scans disk when `_load_session_index()` is empty, and it scans only `session-*.json` — so a present-but-incomplete index hides on-disk sessions, and under v2 the `.json` glob finds nothing. Replace the empty-only trigger with a **sniffer-based missing-entry merge**: after adding indexed entries, enumerate on-disk session ids via the shared `session_ids_on_disk` (Task 21 — v1 `session-*.json` **and** v2 `session-*.head.json`/`session-*.jsonl`, deduped v2-wins, with the `.head.json` skip), and for each id not already present, build an entry **from the v2-aware loader core `_load_snapshot_in_dir` (Task 21)** — `_session_index_entry(loaded_payload, ...)` — **not** `read_head`. This matters for **head-less v2** (transcript present, head lost in a crash — C.6): `read_head` returns `None` for it, which would silently drop a recoverable session from listing; the loader reassembles it (degraded `model`/`summary` per C.6) so it still appears. Drop the `len(sessions) >= limit` early-return that currently short-circuits the legacy scan. **Persist the backfill, do not merge-on-read (C.7):** when any missing entry is derived, write the merged index **once under `.sessions.lock`** via atomic rename — this *is* C.7's lazy one-time backfill, so the next listing is index-only and idempotent. **Build the full merged list (indexed + all derived entries) and write it with a SINGLE `_write_session_index` call inside ONE `.sessions.lock` acquisition.** Do **not** call `_update_session_index_unlocked` per derived entry: that helper writes the whole index on every call, so N missing entries means N writes and an interruption between them leaves a **partially** backfilled index — violating C.7's all-or-nothing "written once" (a crash mid-backfill must leave the *old* index, not a partial one). (C.2: one lock acquisition, never nest.) **Surfacing entries in the returned list without persisting them would pass the listing test yet still violate C.7's "whole index written under lock" contract** — that is the gap this task closes. Mirror the same in ohmo's `list_snapshots`.
 
 1. - [ ] Failing test (v2 session missing from a non-empty index still lists — **including a head-less one**):
    ```python
@@ -2784,8 +2803,35 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
        # index itself contains the headed (B) AND head-less (C) v2 sessions, and a 2nd listing is index-only.
        indexed_ids = {e["session_id"] for e in _load_session_index(sdir)}
        assert {"A", "B", "C"} <= indexed_ids
+
+
+   def test_backfill_writes_index_exactly_once(tmp_path: Path, monkeypatch):
+       # C.7 ATOMICITY: backfilling N missing entries must write the index ONCE (all-or-nothing),
+       # NOT once per entry. A per-entry loop (_update_session_index_unlocked per id) writes the
+       # whole index on each call, so an interruption between B and C leaves a PARTIALLY backfilled
+       # index — violating C.7 ("a crash mid-backfill leaves the OLD index, not a partial one").
+       # Instrument _write_session_index: exactly one write, covering BOTH missing sessions.
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       import openharness.services.session_storage as ss
+       from openharness.services import session_format
+       project = tmp_path / "repo"; project.mkdir()
+       save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="A",
+                             messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
+       sdir = get_project_session_dir(project)
+       for sid in ("B", "C"):  # two index-missing v2 sessions on disk
+           session_format.append_messages_to_transcript(sdir, sid, [ConversationMessage(role="user", content=[TextBlock(text=sid)])], last_persisted_count=0)
+           session_format.write_head(sdir, sid, {"session_id": sid, "message_count": 1, "created_at": 1.0})
+       writes: list[set] = []
+       real_write = ss._write_session_index
+       def _spy(session_dir, entries):
+           writes.append({e["session_id"] for e in entries})
+           return real_write(session_dir, entries)
+       monkeypatch.setattr(ss, "_write_session_index", _spy)
+       list_session_snapshots(project, limit=50)
+       assert len(writes) == 1            # ONE write for the whole backfill, not one per entry
+       assert {"A", "B", "C"} <= writes[0]  # ...persisting both missing entries together (atomic)
    ```
-2. - [ ] Implement the missing-entry merge via `session_ids_on_disk` + `_load_snapshot_in_dir` (Task 21 — the shared enumerator/loader that strip/skip `.head.json` and reassemble head-less v2), then **write the merged index once under `.sessions.lock`** (C.7 one-time backfill — not merge-on-read); mirror in ohmo. Task 10's body backfills only when the index is **absent**; this extends it to **missing entries**, persisting them (C.7). The existing legacy-merge test must stay green.
+2. - [ ] Implement the missing-entry merge via `session_ids_on_disk` + `_load_snapshot_in_dir` (Task 21 — the shared enumerator/loader that strip/skip `.head.json` and reassemble head-less v2), then **build the full merged list and write it with a single `_write_session_index` call inside one `.sessions.lock` acquisition** (C.7 one-time backfill — all-or-nothing, not per-entry, not merge-on-read); mirror in ohmo. Task 10's body backfills only when the index is **absent**; this extends it to **missing entries**, persisting them atomically (C.7). The existing legacy-merge test must stay green.
 3. - [ ] Run + commit (`Surface index-missing v1+v2 (incl. head-less) sessions in listing (PMR-002)`).
 
 ### Task 21: `conversation_index.rebuild` is v2-aware (PMR-003)
@@ -2934,7 +2980,8 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 | public shapes unchanged / legacy readable | structural + behavioral | v2 round-trips, legacy fixtures (Task 14), no-interface-break test |
 | **Contract-MECHANISM enforcement (5th-review audit — test the contract, not just the outcome):** | | |
 | C.1 transcript-append fsync is actually invoked (durability commit point, not just write) | behavioral | `test_append_jsonl_line_appends_and_fsyncs` (now instruments `os.fsync`) |
-| C.2 v2 save calls the lock-free index core once, never the locking wrapper (no nested flock) | behavioral | `test_v2_save_uses_unlocked_index_core_not_the_locking_wrapper` |
+| C.2 v2 save runs the lock-free index core once **while `.sessions.lock` is held**, never the locking wrapper (no nested flock, no unlocked write outside the lock) | behavioral | `test_v2_save_uses_unlocked_index_core_not_the_locking_wrapper` |
+| C.7 backfill writes the index **exactly once** (atomic all-or-nothing, not once-per-entry) | behavioral | `test_backfill_writes_index_exactly_once` |
 | C.3 sniffer reads on-disk shape only, ignores a contradictory `session_storage_format` | behavioral | `test_detect_session_format_ignores_the_setting` |
 | C.4 cursor is the transcript live-count, never `head.message_count` (even when head present) | behavioral | `test_v2_cursor_ignores_head_message_count_even_when_head_present` |
 | C.8 recency window protects a recent session from count-pruning (over max_files) | behavioral | `test_retention_recency_window_protects_recent_from_count_prune` |
@@ -2987,7 +3034,7 @@ These close the C.9 blast-radius gap: code that reads sessions *by file shape* i
 - [x] Conditional touched surfaces and merge-order deps resolved / deferred. — WS1↔WS4 documented (C.2); R-001's fix is **storage-local**. **Format-consumer blast radius now enumerated in C.9** (the gap that produced PMR-001..004): every code path that reads sessions by file shape is listed and routed through the loader or made format-aware (Phase 7).
 - [x] **Contract/format-change consumer enumeration (C.9).** For a shape change, every consumer of the old shape is inventoried and shown handling v1+v2 — not just the changing module's internal correctness. This check was **absent** in the first three gate runs and is the root-cause fix for the PMR class.
 
-**Gate verdict (post-PMR): CLEARED — implementation-ready.** The prior "CLEARED" (2026-06-13, pre-PMR) was **superseded**: the post-merge review found four P1 format-consumer breaks (PMR-001..004, Q.4.2) the first three gate runs missed because none enumerated the blast radius. This revision adds the **C.9 consumer inventory** (the root-cause fix for the class) and Phase 7 (Tasks 19–23) resolving all four + the ohmo `list_snapshots` mirror. A **third independent adversarial re-gate** (fresh agent, blind) then (a) **independently confirmed C.9's inventory is exhaustive** — its own codebase sweep found no session-shape consumer outside the four, so no new P1 — and (b) verified each fix against the real source. It surfaced one **P2** — the `glob("session-*.json")` / `session-<id>.head.json` collision (a phantom `<id>.head` id the sniffer doesn't filter) — which is now **closed**: a single shared `session_ids_on_disk` enumerator with the `.head.json` skip (Task 21), reused by listing (Task 20) and rebuild, plus negative assertions in the Task 20/22 tests and corrected prose. A **fourth review (owner, 2026-06-13)** added: a command-level `/session tag` regression (PMR-001 is a command, not just a backend API — Task 19), loader-based listing so **head-less** v2 sessions surface (Task 20), Q.1/Q.3.1 updated for the Phase 7 surfaces/tests, the stale "blocked" note removed, and Phase 7 renumbered (18→19..) to clear the duplicate-Task-18 collision. A **fifth review (owner, 2026-06-13)** caught the sharpest issue: Task 20 made the listing *test* pass without satisfying C.7's *contract* — it surfaced missing entries but never **persisted** the backfill; fixed (write the merged index once under `.sessions.lock`; test asserts `_load_session_index`), plus C.7's idempotent wording now allows loader-derived head-less entries, the command-test now constructs the registry, and Q.5 coverage names the PMR tests. A **self-run contract-MECHANISM audit** (11 adversarial lenses, find→verify) then generalised that exact "test passes / contract unmet" class across C.1–C.9 and closed four more: **C.1** (assert `os.fsync` is actually invoked on append — the durability commit point), **C.2** (assert the v2 save uses the lock-free index core once, never the locking wrapper), **C.3** (assert the sniffer ignores a contradictory `session_storage_format`), **C.4** (assert the cursor ignores `head.message_count` even when the head is present), **C.8** (assert the recency window protects a recent session from count-pruning). Each adds a behavioural test that *fails* if the contract mechanism is violated even when the old outcome-only test would pass. No open P1, no unaccepted P2; every canonical contract now has a mechanism-enforcing test (Q.3.1), and the format-change blast radius is fully enumerated (C.9).
+**Gate verdict (post-PMR): CLEARED — implementation-ready.** The prior "CLEARED" (2026-06-13, pre-PMR) was **superseded**: the post-merge review found four P1 format-consumer breaks (PMR-001..004, Q.4.2) the first three gate runs missed because none enumerated the blast radius. This revision adds the **C.9 consumer inventory** (the root-cause fix for the class) and Phase 7 (Tasks 19–23) resolving all four + the ohmo `list_snapshots` mirror. A **third independent adversarial re-gate** (fresh agent, blind) then (a) **independently confirmed C.9's inventory is exhaustive** — its own codebase sweep found no session-shape consumer outside the four, so no new P1 — and (b) verified each fix against the real source. It surfaced one **P2** — the `glob("session-*.json")` / `session-<id>.head.json` collision (a phantom `<id>.head` id the sniffer doesn't filter) — which is now **closed**: a single shared `session_ids_on_disk` enumerator with the `.head.json` skip (Task 21), reused by listing (Task 20) and rebuild, plus negative assertions in the Task 20/22 tests and corrected prose. A **fourth review (owner, 2026-06-13)** added: a command-level `/session tag` regression (PMR-001 is a command, not just a backend API — Task 19), loader-based listing so **head-less** v2 sessions surface (Task 20), Q.1/Q.3.1 updated for the Phase 7 surfaces/tests, the stale "blocked" note removed, and Phase 7 renumbered (18→19..) to clear the duplicate-Task-18 collision. A **fifth review (owner, 2026-06-13)** caught the sharpest issue: Task 20 made the listing *test* pass without satisfying C.7's *contract* — it surfaced missing entries but never **persisted** the backfill; fixed (write the merged index once under `.sessions.lock`; test asserts `_load_session_index`), plus C.7's idempotent wording now allows loader-derived head-less entries, the command-test now constructs the registry, and Q.5 coverage names the PMR tests. A **self-run contract-MECHANISM audit** (11 adversarial lenses, find→verify) then generalised that exact "test passes / contract unmet" class across C.1–C.9 and closed four more: **C.1** (assert `os.fsync` is actually invoked on append — the durability commit point), **C.2** (assert the v2 save uses the lock-free index core once, never the locking wrapper), **C.3** (assert the sniffer ignores a contradictory `session_storage_format`), **C.4** (assert the cursor ignores `head.message_count` even when the head is present), **C.8** (assert the recency window protects a recent session from count-pruning). Each adds a behavioural test that *fails* if the contract mechanism is violated even when the old outcome-only test would pass. A **sixth review (owner, 2026-06-13)** then tightened two of those: Task 20 no longer offers the per-entry `_update_session_index_unlocked` option (it writes the index N times → a partial backfill on interruption); it now mandates a **single `_write_session_index`** for the merged list, with a test asserting **exactly one** write covers B+C (C.7 atomicity); and the C.2 test now wraps `exclusive_file_lock` to assert the index core runs **while the lock is held** (catching an unlocked write outside the lock, not just the wrapper). No open P1, no unaccepted P2; every canonical contract now has a mechanism-enforcing test (Q.3.1), and the format-change blast radius is fully enumerated (C.9).
 
 This remains a **design** gate: the tests above are *specified* as TDD steps to run at implementation, not executed as part of the gate. **Owner promoted DRAFT → APPROVED on 2026-06-13** and this plan is on `main`. The plan is now **implementation-ready** (the PMR blockers that made it not-ready are resolved); implementation is a separate, not-yet-started effort (execute the tasks via TDD, Phase 7 last).
 
