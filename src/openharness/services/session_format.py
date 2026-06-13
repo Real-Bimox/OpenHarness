@@ -17,9 +17,12 @@ pure functions with no settings access.
 
 from __future__ import annotations
 
+import json
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+
+from openharness.utils.fs import atomic_write_text
 
 
 def detect_latest_format(payload: dict[str, Any]) -> str:
@@ -60,3 +63,36 @@ def system_prompt_fingerprint(system_prompt: str) -> str:
     the digest is kept only as a debugging signal for prompt drift.
     """
     return sha256(system_prompt.encode("utf-8")).hexdigest()
+
+
+def head_path(session_dir: Path, session_id: str) -> Path:
+    return session_dir / f"session-{session_id}.head.json"
+
+
+def transcript_path(session_dir: Path, session_id: str) -> Path:
+    return session_dir / f"session-{session_id}.jsonl"
+
+
+def write_head(session_dir: Path, session_id: str, head: dict[str, Any]) -> None:
+    """Atomically rewrite the per-session head file.
+
+    Atomic-rename without per-write fsync: a crash loses at most cosmetic
+    head metadata (the transcript stays durable), so the durability cost of
+    an fsync per turn is not paid here.
+    """
+    atomic_write_text(
+        head_path(session_dir, session_id),
+        json.dumps(head, indent=2) + "\n",
+        fsync=False,
+    )
+
+
+def read_head(session_dir: Path, session_id: str) -> dict[str, Any] | None:
+    path = head_path(session_dir, session_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return payload if isinstance(payload, dict) else None

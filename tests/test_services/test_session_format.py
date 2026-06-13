@@ -78,3 +78,28 @@ def test_system_prompt_fingerprint_empty():
     from openharness.services.session_format import system_prompt_fingerprint
 
     assert len(system_prompt_fingerprint("")) == 64
+
+
+def test_write_and_read_head_round_trip(tmp_path: Path):
+    from openharness.services.session_format import read_head, write_head
+
+    head = {
+        "session_id": "abc123",
+        "model": "claude-test",
+        "system_prompt_sha256": "deadbeef" * 8,
+        "usage": {"input_tokens": 1, "output_tokens": 2},
+        "tool_metadata": {"permission_mode": "default"},
+        "message_count": 3,
+        "summary": "hello",
+        "created_at": 1.0,
+    }
+    write_head(tmp_path, "abc123", head)
+    assert (tmp_path / "session-abc123.head.json").exists()
+    loaded = read_head(tmp_path, "abc123")
+    assert loaded == head
+
+
+def test_read_head_missing_returns_none(tmp_path: Path):
+    from openharness.services.session_format import read_head
+
+    assert read_head(tmp_path, "ghost") is None
