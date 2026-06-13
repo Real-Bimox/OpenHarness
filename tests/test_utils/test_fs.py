@@ -182,3 +182,32 @@ def test_concurrent_writers_all_survive(tmp_path: Path) -> None:
     result = json.loads(target.read_text())
     assert set(result) == {f"key_{i}" for i in range(8)}
     assert all(result[f"key_{i}"] == f"value_{i}" for i in range(8))
+
+
+# ---------------------------------------------------------------------------
+# Durability / parent-directory fsync
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_fsyncs_parent_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With fsync=True the parent directory is fsynced so the rename is durable."""
+    synced_fds: list[int] = []
+    real_fsync = os.fsync
+
+    def _record(fd: int) -> None:
+        synced_fds.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr("openharness.utils.fs.os.fsync", _record)
+    path = tmp_path / "out.txt"
+    atomic_write_text(path, "payload", fsync=True)
+    # One fsync for the file, one for the parent directory.
+    assert len(synced_fds) == 2
+    assert path.read_text() == "payload"
+
+
+def test_atomic_write_no_dir_fsync_when_fsync_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    synced_fds: list[int] = []
+    monkeypatch.setattr("openharness.utils.fs.os.fsync", lambda fd: synced_fds.append(fd))
+    atomic_write_text(tmp_path / "out.txt", "payload", fsync=False)
+    assert synced_fds == []

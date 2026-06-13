@@ -72,6 +72,8 @@ def atomic_write_bytes(
                 os.fsync(tmp_file.fileno())
         _apply_mode(tmp_path, target_mode)
         os.replace(tmp_path, dst)
+        if fsync:
+            _fsync_dir(dst.parent)
     except BaseException:
         with contextlib.suppress(OSError):
             tmp_path.unlink()
@@ -126,3 +128,23 @@ def _apply_mode(path: Path, target_mode: int) -> None:
         # chmod can fail on Windows / FAT / some network mounts. The payload
         # is still intact; only permission enforcement is weakened.
         pass
+
+
+def _fsync_dir(directory: Path) -> None:
+    """Fsync a directory so a contained rename reaches stable storage.
+
+    A rename is only durable once the directory entry is flushed. Best
+    effort: opening a directory fd is not possible on every platform
+    (Windows, some network mounts), so failures are swallowed — the
+    payload file itself was already fsynced before the rename.
+    """
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
