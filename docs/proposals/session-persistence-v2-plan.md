@@ -1,6 +1,8 @@
 # Session Persistence v2 (WS4) Implementation Plan
 
-> **Status: APPROVED** (owner, 2026-06-13). design-quality-gate (Tier T2) **CLEARED & implementation-ready** — 14 original + 4 re-review findings (R-001..R-004) + 4 post-merge format-consumer findings (PMR-001..004) resolved across **three** independent adversarial re-gates; the format-change blast radius is enumerated in **C.9** and covered by **Phase 7**. The build has not been started.
+> **Status: APPROVED** (owner, 2026-06-13). design-quality-gate (Tier T2) **CLEARED & implementation-ready** — 14 original + 4 re-review findings (R-001..R-004) + 4 post-merge format-consumer findings (PMR-001..004) resolved across **three** independent adversarial re-gates; the format-change blast radius is enumerated in **C.9** and covered by **Phase 7**.
+>
+> **Implementation complete on branch `proposal/session-persistence-v2`** (2026-06-13). All phases (Tasks 0–23) built test-first; the full Python suite is green (1360 passed, 7 skipped) and `ruff check src tests scripts` is clean. One independent code review was run against C.1–C.9 and its findings resolved (corrupt-v1 tolerance, the listing backfill's read-modify-write under lock, CONFLICT supersede, ohmo index fsync policy, head-less backfill). The Phase 7 consumer fixes (PMR-001..004) were interleaved with the phases that introduce v2-as-default rather than deferred to the end, so the suite stays green at every commit. **Pending owner review and merge to `main`** (author ≠ approver, §7); on merge this becomes **IMPLEMENTED** and the branch is archived per AGENTS §4.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
