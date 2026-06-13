@@ -1350,6 +1350,8 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 
 **Design decision (sub-item d):** when the index file exists, `list_session_snapshots` returns its entries (filtered to those whose backing file still exists) regardless of count — dropping the `len(sessions) >= limit` gate at `session_storage.py:234`. When the index does *not* exist, a one-time backfill scans both `session-*.json` (v1) and `session-*.head.json` (v2) files, builds the index, and writes it once; subsequent lists are index-only. Stale entries (backing file gone) are compacted out at the *next save's* `_write_session_index` (they are currently filtered on read but never removed, `session_storage.py:220`). `latest.json` is no longer scanned as a pseudo-session under v2 (it is a pointer); the legacy `latest.json` fallback is kept only when the index is empty AND it is a v1 full payload.
 
+**Migration contract (C.7) [P1-004].** The backfill is **idempotent** (id-keyed; re-running yields the same index) and **partial-state safe** (the whole index is written once, under `.sessions.lock`, via atomic rename — never torn; a crash mid-backfill leaves the prior/absent index and the next trigger re-runs). For a **dual-format same id** (a legacy `.json` *and* a v2 head both exist), **v2 wins**: the backfill scans `.head.json` first and the `seen` set blocks the later `.json` (C.3 precedence). The migration is **forward-only** — no down-migration; the `v1` revert switch stops new v2 writes but the sniffer keeps existing v2 sessions readable. Backfill never deletes data; retention (C.8) is the only deleter. Stale-compaction and the list filter use the format **sniffer** (not the head-file path), so a `V2_HEADLESS` session (live transcript, lost head) is kept, not dropped.
+
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_storage.py`:
    ```python
    def test_index_trusted_below_limit(tmp_path: Path, monkeypatch):
@@ -1407,6 +1409,31 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        ids = {e["session_id"] for e in _load_session_index(session_dir)}
        assert "gone" not in ids
        assert {"keep", "keep2"} <= ids
+
+
+   def test_backfill_dual_format_same_id_prefers_v2_and_is_idempotent(tmp_path: Path, monkeypatch):
+       # P1-004 / C.7: a legacy .json and a v2 head for the same id -> v2 wins;
+       # re-running the backfill yields the same single entry (idempotent).
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       project = tmp_path / "repo"
+       project.mkdir()
+       session_dir = get_project_session_dir(project)
+       (session_dir / "session-dup.json").write_text(
+           json.dumps({"session_id": "dup", "summary": "v1", "message_count": 9,
+                       "model": "v1model", "created_at": 1.0, "messages": []}),
+           encoding="utf-8",
+       )
+       from openharness.services.session_format import write_head
+       write_head(session_dir, "dup", {"session_id": "dup", "summary": "v2",
+                  "message_count": 2, "model": "v2model", "created_at": 2.0})
+
+       from openharness.services.session_storage import _backfill_index, _load_session_index
+       first = _backfill_index(session_dir)
+       dup = [e for e in first if e["session_id"] == "dup"]
+       assert len(dup) == 1 and dup[0]["model"] == "v2model"  # v2 won the conflict
+       second = _backfill_index(session_dir)  # idempotent
+       assert {e["session_id"] for e in second} == {e["session_id"] for e in first}
+       assert len(_load_session_index(session_dir)) == len(first)
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -1417,10 +1444,14 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
    Make `_write_session_index` drop stale entries — replace its body (`session_storage.py:92-98`):
    ```python
    def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> None:
+       # Stale-compaction: keep an entry only if its session still exists. Use the
+       # sniffer, not the head-file path, so a V2_HEADLESS session (head lost in a
+       # crash, transcript still present — C.3) is NOT dropped. Caller holds the
+       # store lock (this is part of a read-modify-write).
        live = [
            entry
            for entry in entries
-           if (session_dir / str(entry.get("path") or "")).exists()
+           if session_format.detect_session_format(session_dir, str(entry.get("session_id") or "")) is not None
        ]
        live = sorted(live, key=lambda item: item.get("created_at", 0), reverse=True)
        atomic_write_text(
@@ -1446,7 +1477,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
            if json_file.name.endswith(".head.json"):
                continue
            sid = json_file.stem.replace("session-", "")
-           if sid in seen:
+           if sid in seen:  # a v2 head already claimed this id — v2 wins (C.3 / C.7)
                continue
            try:
                data = json.loads(json_file.read_text(encoding="utf-8"))
@@ -1455,7 +1486,11 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
            seen.add(sid)
            entries.append(_session_index_entry(data, json_file))
        if entries:
-           _write_session_index(session_dir, entries)
+           # Write the whole index once under the store lock (C.7): atomic rename
+           # means a reader sees the old or the new index, never a torn one; a
+           # crash mid-backfill leaves the prior state and the next trigger re-runs.
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _write_session_index(session_dir, entries)
        return entries
    ```
    Replace `list_session_snapshots` (`session_storage.py:212-294`) with the index-trusting version:
@@ -1472,8 +1507,8 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
            indexed = _backfill_index(session_dir)
        sessions: list[dict[str, Any]] = []
        for item in indexed:
-           if not (session_dir / str(item.get("path") or "")).exists():
-               continue
+           if session_format.detect_session_format(session_dir, str(item.get("session_id") or "")) is None:
+               continue  # session truly gone (V2_HEADLESS counts as live — C.3)
            sessions.append(
                {
                    "session_id": item.get("session_id", ""),
@@ -1502,7 +1537,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 - Modify: `src/openharness/services/session_storage.py` (new `_prune_sessions`; call it from both save helpers)
 - Test: `tests/test_services/test_session_storage.py`
 
-**Design decision (sub-item e):** after a successful save, prune oldest-first by `created_at` from the index down to `session_retention_max_files`, and drop anything older than `session_retention_max_age_days`. **Never** prune the session just saved (the active one) or the id `latest.json` currently points at. Pruning deletes the backing files (v2: `.jsonl` + `.head.json`; v1: `.json`) and rewrites the index. `0` for either limit disables that rule. Pruning is wrapped so a failure never breaks the save (best-effort, like the conversation index).
+**Design decision (sub-item e) [P2-004]:** after a successful save, prune oldest-first by `created_at` from the index down to `session_retention_max_files`, and drop anything older than `session_retention_max_age_days`. Per **C.8**, the prune runs **inside the same `.sessions.lock` critical section as the index update** (a lock-free `_prune_sessions_unlocked` core, single acquisition — C.2), so it can never race a concurrent saver's index write. It **never** deletes: the session just saved (active id), the id `latest.json` points at, **or any session whose files were modified within the recency window** (`mtime` newer than `max(3600s, task_worker_idle_timeout_s)`) — so a *concurrent* worker actively appending another id (its transcript append happens outside the lock) is never pruned out from under itself. Consequence: count/age limits only reclaim sessions older than the recency window, which is the safe semantics. Pruning deletes the backing files (v2: `.jsonl` + `.head.json`; v1: `.json`) and rewrites the index. `0` for either limit disables that rule. Pruning is wrapped so a failure never breaks the save (best-effort).
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_storage.py`:
    ```python
@@ -1518,13 +1553,27 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        (config_dir / "settings.json").write_text('{"session_retention_max_files": 2, "session_retention_max_age_days": 0}', encoding="utf-8")
        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
 
-       for i in range(4):
+       import os
+       for i in range(3):  # s0, s1, s2 — the older sessions
            save_session_snapshot(
                cwd=project, model="m", system_prompt="s", session_id=f"s{i}",
                messages=[ConversationMessage(role="user", content=[TextBlock(text=f"m{i}")])],
                usage=UsageSnapshot(),
            )
            _time.sleep(0.01)  # distinct created_at ordering
+       # Age them past the recency window so count-pruning can reclaim them (C.8);
+       # without this they would be recency-protected as possibly-active.
+       session_dir = get_project_session_dir(project)
+       old = _time.time() - 7 * 86400
+       for i in range(3):
+           for suffix in (".jsonl", ".head.json"):
+               os.utime(session_dir / f"session-s{i}{suffix}", (old, old))
+       # The active save (s3) triggers the prune; max_files=2 keeps s3 + the newest aged.
+       save_session_snapshot(
+           cwd=project, model="m", system_prompt="s", session_id="s3",
+           messages=[ConversationMessage(role="user", content=[TextBlock(text="m3")])],
+           usage=UsageSnapshot(),
+       )
 
        ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
        # max_files=2 keeps the two newest; the active save (s3) is always kept.
@@ -1542,6 +1591,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        (config_dir / "settings.json").write_text('{"session_retention_max_files": 0, "session_retention_max_age_days": 1}', encoding="utf-8")
        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
 
+       import os
        session_dir = get_project_session_dir(project)
        # Inject an ancient v1 session directly into the index.
        (session_dir / "session-ancient.json").write_text(
@@ -1549,6 +1599,10 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
                        "model": "m", "created_at": 1.0, "messages": []}),
            encoding="utf-8",
        )
+       # Age its mtime too, so it falls outside the recency window (C.8) and the
+       # age limit can reclaim it (a fresh file would be recency-protected).
+       old = _time.time() - 5 * 86400
+       os.utime(session_dir / "session-ancient.json", (old, old))
        from openharness.services.session_storage import _update_session_index, _session_index_entry
        _update_session_index(session_dir, _session_index_entry(
            {"session_id": "ancient", "summary": "old", "message_count": 1, "model": "m", "created_at": 1.0},
@@ -1580,8 +1634,21 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
                pass
 
 
-   def _prune_sessions(session_dir: Path, *, active_id: str, settings: Any) -> None:
-       """Prune oldest/aged-out sessions, never the active or latest-pointed one."""
+   def _transcript_mtime(session_dir: Path, session_id: str) -> float:
+       """Newest mtime across a session's files (0.0 if none exist)."""
+       newest = 0.0
+       for suffix in (".jsonl", ".head.json", ".json"):
+           try:
+               newest = max(newest, (session_dir / f"session-{session_id}{suffix}").stat().st_mtime)
+           except OSError:
+               pass
+       return newest
+
+
+   def _prune_sessions_unlocked(session_dir: Path, *, active_id: str, settings: Any) -> None:
+       """Prune oldest/aged-out sessions. Lock-free core — the caller holds
+       ``session_dir / ".sessions.lock"`` (C.2). Never deletes the active id, the
+       latest-pointed id, or a session modified within the recency window (C.8)."""
        max_files = int(getattr(settings, "session_retention_max_files", 0) or 0)
        max_age_days = int(getattr(settings, "session_retention_max_age_days", 0) or 0)
        if max_files <= 0 and max_age_days <= 0:
@@ -1605,10 +1672,14 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        )
        to_delete: list[str] = []
        cutoff = time.time() - max_age_days * 86400 if max_age_days > 0 else None
+       idle = float(getattr(settings, "task_worker_idle_timeout_s", 600) or 600)
+       recency_floor = time.time() - max(3600.0, idle)
        kept = 0
        for entry in entries:
            sid = str(entry.get("session_id") or "")
-           if sid in protected:
+           # C.8: never prune the active/latest id, nor a session whose files were
+           # touched within the recency window (a concurrent worker may be appending).
+           if sid in protected or _transcript_mtime(session_dir, sid) > recency_floor:
                kept += 1
                continue
            created = float(entry.get("created_at", 0) or 0)
@@ -1629,14 +1700,30 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        ]
        _write_session_index(session_dir, remaining)
    ```
-   Then call it (best-effort) at the end of **both** save helpers, just before each `return latest_path`:
+   Wire it **inside** each save's store-lock critical section (C.2 — the index update and the prune share one acquisition), calling the lock-free core. In `_save_session_snapshot_v2`, replace the `# Task 11 inserts the retention prune here` placeholder so the lock block reads:
    ```python
-       try:
-           from openharness.config import load_settings
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index_unlocked(
+                   session_dir,
+                   _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"),
+               )
+               try:  # retention is best-effort and must never break a save
+                   from openharness.config import load_settings
 
-           _prune_sessions(session_dir, active_id=sid, settings=load_settings())
-       except Exception:
-           pass
+                   _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+               except Exception:
+                   pass
+   ```
+   In `_save_session_snapshot_v1`, replace the lone `_update_session_index(session_dir, _session_index_entry(payload, session_path))` line with the same locked block, so v1 also serialises the index update + prune under one acquisition:
+   ```python
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index_unlocked(session_dir, _session_index_entry(payload, session_path))
+               try:
+                   from openharness.config import load_settings
+
+                   _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+               except Exception:
+                   pass
        return latest_path
    ```
 4. - [ ] Run, verify pass:
