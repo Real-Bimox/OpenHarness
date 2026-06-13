@@ -659,3 +659,87 @@ def test_retention_recency_window_protects_recent_from_count_prune(tmp_path: Pat
                           messages=[ConversationMessage(role="user", content=[TextBlock(text="a")])], usage=UsageSnapshot())
     ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
     assert {"recent", "active"} <= ids   # a count-only prune (ignoring the recency window) would drop 'recent'
+
+
+def test_v2_append_delta_is_bounded(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    session_dir = get_project_session_dir(project)
+
+    big = [
+        ConversationMessage(role="user", content=[TextBlock(text="x" * 1000)])
+        for _ in range(200)
+    ]
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="big",
+                          messages=big, usage=UsageSnapshot())
+    transcript = session_dir / "session-big.jsonl"
+    size_before = transcript.stat().st_size
+
+    big.append(ConversationMessage(role="assistant", content=[TextBlock(text="ok")]))
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="big",
+                          messages=big, usage=UsageSnapshot())
+    size_after = transcript.stat().st_size
+
+    # Second save appended only the one new short message, not the whole history.
+    assert size_after - size_before < 50_000
+    assert size_after - size_before > 0
+
+
+def test_v2_compaction_shrink_round_trip(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    from openharness.services.session_storage import load_session_by_id
+
+    msgs = [ConversationMessage(role="user", content=[TextBlock(text=f"m{i}")]) for i in range(5)]
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="c",
+                          messages=msgs, usage=UsageSnapshot())
+    # Simulate compaction: history collapses to one summary message.
+    compacted = [ConversationMessage(role="user", content=[TextBlock(text="summary")])]
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="c",
+                          messages=compacted, usage=UsageSnapshot())
+
+    snap = load_session_by_id(project, "c")
+    assert snap is not None
+    assert [m["content"][0]["text"] for m in snap["messages"]] == ["summary"]
+
+
+def test_v2_in_place_compaction_same_count_rewrites_not_stale(tmp_path: Path, monkeypatch):
+    # R-001 regression: the engine compacts IN PLACE — message *content* is
+    # rewritten while the message COUNT stays the same (microcompact clears old
+    # tool-result bodies). A count-shrink trigger (`last_persisted > len(messages)`)
+    # would take the append path, write nothing, and leave the stale bloated
+    # content on disk. The fingerprint trigger must detect the divergence and
+    # rewrite the transcript.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    from openharness.services.session_storage import load_session_by_id
+    from openharness.services.session_format import transcript_path
+
+    bloated = [
+        ConversationMessage(role="user", content=[TextBlock(text="BIG-OUTPUT-" + "x" * 4000)]),
+        ConversationMessage(role="assistant", content=[TextBlock(text="b")]),
+    ]
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="ip",
+                          messages=bloated, usage=UsageSnapshot())
+    transcript = transcript_path(get_project_session_dir(project), "ip")
+    size_before = transcript.stat().st_size
+
+    # In-place compaction: SAME count, the first message's content cleared.
+    compacted = [
+        ConversationMessage(role="user", content=[TextBlock(text="[cleared]")]),
+        ConversationMessage(role="assistant", content=[TextBlock(text="b")]),
+    ]
+    assert len(compacted) == len(bloated)  # count did NOT shrink — the R-001 trap
+    save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="ip",
+                          messages=compacted, usage=UsageSnapshot())
+
+    snap = load_session_by_id(project, "ip")
+    assert snap is not None
+    # Durable history is the COMPACTED content, not the stale bloated text...
+    assert [m["content"][0]["text"] for m in snap["messages"]] == ["[cleared]", "b"]
+    # ...and the transcript was actually rewritten smaller (a buggy no-op append
+    # would leave it unchanged at size_before).
+    assert transcript.stat().st_size < size_before
