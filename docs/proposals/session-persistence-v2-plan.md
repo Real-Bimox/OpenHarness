@@ -647,7 +647,7 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 - Modify: `src/openharness/services/session_format.py`
 - Test: `tests/test_services/test_session_format.py`
 
-**Design decision (delta append + compaction):** Engine messages are append-only between compactions. The save path appends only the messages past `last_persisted_count` (read from the head's `message_count`). On compaction the message list shrinks/changes, which the caller signals by passing `compacted=True`; the transcript is then rewritten in full once and a `{"__compacted_at__": <ts>}` marker line is written first so a reader can see a rewrite boundary. `load_v2_snapshot` reads every complete transcript line, ignores marker lines, and keeps only the records *after the last marker* (the live history), guaranteeing the loaded history matches the post-compaction state.
+**Design decision (delta append + compaction):** Engine messages are append-only between compactions. The save path appends only the messages past `last_persisted_count`, where that cursor is the transcript's own live-record count (C.4 cursor invariant) — **never** `head.message_count`. On compaction the message list shrinks (or otherwise diverges from append-only), which the save path detects as `last_persisted > len(messages)` (Design decision 3); the transcript is then rewritten in full once, preceded by a typed compaction-marker line. Per **C.5** the marker is `{"__compacted_at__": <ts>}` and a record dispatches as a marker **iff** it carries `__compacted_at__` *and has no* `role` key (message records always carry `role`) — so a message can never be mistaken for a marker. `load_v2_snapshot` reads every complete transcript line, drops everything up to and including the last marker, and returns the live history; `transcript_live_count` returns its length, which is the crash-correct seed for the cursor.
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_format.py`:
    ```python
@@ -694,6 +694,34 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        )
        snap = load_v2_snapshot(tmp_path, "s1")
        assert [m["content"][0]["text"] for m in snap] == ["a", "b"]
+
+
+   def test_record_with_marker_key_but_role_is_a_message_not_a_marker(tmp_path: Path):
+       # Typed dispatch (C.5, P2-003): a record carrying both the marker key and a
+       # "role" is a message, not a marker, so it must NOT wipe history. Written as
+       # a raw line to bypass the message schema and exercise the discriminator.
+       from openharness.services.session_format import load_v2_snapshot, transcript_path
+
+       transcript_path(tmp_path, "s1").write_bytes(
+           b'{"role": "user", "content": [{"type": "text", "text": "a"}]}\n'
+           b'{"__compacted_at__": 123, "role": "user", "content": [{"type": "text", "text": "b"}]}\n'
+       )
+       snap = load_v2_snapshot(tmp_path, "s1")
+       assert [m["content"][0]["text"] for m in snap] == ["a", "b"]
+
+
+   def test_transcript_live_count_counts_post_marker_records(tmp_path: Path):
+       from openharness.services.session_format import (
+           append_messages_to_transcript,
+           rewrite_transcript,
+           transcript_live_count,
+       )
+
+       assert transcript_live_count(tmp_path, "s1") == 0  # absent transcript
+       append_messages_to_transcript(tmp_path, "s1", _msgs("a", "b"), last_persisted_count=0)
+       assert transcript_live_count(tmp_path, "s1") == 2
+       rewrite_transcript(tmp_path, "s1", _msgs("summary"))  # compaction
+       assert transcript_live_count(tmp_path, "s1") == 1  # only the post-marker record
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -778,17 +806,31 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
                continue
            if not isinstance(obj, dict):
                continue
-           if _COMPACTION_MARKER in obj:
+           # Typed dispatch (C.5, P2-003): a record is a compaction marker iff it
+           # carries the marker key AND lacks "role". Message records always have
+           # "role", so a message is never mistaken for a marker.
+           if _COMPACTION_MARKER in obj and "role" not in obj:
                records.clear()  # drop pre-compaction history
                continue
            records.append(obj)
        return records
+
+
+   def transcript_live_count(session_dir: Path, session_id: str) -> int:
+       """Count the live records durable in the transcript (post-last-marker).
+
+       The crash-correct seed for the append cursor (C.4): it reflects what is
+       actually fsync'd in the transcript, independent of the non-durable head.
+       Called once per process per session — the writer then maintains the count
+       in-process (Task 8), so it is not an O(n) per-save read.
+       """
+       return len(load_v2_snapshot(session_dir, session_id))
    ```
 4. - [ ] Run, verify pass:
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 13 passed.
+   Expected: 15 passed (adds the P2-003 dispatch test and the `transcript_live_count` test).
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add v2 transcript append, load, and compaction rewrite"
@@ -855,6 +897,37 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        session_dir = get_project_session_dir(project)
        assert (session_dir / "session-v1sess.json").exists()
        assert not (session_dir / "session-v1sess.jsonl").exists()
+
+
+   def test_v2_lost_head_does_not_duplicate_on_next_save(tmp_path: Path, monkeypatch):
+       # P1-001 (behavioral). A crash that loses the non-fsync'd head between two
+       # saves must NOT make the next save re-append already-durable messages.
+       # Fails with the old head-derived cursor (re-appends -> a,b,a,b,c);
+       # passes with the transcript-derived cursor (C.4).
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       import openharness.services.session_storage as ss
+       from openharness.services.session_format import head_path, load_v2_snapshot
+
+       project = tmp_path / "repo"
+       project.mkdir()
+
+       def save(texts):
+           save_session_snapshot(
+               cwd=project, model="claude-test", system_prompt="s", session_id="s1",
+               messages=[ConversationMessage(role="user", content=[TextBlock(text=t)]) for t in texts],
+               usage=UsageSnapshot(),
+           )
+
+       save(["a", "b"])  # transcript durable with 2 records; head + cache reflect 2
+       session_dir = get_project_session_dir(project)
+       # Simulate the crash window: the head write (no fsync) is lost AND the
+       # in-process cursor cache is gone (a fresh process would have neither).
+       head_path(session_dir, "s1").unlink()
+       ss._v2_persisted_count.clear()
+
+       save(["a", "b", "c"])  # cursor re-seeds from the transcript (=2); appends only "c"
+
+       assert [m["content"][0]["text"] for m in load_v2_snapshot(session_dir, "s1")] == ["a", "b", "c"]
    ```
    > **Verified mechanism:** `get_config_file_path()` (`config/paths.py:44`) returns `get_config_dir() / "settings.json"`, and `get_config_dir()` (`config/paths.py:28-41`) honors `OPENHARNESS_CONFIG_DIR`. Setting that env var to a temp dir and writing `settings.json` inside it makes `load_settings()` pick up the format flag. (`OPENHARNESS_DATA_DIR` controls only the *sessions* dir, not the settings file, so the two env vars point at different temp dirs above.)
 2. - [ ] Run it, verify it fails:
@@ -865,6 +938,37 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
 3. - [ ] Write minimal implementation. In `src/openharness/services/session_storage.py`, add to the imports (after `session_storage.py:15`):
    ```python
    from openharness.services import session_format
+   from openharness.utils.file_lock import exclusive_file_lock
+   ```
+   Add a module-level in-process append cursor (C.4) near the other module state — this is the crash-correct cursor source that replaces `head.message_count`:
+   ```python
+   # In-process append cursor keyed by (session_dir, session_id): the count of
+   # live records the owning writer has persisted. Seeded from the durable
+   # transcript on first use, never from the non-durable head (P1-001 / C.4).
+   # Process-local; a crash discards it and the next process re-seeds.
+   _v2_persisted_count: dict[tuple[str, str], int] = {}
+   ```
+   Split the existing `_update_session_index` (`session_storage.py:101`) into a lock-free core plus a locking wrapper, so the store-wide index read-modify-write is serialised by the same `exclusive_file_lock` the rest of the codebase already uses for shared JSON registries (C.2). v1 callers keep calling the wrapper (one acquisition, no nesting); the v2 save acquires the lock once itself and calls the *core*:
+   ```python
+   def _update_session_index_unlocked(session_dir: Path, entry: dict[str, Any]) -> None:
+       # The current _update_session_index body (read-modify-write) — NO lock; the
+       # caller must hold session_dir / ".sessions.lock".
+       session_id = str(entry.get("session_id") or "")
+       if not session_id:
+           return
+       entries = [
+           existing
+           for existing in _load_session_index(session_dir)
+           if str(existing.get("session_id") or "") != session_id
+       ]
+       entries.append(entry)
+       _write_session_index(session_dir, entries)
+
+
+   def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
+       # Locking wrapper for callers not already under the store lock (e.g. v1).
+       with exclusive_file_lock(session_dir / ".sessions.lock"):
+           _update_session_index_unlocked(session_dir, entry)
    ```
    Replace the body of `save_session_snapshot` from `session_dir = get_project_session_dir(cwd)` (`session_storage.py:125`) down to `return latest_path` (`session_storage.py:174`) with a router that keeps the existing v1 body in a helper:
    ```python
@@ -975,21 +1079,31 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        from openharness.diagnostics import watchdog
 
        prior_head = session_format.read_head(session_dir, sid)
-       last_persisted = int(prior_head.get("message_count", 0)) if prior_head else 0
        created_at = prior_head.get("created_at", now) if prior_head else now
-       # A shrink (or any non-append edit) means the history was compacted —
-       # rewrite the transcript in full; otherwise append the delta.
+       # Cursor invariant (C.4): the append cursor is the count of live records
+       # already durable in the transcript — NOT head.message_count, which is
+       # rename-written (no fsync) after the fsync'd transcript and so can be lost
+       # in a crash (P1-001). Seed once from the transcript, then maintain it
+       # in-process (single writer per C.2) so it stays O(1) per save.
+       key = (str(session_dir), sid)
+       last_persisted = _v2_persisted_count.get(key)
+       if last_persisted is None:
+           last_persisted = session_format.transcript_live_count(session_dir, sid)
+       # A shrink (or any non-append divergence) means the history was compacted —
+       # rewrite the transcript in full; otherwise append only the delta (C.3).
        compacted = last_persisted > len(messages)
 
        with watchdog.track("snapshot_write", session_id=sid):
-           if compacted or last_persisted == 0 and prior_head is not None:
-               session_format.rewrite_transcript(session_dir, sid, messages)
-           elif compacted:
+           if compacted:
                session_format.rewrite_transcript(session_dir, sid, messages)
            else:
                session_format.append_messages_to_transcript(
                    session_dir, sid, messages, last_persisted_count=last_persisted
                )
+           # Transcript is now durable; record the new live count in-process (it
+           # equals len(messages) after either path) before the derived
+           # head/pointer/index writes (C.4 partial-failure matrix).
+           _v2_persisted_count[key] = len(messages)
 
            head = {
                "session_id": sid,
@@ -1010,7 +1124,17 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
            )
 
            index_payload = {**head, "messages": []}
-           _update_session_index(session_dir, _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"))
+           # Store-wide critical section (C.2): the index read-modify-write — and,
+           # added in Task 11, the retention prune — run under ONE acquisition of
+           # the store lock. Call the *_unlocked core, never the locking
+           # _update_session_index (flock is per-open-description → a second
+           # acquire in this process self-deadlocks).
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index_unlocked(
+                   session_dir,
+                   _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"),
+               )
+               # Task 11 inserts the retention prune here, inside this same lock.
            _update_conversation_index({**head, "messages": [m.model_dump(mode="json") for m in messages]})
 
        from openharness.diagnostics import record
@@ -1025,12 +1149,12 @@ Retention runs on save, **inside the `.sessions.lock` critical section** it shar
        )
        return latest_path
    ```
-   > **Note:** the `compacted` branch above is written verbosely for clarity; collapse the redundant `if/elif` in review to a single `if compacted: rewrite else: append` — the extra clause is a no-op kept only to make the compaction path explicit during first implementation. Remove it once Task 9/12 tests pass.
+   > **Crash safety (C.4).** Step order is: (1) append/rewrite the transcript — the single fsync and the commit point; (2) record the in-process cursor; (3) write the head; (4) write the pointer; (5) update the index under the store lock. A crash after any of (2)–(5) loses only derived state: the next save re-seeds the cursor from the transcript and rewrites the head/pointer/index, so no message is duplicated or lost. The full step-by-step matrix is in C.4.
 4. - [ ] Run, verify pass (both new tests + the existing v1 round-trip):
    ```bash
-   python -m pytest tests/test_services/test_session_storage.py::test_v2_save_creates_transcript_head_and_pointer tests/test_services/test_session_storage.py::test_v1_revert_switch_writes_full_session_file -q
+   python -m pytest tests/test_services/test_session_storage.py::test_v2_save_creates_transcript_head_and_pointer tests/test_services/test_session_storage.py::test_v1_revert_switch_writes_full_session_file tests/test_services/test_session_storage.py::test_v2_lost_head_does_not_duplicate_on_next_save -q
    ```
-   Expected: 2 passed.
+   Expected: 3 passed (the lost-head test is the behavioral proof for P1-001).
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_storage.py tests/test_services/test_session_storage.py && git commit -m "Route session save through v2 format behind the flag"
