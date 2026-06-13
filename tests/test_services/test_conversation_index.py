@@ -184,3 +184,32 @@ def test_save_snapshot_feeds_index(tmp_path: Path, monkeypatch):
     )
     flush_index_queue()
     assert get_conversation_index().search("hooked", project="all")["hits"]
+
+
+def test_rebuild_indexes_v2_sessions(tmp_path: Path, monkeypatch):
+    # PMR-003: rebuild must index v2 sessions (head/transcript), not only v1 .json.
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+    from openharness.api.usage import UsageSnapshot
+    from openharness.engine.messages import ConversationMessage, TextBlock
+    from openharness.services.session_storage import get_project_session_dir, save_session_snapshot
+
+    project = tmp_path / "proj2"
+    save_session_snapshot(
+        cwd=project,
+        model="m",
+        system_prompt="sp",
+        messages=[ConversationMessage(role="user", content=[TextBlock(text="v2 rebuild target")])],
+        usage=UsageSnapshot(),
+        session_id="v2rb",
+    )
+    sdir = get_project_session_dir(project)
+    assert (sdir / "session-v2rb.jsonl").exists()       # a v2 artifact, NOT a .json
+    assert not (sdir / "session-v2rb.json").exists()
+
+    idx = ConversationIndex(db_path=tmp_path / "ci2.db")
+    try:
+        count = idx.rebuild()
+        assert count >= 1
+        assert idx.search("rebuild", project="all")["hits"]
+    finally:
+        idx.close()

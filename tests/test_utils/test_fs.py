@@ -182,3 +182,87 @@ def test_concurrent_writers_all_survive(tmp_path: Path) -> None:
     result = json.loads(target.read_text())
     assert set(result) == {f"key_{i}" for i in range(8)}
     assert all(result[f"key_{i}"] == f"value_{i}" for i in range(8))
+
+
+# ---------------------------------------------------------------------------
+# Durability / parent-directory fsync
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_fsyncs_parent_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With fsync=True the parent directory is fsynced so the rename is durable."""
+    synced_fds: list[int] = []
+    real_fsync = os.fsync
+
+    def _record(fd: int) -> None:
+        synced_fds.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr("openharness.utils.fs.os.fsync", _record)
+    path = tmp_path / "out.txt"
+    atomic_write_text(path, "payload", fsync=True)
+    # One fsync for the file, one for the parent directory.
+    assert len(synced_fds) == 2
+    assert path.read_text() == "payload"
+
+
+def test_atomic_write_no_dir_fsync_when_fsync_false(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    synced_fds: list[int] = []
+    monkeypatch.setattr("openharness.utils.fs.os.fsync", lambda fd: synced_fds.append(fd))
+    atomic_write_text(tmp_path / "out.txt", "payload", fsync=False)
+    assert synced_fds == []
+
+
+# ---------------------------------------------------------------------------
+# Append-only JSONL write + crash-safe read
+# ---------------------------------------------------------------------------
+
+
+def test_append_jsonl_line_appends_and_fsyncs(tmp_path: Path, monkeypatch) -> None:
+    from openharness.utils.fs import append_jsonl_line, read_jsonl_complete_lines
+
+    # C.1: the append's fsync is the per-turn COMMIT POINT, not just the write. Instrument
+    # os.fsync so an implementation that writes+flushes but drops fsync() cannot pass — a
+    # data-only assertion (page-cache readable) would not catch the lost durability.
+    synced: list[int] = []
+    monkeypatch.setattr("openharness.utils.fs.os.fsync", lambda fd: synced.append(fd))
+
+    path = tmp_path / "t.jsonl"
+    append_jsonl_line(path, '{"a": 1}', fsync=False)   # no commit requested...
+    assert synced == []                                 # ...so no fsync
+    append_jsonl_line(path, '{"a": 2}', fsync=True)     # the C.1 commit point
+    assert len(synced) >= 1                             # fsync WAS invoked on the fd (durability), not just write+flush
+    assert path.read_text() == '{"a": 1}\n{"a": 2}\n'
+    assert read_jsonl_complete_lines(path) == ['{"a": 1}', '{"a": 2}']
+
+
+def test_read_jsonl_drops_trailing_partial_line(tmp_path: Path) -> None:
+    from openharness.utils.fs import read_jsonl_complete_lines
+
+    path = tmp_path / "t.jsonl"
+    # Simulate a crash mid-append: last line has no terminating newline.
+    path.write_bytes(b'{"a": 1}\n{"a": 2}\n{"a": 3')
+    assert read_jsonl_complete_lines(path) == ['{"a": 1}', '{"a": 2}']
+
+
+def test_read_jsonl_missing_file_is_empty(tmp_path: Path) -> None:
+    from openharness.utils.fs import read_jsonl_complete_lines
+
+    assert read_jsonl_complete_lines(tmp_path / "nope.jsonl") == []
+
+
+def test_append_jsonl_line_fsyncs_parent_dir_on_create(tmp_path: Path, monkeypatch) -> None:
+    # C.1: the first append that CREATES a transcript fsyncs the parent directory
+    # so the create itself is durable; a later append to the existing file does
+    # not (one fsync/turn for an ongoing session); fsync=False never fsyncs the dir.
+    from openharness.utils import fs as fs_mod
+
+    dir_fsyncs: list[Path] = []
+    monkeypatch.setattr(fs_mod, "_fsync_dir", lambda d: dir_fsyncs.append(Path(d)))
+    path = tmp_path / "t.jsonl"
+    fs_mod.append_jsonl_line(path, '{"a": 1}', fsync=True)   # creates the file
+    assert dir_fsyncs == [tmp_path]
+    fs_mod.append_jsonl_line(path, '{"a": 2}', fsync=True)   # file already exists
+    assert dir_fsyncs == [tmp_path]                          # not fsynced again
+    fs_mod.append_jsonl_line(tmp_path / "u.jsonl", '{"b": 1}', fsync=False)
+    assert dir_fsyncs == [tmp_path]                          # fsync=False -> no dir fsync

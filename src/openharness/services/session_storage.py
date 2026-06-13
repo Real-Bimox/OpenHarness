@@ -12,6 +12,8 @@ from uuid import uuid4
 from openharness.api.usage import UsageSnapshot
 from openharness.config.paths import get_sessions_dir
 from openharness.engine.messages import ConversationMessage, sanitize_conversation_messages
+from openharness.services import session_format
+from openharness.utils.file_lock import exclusive_file_lock
 from openharness.utils.fs import atomic_write_text
 
 
@@ -90,15 +92,26 @@ def _load_session_index(session_dir: Path) -> list[dict[str, Any]]:
 
 
 def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> None:
-    entries = sorted(entries, key=lambda item: item.get("created_at", 0), reverse=True)
+    # Stale-compaction: keep an entry only if its session still exists. Use the
+    # sniffer, not the head-file path, so a V2_HEADLESS session (head lost in a
+    # crash, transcript still present — C.3) is NOT dropped. Caller holds the
+    # store lock (this is part of a read-modify-write).
+    live = [
+        entry
+        for entry in entries
+        if session_format.detect_session_format(session_dir, str(entry.get("session_id") or "")) is not None
+    ]
+    live = sorted(live, key=lambda item: item.get("created_at", 0), reverse=True)
     atomic_write_text(
         _session_index_path(session_dir),
-        json.dumps({"version": 1, "sessions": entries}, indent=2) + "\n",
+        json.dumps({"version": 1, "sessions": live}, indent=2) + "\n",
         fsync=False,
     )
 
 
-def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
+def _update_session_index_unlocked(session_dir: Path, entry: dict[str, Any]) -> None:
+    # The read-modify-write core — NO lock; the caller must hold
+    # session_dir / ".sessions.lock".
     session_id = str(entry.get("session_id") or "")
     if not session_id:
         return
@@ -109,6 +122,196 @@ def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
     ]
     entries.append(entry)
     _write_session_index(session_dir, entries)
+
+
+def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
+    # Locking wrapper for callers not already under the store lock (e.g. v1).
+    with exclusive_file_lock(session_dir / ".sessions.lock"):
+        _update_session_index_unlocked(session_dir, entry)
+
+
+# In-process per-session persistence state, keyed by (session_dir, session_id):
+#   _v2_persisted_count     -> count of live records the owning writer has
+#                              persisted (the crash-correct append cursor —
+#                              C.4 / P1-001; seeded from the durable transcript,
+#                              NEVER from the non-durable head).
+#   _v2_persisted_prefix_fp -> content fingerprint of those same persisted live
+#                              records, used to detect an *in-place* compaction
+#                              that rewrites content WITHOUT changing the count
+#                              (C.5-trigger / R-001). Always written together
+#                              with the count, via _v2_remember_persisted.
+# Process-local: a crash discards both and the next process re-seeds from the
+# transcript. Bounded (R-004): a long-lived foreground process that resumes many
+# sessions evicts the oldest entry past _V2_CURSOR_CACHE_MAX; an evicted session
+# simply re-seeds (count + fp) from its transcript on its next save — correct,
+# one extra read.
+_V2_CURSOR_CACHE_MAX = 1024
+_v2_persisted_count: dict[tuple[str, str], int] = {}
+_v2_persisted_prefix_fp: dict[tuple[str, str], str] = {}
+
+
+def _v2_remember_persisted(key: tuple[str, str], count: int, prefix_fp: str) -> None:
+    """Record the durable (count, fingerprint) for a session, bounding the cache.
+
+    Re-inserts the key at the most-recent position (write-LRU) and evicts the
+    oldest entries past the cap; eviction is safe because the next save for an
+    evicted id re-seeds from the transcript (the cold-seed path).
+    """
+    _v2_persisted_count.pop(key, None)
+    _v2_persisted_prefix_fp.pop(key, None)
+    _v2_persisted_count[key] = count
+    _v2_persisted_prefix_fp[key] = prefix_fp
+    while len(_v2_persisted_count) > _V2_CURSOR_CACHE_MAX:
+        oldest = next(iter(_v2_persisted_count))
+        _v2_persisted_count.pop(oldest, None)
+        _v2_persisted_prefix_fp.pop(oldest, None)
+
+
+def session_ids_on_disk(session_dir: Path) -> list[str]:
+    """v1 + v2 session ids present on disk (deduped; v2 and v1 share the id space).
+
+    Shared enumerator for listing (PMR-002) and conversation-index rebuild
+    (PMR-003). ``glob("session-*.json")`` also matches ``session-<id>.head.json``,
+    so derive v1 ids precisely by skipping the head files.
+    """
+    ids: dict[str, None] = {}  # insertion-ordered set
+    for p in session_dir.glob("session-*.head.json"):      # v2 head
+        ids.setdefault(p.name[len("session-"):-len(".head.json")], None)
+    for p in session_dir.glob("session-*.jsonl"):           # v2 transcript (headless too)
+        ids.setdefault(p.stem[len("session-"):], None)
+    for p in session_dir.glob("session-*.json"):            # v1 — but this ALSO matches *.head.json
+        if p.name.endswith(".head.json"):
+            continue
+        ids.setdefault(p.stem[len("session-"):], None)
+    return list(ids)
+
+
+def _backfill_index(session_dir: Path) -> list[dict[str, Any]]:
+    """Build the index once from legacy v1 and v2 files, then persist it."""
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for head_file in session_dir.glob("session-*.head.json"):
+        sid = head_file.stem[len("session-"):-len(".head")]
+        head = session_format.read_head(session_dir, sid)
+        if head is None or sid in seen:
+            continue
+        seen.add(sid)
+        entries.append(_session_index_entry({**head, "messages": []}, head_file))
+    for jsonl_file in session_dir.glob("session-*.jsonl"):
+        # Head-less v2 (transcript present, head lost in a crash — C.6): re-derive
+        # via the loader so it is indexed too (C.7). Runs before the v1 loop so a
+        # jsonl-only v2 still wins a CONFLICT over a same-id legacy .json.
+        sid = jsonl_file.stem[len("session-"):]
+        if sid in seen:
+            continue
+        payload = _load_v2_payload(session_dir, sid)
+        if payload is None:
+            continue
+        seen.add(sid)
+        entries.append(_session_index_entry(payload, session_dir / f"session-{sid}.head.json"))
+    for json_file in session_dir.glob("session-*.json"):
+        if json_file.name.endswith(".head.json"):
+            continue
+        sid = json_file.stem.replace("session-", "")
+        if sid in seen:  # a v2 head already claimed this id — v2 wins (C.3 / C.7)
+            continue
+        try:
+            data = json.loads(json_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        seen.add(sid)
+        entries.append(_session_index_entry(data, json_file))
+    if entries:
+        # Write the whole index once under the store lock (C.7): atomic rename
+        # means a reader sees the old or the new index, never a torn one; a
+        # crash mid-backfill leaves the prior state and the next trigger re-runs.
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            _write_session_index(session_dir, entries)
+    return entries
+
+
+def _delete_session_files(session_dir: Path, session_id: str) -> None:
+    for suffix in (".jsonl", ".head.json", ".json"):
+        candidate = session_dir / f"session-{session_id}{suffix}"
+        try:
+            candidate.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+def _transcript_mtime(session_dir: Path, session_id: str) -> float:
+    """Newest mtime across a session's files (0.0 if none exist)."""
+    newest = 0.0
+    for suffix in (".jsonl", ".head.json", ".json"):
+        try:
+            newest = max(newest, (session_dir / f"session-{session_id}{suffix}").stat().st_mtime)
+        except OSError:
+            pass
+    return newest
+
+
+def _prune_sessions_unlocked(session_dir: Path, *, active_id: str, settings: Any) -> None:
+    """Prune oldest/aged-out sessions. Lock-free core — the caller holds
+    ``session_dir / ".sessions.lock"`` (C.2). Never deletes the active id, the
+    latest-pointed id, or a session modified within the recency window (C.8)."""
+    max_files = int(getattr(settings, "session_retention_max_files", 0) or 0)
+    max_age_days = int(getattr(settings, "session_retention_max_age_days", 0) or 0)
+    if max_files <= 0 and max_age_days <= 0:
+        return
+
+    protected = {active_id}
+    latest_path = session_dir / "latest.json"
+    if latest_path.exists():
+        try:
+            raw = json.loads(latest_path.read_text(encoding="utf-8"))
+            pointed = str(raw.get("session_id") or "")
+            if pointed:
+                protected.add(pointed)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    entries = sorted(
+        _load_session_index(session_dir),
+        key=lambda item: item.get("created_at", 0),
+        reverse=True,
+    )
+    to_delete: list[str] = []
+    cutoff = time.time() - max_age_days * 86400 if max_age_days > 0 else None
+    idle = float(getattr(settings, "task_worker_idle_timeout_s", 600) or 600)
+    # R-003: the window only needs to cover the *concurrent-writer* horizon — a
+    # worker idle longer than its timeout is reaped and won't append again — so
+    # base it on the idle timeout (2x margin for an append near the boundary, 60s
+    # absolute minimum), NOT a fixed hour. The old `max(3600s, idle)` floor meant
+    # max_files could not bound count for any session touched in the last hour.
+    recency_window = max(idle * 2.0, 60.0)
+    recency_floor = time.time() - recency_window
+    kept = 0
+    for entry in entries:
+        sid = str(entry.get("session_id") or "")
+        # C.8: never prune the active/latest id, nor a session whose files were
+        # touched within the recency window (a concurrent worker may be appending).
+        if sid in protected or _transcript_mtime(session_dir, sid) > recency_floor:
+            kept += 1
+            continue
+        created = float(entry.get("created_at", 0) or 0)
+        too_old = cutoff is not None and created < cutoff
+        over_count = max_files > 0 and kept >= max_files
+        if too_old or over_count:
+            to_delete.append(sid)
+        else:
+            kept += 1
+    if not to_delete:
+        return
+    for sid in to_delete:
+        _delete_session_files(session_dir, sid)
+    remaining = [
+        entry
+        for entry in entries
+        if str(entry.get("session_id") or "") not in set(to_delete)
+    ]
+    _write_session_index(session_dir, remaining)
 
 
 def save_session_snapshot(
@@ -122,17 +325,59 @@ def save_session_snapshot(
     tool_metadata: dict[str, object] | None = None,
 ) -> Path:
     """Persist a session snapshot. Saves both by ID and as latest."""
+    from openharness.config import load_settings
+
     session_dir = get_project_session_dir(cwd)
     sid = session_id or uuid4().hex[:12]
     now = time.time()
     messages = sanitize_conversation_messages(messages)
-    # Extract a summary from the first user message
     summary = ""
     for msg in messages:
         if msg.role == "user" and msg.text.strip():
             summary = msg.text.strip()[:80]
             break
 
+    fmt = load_settings().session_storage_format
+    if fmt == "v2":
+        return _save_session_snapshot_v2(
+            session_dir=session_dir,
+            sid=sid,
+            cwd=cwd,
+            model=model,
+            system_prompt=system_prompt,
+            messages=messages,
+            usage=usage,
+            tool_metadata=tool_metadata,
+            summary=summary,
+            now=now,
+        )
+    return _save_session_snapshot_v1(
+        session_dir=session_dir,
+        sid=sid,
+        cwd=cwd,
+        model=model,
+        system_prompt=system_prompt,
+        messages=messages,
+        usage=usage,
+        tool_metadata=tool_metadata,
+        summary=summary,
+        now=now,
+    )
+
+
+def _save_session_snapshot_v1(
+    *,
+    session_dir: Path,
+    sid: str,
+    cwd: str | Path,
+    model: str,
+    system_prompt: str,
+    messages: list[ConversationMessage],
+    usage: UsageSnapshot,
+    tool_metadata: dict[str, object] | None,
+    summary: str,
+    now: float,
+) -> Path:
     payload = {
         "session_id": sid,
         "cwd": str(Path(cwd).resolve()),
@@ -150,15 +395,30 @@ def save_session_snapshot(
     from openharness.diagnostics import watchdog
 
     with watchdog.track("snapshot_write", session_id=sid):
-        # Save as latest
         latest_path = session_dir / "latest.json"
-        # Per-line state cache: rename-atomic, no fsync (see atomic_write_bytes).
         atomic_write_text(latest_path, data, fsync=False)
-
-        # Save by session ID
         session_path = session_dir / f"session-{sid}.json"
         atomic_write_text(session_path, data, fsync=False)
-        _update_session_index(session_dir, _session_index_entry(payload, session_path))
+        # Revert-switch supersede (symmetric to the v2-save supersede, C.3): a
+        # prior v2 transcript/head for this id is now stale — this full v1 file
+        # is the authoritative state — and the sniffer would otherwise make the
+        # stale v2 win for load_session_by_id / listing. Remove them so the v1
+        # write is the live session and there is no CONFLICT.
+        for suffix in (".jsonl", ".head.json"):
+            stale = session_dir / f"session-{sid}{suffix}"
+            if stale.exists():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            _update_session_index_unlocked(session_dir, _session_index_entry(payload, session_path))
+            try:  # retention is best-effort and must never break a save
+                from openharness.config import load_settings
+
+                _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+            except Exception:
+                pass
         _update_conversation_index(payload)
 
     from openharness.diagnostics import record
@@ -170,6 +430,126 @@ def save_session_snapshot(
         duration_ms=(time.time() - now) * 1000.0,
         session_id=sid,
         attrs={"app": "openharness", "size_bytes": len(data), "message_count": len(messages)},
+    )
+    return latest_path
+
+
+def _save_session_snapshot_v2(
+    *,
+    session_dir: Path,
+    sid: str,
+    cwd: str | Path,
+    model: str,
+    system_prompt: str,
+    messages: list[ConversationMessage],
+    usage: UsageSnapshot,
+    tool_metadata: dict[str, object] | None,
+    summary: str,
+    now: float,
+) -> Path:
+    from openharness.diagnostics import watchdog
+
+    prior_head = session_format.read_head(session_dir, sid)
+    created_at = prior_head.get("created_at", now) if prior_head else now
+    # Cursor + fingerprint invariant (C.4 / C.5-trigger): the append cursor is
+    # the count of live records already durable in the transcript — NOT
+    # head.message_count, which is rename-written (no fsync) after the fsync'd
+    # transcript and so can be lost in a crash (P1-001). Alongside it we keep a
+    # content fingerprint of that durable prefix. Both are seeded once from the
+    # transcript (a single load_v2_snapshot read — same I/O the count seed used)
+    # and then maintained in-process (single writer per C.2).
+    key = (str(session_dir), sid)
+    last_persisted = _v2_persisted_count.get(key)
+    persisted_fp = _v2_persisted_prefix_fp.get(key)
+    if last_persisted is None or persisted_fp is None:
+        durable = session_format.load_v2_snapshot(session_dir, sid)
+        last_persisted = len(durable)
+        persisted_fp = session_format.fingerprint_messages(durable)
+    # R-001: count alone is a LOSSY proxy for "was the history compacted". The
+    # engine compacts IN PLACE — microcompact clears old tool-result bodies and
+    # context-collapse shrinks text, both rewriting message *content* while the
+    # count stays the same (verified: compact/__init__.py:854 / :348). A count
+    # test would take the append path and leave stale content on disk. Compare
+    # the durable prefix's content fingerprint instead: the prefix is stale iff
+    # the in-memory prefix no longer matches what we persisted, OR the history
+    # shrank. Either way rewrite the transcript in full (C.5 marker + full
+    # history); otherwise append only the delta (C.3).
+    compacted = (
+        len(messages) < last_persisted
+        or session_format.fingerprint_messages(messages[:last_persisted]) != persisted_fp
+    )
+
+    with watchdog.track("snapshot_write", session_id=sid):
+        if compacted:
+            session_format.rewrite_transcript(session_dir, sid, messages)
+        else:
+            session_format.append_messages_to_transcript(
+                session_dir, sid, messages, last_persisted_count=last_persisted
+            )
+        # Transcript is now durable; record the new live count AND the fingerprint
+        # of the now-persisted history (the whole list, after either path) before
+        # the derived head/pointer/index writes (C.4 matrix). Bounded cache (R-004).
+        _v2_remember_persisted(
+            key, len(messages), session_format.fingerprint_messages(messages)
+        )
+
+        head = {
+            "session_id": sid,
+            "cwd": str(Path(cwd).resolve()),
+            "model": model,
+            "system_prompt_sha256": session_format.system_prompt_fingerprint(system_prompt),
+            "usage": usage.model_dump(),
+            "tool_metadata": _persistable_tool_metadata(tool_metadata),
+            "created_at": created_at,
+            "summary": summary,
+            "message_count": len(messages),
+        }
+        session_format.write_head(session_dir, sid, head)
+
+        # CONFLICT supersede (C.3 / C.7): a legacy v1 session-<id>.json for this
+        # id is now stale (the v2 transcript is durable and reads prefer v2), so
+        # remove it once the v2 write has succeeded — otherwise the CONFLICT
+        # state lingers and the .json wastes disk until the session is pruned.
+        legacy_v1 = session_dir / f"session-{sid}.json"
+        if legacy_v1.exists():
+            try:
+                legacy_v1.unlink()
+            except OSError:
+                pass
+
+        latest_path = session_dir / "latest.json"
+        atomic_write_text(
+            latest_path, json.dumps({"session_id": sid}) + "\n", fsync=False
+        )
+
+        index_payload = {**head, "messages": []}
+        # Store-wide critical section (C.2): the index read-modify-write — and,
+        # added in Task 11, the retention prune — run under ONE acquisition of
+        # the store lock. Call the *_unlocked core, never the locking
+        # _update_session_index (flock is per-open-description → a second
+        # acquire in this process self-deadlocks).
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            _update_session_index_unlocked(
+                session_dir,
+                _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"),
+            )
+            try:  # retention is best-effort and must never break a save
+                from openharness.config import load_settings
+
+                _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+            except Exception:
+                pass
+        _update_conversation_index({**head, "messages": [m.model_dump(mode="json") for m in messages]})
+
+    from openharness.diagnostics import record
+
+    record(
+        "storage",
+        "snapshot_save",
+        "completed",
+        duration_ms=(time.time() - now) * 1000.0,
+        session_id=sid,
+        attrs={"app": "openharness", "message_count": len(messages), "format": "v2"},
     )
     return latest_path
 
@@ -189,124 +569,160 @@ def _update_conversation_index(payload: dict[str, Any]) -> None:
 
 
 def _sanitize_snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Normalize persisted messages for forward compatibility."""
+    """Normalize persisted messages for forward compatibility (single pass)."""
     raw_messages = payload.get("messages", [])
-    if isinstance(raw_messages, list):
-        messages = sanitize_conversation_messages(
-            [ConversationMessage.model_validate(item) for item in raw_messages]
-        )
-        payload = dict(payload)
-        payload["messages"] = [message.model_dump(mode="json") for message in messages]
-        payload["message_count"] = len(messages)
+    if not isinstance(raw_messages, list):
+        return payload
+    sanitized = sanitize_conversation_messages(
+        [ConversationMessage.model_validate(item) for item in raw_messages]
+    )
+    payload = dict(payload)
+    payload["messages"] = [message.model_dump(mode="json") for message in sanitized]
+    payload["message_count"] = len(sanitized)
     return payload
+
+
+def _load_v2_payload(session_dir: Path, session_id: str) -> dict[str, Any] | None:
+    """Reassemble a v1-shaped snapshot dict from a v2 head + transcript.
+
+    Handles V2_HEADLESS (C.3 / C.6): if the head was lost in a crash but the
+    transcript is durable, resume still works off the transcript and the head
+    is rebuilt on the next save. Returns None only when BOTH are absent.
+    """
+    head = session_format.read_head(session_dir, session_id)
+    raw_messages = session_format.load_v2_snapshot(session_dir, session_id)
+    if head is None and not raw_messages:
+        return None
+    # Head-less branch: history is preserved; head-only fields (model, usage,
+    # tool_metadata) are deliberately omitted and degrade per the C.6 contract
+    # (R-002) — model falls back to the runtime default, NOT null.
+    payload = dict(head) if head is not None else {
+        "session_id": session_id,
+        "message_count": len(raw_messages),
+    }
+    payload["messages"] = raw_messages
+    # system_prompt is rebuilt by build_runtime; loaders never read it back.
+    payload.setdefault("system_prompt", "")
+    return _sanitize_snapshot_payload(payload)
 
 
 def load_session_snapshot(cwd: str | Path) -> dict[str, Any] | None:
     """Load the most recent session snapshot for the project."""
-    path = get_project_session_dir(cwd) / "latest.json"
+    session_dir = get_project_session_dir(cwd)
+    path = session_dir / "latest.json"
     if not path.exists():
         return None
-    return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if session_format.detect_latest_format(raw) == "v2":
+        sid = str(raw.get("session_id") or "")
+        # Resolve through the sniffer/loader core (C.6): prefers v2 (incl.
+        # head-less recovery off the transcript), then falls back to a same-id
+        # legacy session-<id>.json when the pointer's v2 target is absent.
+        return _load_snapshot_in_dir(session_dir, sid) if sid else None
+    return _sanitize_snapshot_payload(raw)
 
 
 def list_session_snapshots(cwd: str | Path, limit: int = 20) -> list[dict[str, Any]]:
-    """List saved sessions for the project, newest first."""
+    """List saved sessions for the project, newest first.
+
+    Trusts the index whenever it exists, builds it once via a backfill when
+    absent, and surfaces any on-disk session a present-but-incomplete index is
+    still missing — v1 ``session-*.json`` AND v2 head/transcript (incl. a
+    head-less transcript) — via the sniffer + loader, persisting the merged
+    index once under the store lock (C.7 lazy one-time backfill, all-or-nothing).
+    Subsequent lists are index-only.
+    """
     session_dir = get_project_session_dir(cwd)
-    sessions: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
     indexed = _load_session_index(session_dir)
-    if indexed:
-        for item in indexed:
-            if not (session_dir / str(item.get("path") or "")).exists():
-                continue
-            sid = str(item.get("session_id") or "")
-            if sid:
-                seen_ids.add(sid)
-            sessions.append(
-                {
-                    "session_id": item.get("session_id", ""),
-                    "summary": item.get("summary", ""),
-                    "message_count": item.get("message_count", 0),
-                    "model": item.get("model", ""),
-                    "created_at": item.get("created_at", 0),
-                }
-            )
-        if len(sessions) >= limit:
-            sessions.sort(key=lambda item: item.get("created_at", 0), reverse=True)
-            return sessions[:limit]
-
-    # Named session files
-    for path in sorted(session_dir.glob("session-*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            sid = data.get("session_id", path.stem.replace("session-", ""))
-            if sid in seen_ids:
-                continue
-            seen_ids.add(sid)
-            summary = data.get("summary", "")
-            if not summary:
-                # Extract from first user message
-                for msg in data.get("messages", []):
-                    if msg.get("role") == "user":
-                        texts = [b.get("text", "") for b in msg.get("content", []) if b.get("type") == "text"]
-                        summary = " ".join(texts).strip()[:80]
-                        if summary:
-                            break
-            sessions.append({
-                "session_id": sid,
-                "summary": summary,
-                "message_count": data.get("message_count", len(data.get("messages", []))),
-                "model": data.get("model", ""),
-                "created_at": data.get("created_at", path.stat().st_mtime),
-            })
-        except (json.JSONDecodeError, OSError):
+    if not indexed:
+        indexed = _backfill_index(session_dir)
+    by_id: dict[str, dict[str, Any]] = {}
+    for entry in indexed:
+        sid = str(entry.get("session_id") or "")
+        if sid:
+            by_id[sid] = entry
+    # Surface on-disk sessions a present-but-incomplete index is missing
+    # (PMR-002). Derive each via the v2-aware loader core so a head-less v2
+    # session (transcript present, head lost — C.6) still surfaces, degraded.
+    derived: dict[str, dict[str, Any]] = {}
+    for sid in session_ids_on_disk(session_dir):
+        if sid in by_id:
             continue
-        if len(sessions) >= limit:
-            break
-
-    # Also include latest.json if it has no corresponding session file
-    latest_path = session_dir / "latest.json"
-    if latest_path.exists() and len(sessions) < limit:
-        try:
-            data = json.loads(latest_path.read_text(encoding="utf-8"))
-            sid = data.get("session_id", "latest")
-            if sid not in seen_ids:
-                summary = data.get("summary", "")
-                if not summary:
-                    for msg in data.get("messages", []):
-                        if msg.get("role") == "user":
-                            texts = [b.get("text", "") for b in msg.get("content", []) if b.get("type") == "text"]
-                            summary = " ".join(texts).strip()[:80]
-                            if summary:
-                                break
-                sessions.append({
-                    "session_id": sid,
-                    "summary": summary or "(latest session)",
-                    "message_count": data.get("message_count", len(data.get("messages", []))),
-                    "model": data.get("model", ""),
-                    "created_at": data.get("created_at", latest_path.stat().st_mtime),
-                })
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Sort by created_at descending
-    sessions.sort(key=lambda s: s.get("created_at", 0), reverse=True)
+        payload = _load_snapshot_in_dir(session_dir, sid)
+        if payload is None:
+            continue
+        fmt = session_format.detect_session_format(session_dir, sid)
+        sp = session_dir / (f"session-{sid}.head.json" if fmt == "v2" else f"session-{sid}.json")
+        entry = _session_index_entry(payload, sp)
+        derived[sid] = entry
+        by_id[sid] = entry
+    if derived:
+        # C.7 lazy one-time backfill, persisted ONCE under .sessions.lock (atomic,
+        # not per-entry, not merge-on-read). Re-read the index INSIDE the lock and
+        # merge the derived entries onto it (C.2 read-modify-write), so an entry a
+        # concurrent saver wrote in the read→write window is preserved rather than
+        # clobbered by this stale snapshot.
+        with exclusive_file_lock(session_dir / ".sessions.lock"):
+            merged: dict[str, dict[str, Any]] = {}
+            for entry in _load_session_index(session_dir):
+                sid = str(entry.get("session_id") or "")
+                if sid:
+                    merged[sid] = entry
+            merged.update(derived)
+            _write_session_index(session_dir, list(merged.values()))
+    sessions: list[dict[str, Any]] = []
+    for sid, item in by_id.items():
+        if session_format.detect_session_format(session_dir, sid) is None:
+            continue  # session truly gone (V2_HEADLESS counts as live — C.3)
+        sessions.append(
+            {
+                "session_id": item.get("session_id", ""),
+                "summary": item.get("summary", ""),
+                "message_count": item.get("message_count", 0),
+                "model": item.get("model", ""),
+                "created_at": item.get("created_at", 0),
+            }
+        )
+    sessions.sort(key=lambda item: item.get("created_at", 0), reverse=True)
     return sessions[:limit]
+
+
+def _load_snapshot_in_dir(session_dir: Path, session_id: str) -> dict[str, Any] | None:
+    """Load a session by id from a known session dir (sniffer → v2/v1).
+
+    The dir-based core shared by ``load_session_by_id`` and the conversation
+    index rebuild (PMR-003). Returns None when neither a v2 nor a v1 session
+    exists for the id.
+    """
+    fmt = session_format.detect_session_format(session_dir, session_id)
+    if fmt == "v2":
+        return _load_v2_payload(session_dir, session_id)
+    if fmt == "v1":
+        path = session_dir / f"session-{session_id}.json"
+        # Tolerate a corrupt or concurrently-deleted v1 file (the file can vanish
+        # between the sniff and the read under a concurrent retention prune). The
+        # v2 path already absorbs these internally; mirror that here so a single
+        # bad legacy file never crashes listing or conversation-index rebuild.
+        try:
+            return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            return None
+    return None
 
 
 def load_session_by_id(cwd: str | Path, session_id: str) -> dict[str, Any] | None:
     """Load a specific session by ID."""
     session_dir = get_project_session_dir(cwd)
-    # Try named session first
-    path = session_dir / f"session-{session_id}.json"
-    if path.exists():
-        return _sanitize_snapshot_payload(json.loads(path.read_text(encoding="utf-8")))
-    # Fallback to latest.json if session_id matches
-    latest = session_dir / "latest.json"
-    if latest.exists():
-        data = _sanitize_snapshot_payload(json.loads(latest.read_text(encoding="utf-8")))
-        if data.get("session_id") == session_id or session_id == "latest":
-            return data
+    snap = _load_snapshot_in_dir(session_dir, session_id)
+    if snap is not None:
+        return snap
+    # Fallback to latest.json if it resolves to this id.
+    snap = load_session_snapshot(cwd)
+    if snap is not None and (snap.get("session_id") == session_id or session_id == "latest"):
+        return snap
     return None
 
 

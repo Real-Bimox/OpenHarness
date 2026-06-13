@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -1418,3 +1419,23 @@ def test_help_and_list_do_not_duplicate_aliases():
     help_text = reg.help_text()
     assert help_text.count("/exit ") == 1
     assert "/quit" not in help_text
+
+
+@pytest.mark.asyncio
+async def test_session_tag_command_exports_full_snapshot_under_v2(tmp_path: Path, monkeypatch):
+    # PMR-001 at the COMMAND level: exercises registry.py's /session tag handler and
+    # proves it no longer does a raw .json copy (which under v2 = the pointer).
+    monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))  # v2 is the default format
+    from openharness.services.session_storage import get_project_session_dir
+
+    context = _make_context(tmp_path)
+    registry = create_default_command_registry()
+    command, args = registry.lookup("/session tag mytag")
+    await command.handler(args, context)
+
+    tagged = get_project_session_dir(tmp_path) / "mytag.json"
+    payload = json.loads(tagged.read_text())
+    # The discriminator: a v2 pointer is exactly {"session_id": ...}; a full snapshot has "messages".
+    assert "messages" in payload and payload.get("session_id")
+    assert set(payload) != {"session_id"}   # NOT a raw copy of the pointer latest.json

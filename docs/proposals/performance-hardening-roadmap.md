@@ -11,7 +11,7 @@
 | Baseline | `v0.1.12` (`841e3e5`) |
 | Related | [release-architecture-hardening](release-architecture-hardening.md), [headless-local-control-api](headless-local-control-api.md) |
 
-> **Partially implemented.** WS1 (persistent task workers) and WS6 (quick wins) shipped in v0.1.13; WS3 (config/prompt-stability caching) and WS2 (prompt-caching breakpoints) shipped in v0.1.14. **WS4 (append-only session persistence + retention) and WS5 (parallel MCP connect + per-channel dispatchers) are not yet implemented** — verified absent from `services/session_storage.py`, `config/settings.py`, `mcp/client.py`, and `channels/impl/manager.py`. The Sequencing table below is the original plan; the `0.1.15` row did not happen (0.1.15 shipped unrelated features), so WS4/WS5 remain unscheduled.
+> **Partially implemented.** WS1 (persistent task workers) and WS6 (quick wins) shipped in v0.1.13; WS3 (config/prompt-stability caching) and WS2 (prompt-caching breakpoints) shipped in v0.1.14. **WS4 (append-only session persistence + retention) is implemented behind `session_storage_format=v2`** (default on; revert switch to `v1`) — an append-only `session-<id>.jsonl` transcript + `session-<id>.head.json` + pointer `latest.json`, a trusted index with one-time backfill, and retention pruning, with every legacy `v1` file readable forever via a format sniffer; see [session-persistence-v2-plan](session-persistence-v2-plan.md). **WS5 (parallel MCP connect + per-channel dispatchers) is not yet implemented** — verified absent from `mcp/client.py` and `channels/impl/manager.py` — and remains unscheduled. The Sequencing table below is the original plan; the `0.1.15` row did not happen (0.1.15 shipped unrelated features).
 
 ## Summary
 

@@ -17,7 +17,6 @@ guaranteed-valid FTS5 expression instead of regex surgery.
 
 from __future__ import annotations
 
-import json
 import logging
 import random
 import re
@@ -341,8 +340,16 @@ class ConversationIndex:
         )
 
     def rebuild(self) -> int:
-        """Drop everything and reindex every snapshot on disk."""
+        """Drop everything and reindex every snapshot on disk (v1 + v2).
+
+        Enumerates each project dir's v1 ``session-*.json`` AND v2
+        ``session-*.head.json`` / ``session-*.jsonl`` sessions (deduped, v2-wins)
+        and reassembles each full payload through the v2-aware storage loader,
+        so a v2-default store is indexed and a head-less v2 session degrades
+        gracefully (PMR-003 / C.6).
+        """
         from openharness.config.paths import get_sessions_dir
+        from openharness.services import session_storage  # lazy: avoid import cycle
 
         def _clear(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM messages")
@@ -350,14 +357,13 @@ class ConversationIndex:
 
         self._write(_clear)
         count = 0
-        sessions_root = get_sessions_dir()
-        for snapshot_path in sorted(sessions_root.glob("*/session-*.json")):
-            try:
-                payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            self.index_snapshot(payload)
-            count += 1
+        for project_dir in sorted(p for p in get_sessions_dir().iterdir() if p.is_dir()):
+            for sid in session_storage.session_ids_on_disk(project_dir):  # v1 + v2, deduped
+                payload = session_storage._load_snapshot_in_dir(project_dir, sid)
+                if payload is None:
+                    continue
+                self.index_snapshot(payload)
+                count += 1
         return count
 
     # -- queries --------------------------------------------------------------

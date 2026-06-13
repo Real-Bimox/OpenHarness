@@ -74,6 +74,22 @@ def test_list_sessions_touched_since_supports_session_dir_override(tmp_path: Pat
     assert list_sessions_touched_since(cwd, 0, session_dir=session_dir) == ["ohmo"]
 
 
+def test_list_sessions_touched_since_finds_v2_transcripts(tmp_path: Path) -> None:
+    # PMR-004: under v2 the per-turn artifact is session-<id>.jsonl, and the old
+    # glob("session-*.json") both MISSES it and matches session-<id>.head.json
+    # (phantom "<id>.head"). The scan must find the v2 transcript and skip heads.
+    from openharness.engine.messages import ConversationMessage, TextBlock
+    from openharness.services import session_format
+
+    session_format.append_messages_to_transcript(
+        tmp_path, "v2sess",
+        [ConversationMessage(role="user", content=[TextBlock(text="x")])], last_persisted_count=0)
+    session_format.write_head(tmp_path, "v2sess", {"session_id": "v2sess", "message_count": 1, "created_at": 1.0})
+    ids = list_sessions_touched_since(tmp_path, since_ts=0.0, session_dir=tmp_path)
+    assert "v2sess" in ids                 # v2 transcript discovered
+    assert "v2sess.head" not in ids        # .head.json glob-collision phantom must NOT appear
+
+
 def test_consolidation_prompt_contains_expected_sections(tmp_path: Path) -> None:
     prompt = build_consolidation_prompt(tmp_path / "memory", tmp_path / "sessions", "extra")
     assert "# Dream: Memory Consolidation" in prompt

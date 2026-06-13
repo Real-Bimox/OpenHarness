@@ -897,7 +897,7 @@ def create_default_command_registry(
             safe_name = "".join(character for character in tokens[1] if character.isalnum() or character in {"-", "_"})
             if not safe_name:
                 return CommandResult(message="Usage: /session tag NAME")
-            snapshot_path = context.session_backend.save_snapshot(
+            context.session_backend.save_snapshot(
                 cwd=context.cwd,
                 model=context.app_state.get().model if context.app_state is not None else load_settings().model,
                 system_prompt=build_runtime_system_prompt(
@@ -911,7 +911,9 @@ def create_default_command_registry(
             export_path = context.session_backend.export_markdown(cwd=context.cwd, messages=context.engine.messages)
             tagged_json = session_dir / f"{safe_name}.json"
             tagged_md = session_dir / f"{safe_name}.md"
-            shutil.copy2(snapshot_path, tagged_json)
+            # Full v1-shaped snapshot via the v2-aware loader — never a copy of the
+            # v2 pointer latest.json (PMR-001).
+            context.session_backend.export_snapshot_json(cwd=context.cwd, dest=tagged_json)
             shutil.copy2(export_path, tagged_md)
             return CommandResult(message=f"Tagged session as {safe_name}:\n- {tagged_json}\n- {tagged_md}")
         if tokens[0] == "clear":
