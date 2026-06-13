@@ -17,6 +17,7 @@ pure functions with no settings access.
 
 from __future__ import annotations
 
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -48,3 +49,14 @@ def detect_session_format(session_dir: Path, session_id: str) -> str | None:
     if (session_dir / f"session-{session_id}.json").exists():
         return "v1"
     return None
+
+
+def system_prompt_fingerprint(system_prompt: str) -> str:
+    """Return the sha256 hex digest of a built system prompt.
+
+    v2 persists this digest instead of the full prompt text. The prompt is
+    always rebuilt on resume from ``model`` + ``tool_metadata`` (the rebuild
+    inputs already in the head), so the text itself is never needed on disk;
+    the digest is kept only as a debugging signal for prompt drift.
+    """
+    return sha256(system_prompt.encode("utf-8")).hexdigest()

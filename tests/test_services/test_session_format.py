@@ -63,3 +63,18 @@ def test_detect_session_format_ignores_the_setting(tmp_path: Path, monkeypatch):
     (cfg / "settings.json").write_text(_json.dumps({"session_storage_format": "v2"}), encoding="utf-8")
     (tmp_path / "session-shaped_v1.json").write_text("{}", encoding="utf-8")
     assert detect_session_format(tmp_path, "shaped_v1") == "v1"
+
+
+def test_system_prompt_fingerprint_is_stable_sha256():
+    from openharness.services.session_format import system_prompt_fingerprint
+
+    fp = system_prompt_fingerprint("You are a helpful assistant.")
+    assert fp == system_prompt_fingerprint("You are a helpful assistant.")
+    assert len(fp) == 64  # sha256 hex digest
+    assert fp != system_prompt_fingerprint("different")
+
+
+def test_system_prompt_fingerprint_empty():
+    from openharness.services.session_format import system_prompt_fingerprint
+
+    assert len(system_prompt_fingerprint("")) == 64
