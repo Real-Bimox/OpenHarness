@@ -1,5 +1,7 @@
 # Session Persistence v2 (WS4) Implementation Plan
 
+> **Status: APPROVED** (owner, 2026-06-13). design-quality-gate (Tier T2) **CLEARED** — all 14 original findings + 4 re-review findings resolved across two independent adversarial re-reviews (see Quality Gate section). Ready to implement; the build has not been started.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the O(n²) full-history rewrite in OpenHarness session persistence with an append-only per-session transcript plus a trusted index and a retention policy, behind a `session_storage_format=v2` setting, while keeping every legacy file readable forever and every loader's public dict shape unchanged.
@@ -16,14 +18,123 @@
 |---|---|---|
 | `src/openharness/config/settings.py` | Modify (add fields to `Settings`, `settings.py:614-677` block) | New `session_storage_format: str = "v2"`, `session_retention_max_files: int = 50`, `session_retention_max_age_days: int = 30` fields. |
 | `src/openharness/utils/fs.py` | Modify (`atomic_write_bytes`, `fs.py:39-78`; new `append_jsonl_line`, `read_jsonl_complete_lines`) | Add a parent-dir fsync to `atomic_write_bytes` (close the documented gap at `fs.py:57-62`); add an append-with-fsync helper and a crash-safe JSONL reader that stops at the last complete line. |
-| `src/openharness/services/session_format.py` | **Create** | Format sniffer (`detect_session_format`), v2 transcript read/write primitives (`append_messages_to_transcript`, `write_head`, `read_head`, `load_v2_snapshot`, `rewrite_transcript`), and the system-prompt hash helper (`system_prompt_fingerprint`). Pure functions, no settings access. |
-| `src/openharness/services/session_storage.py` | Modify (`session_storage.py:114-310`) | Route `save_session_snapshot` through v1 or v2 by setting; make `load_session_snapshot` / `load_session_by_id` resolve the `latest.json` pointer and sniff format; make `list_session_snapshots` trust the index unconditionally + one-time backfill; add retention pruning; single-pass resume load. |
+| `src/openharness/services/session_format.py` | **Create** | Format sniffer (`detect_session_format`), v2 transcript read/write primitives (`append_messages_to_transcript`, `write_head`, `read_head`, `load_v2_snapshot`, `rewrite_transcript`), the system-prompt hash helper (`system_prompt_fingerprint`), and the message-history content fingerprint (`fingerprint_messages`) used to detect in-place compaction (R-001). Pure functions, no settings access. |
+| `src/openharness/services/session_storage.py` | Modify (`session_storage.py:114-310`) | Route `save_session_snapshot` through v1 or v2 by setting; make `load_session_snapshot` / `load_session_by_id` resolve the `latest.json` pointer and sniff format; make `list_session_snapshots` trust the index unconditionally + one-time backfill; add retention pruning; v2 pointer resolution + format-sniffing load. |
 | `src/openharness/services/session_backend.py` | Unchanged | Protocol/shape stays identical — confirmed by a no-op shape test in Task 14. |
 | `ohmo/session_storage.py` | Modify (`ohmo/session_storage.py:92-209`) | Apply the same head+append pattern via the shared `session_format` primitives; keep `session_key` plumbing and the `latest-<token>.json` pointer. |
 | `tests/test_utils/test_fs.py` | Modify | Tests for parent-dir fsync, `append_jsonl_line`, and crash-safe `read_jsonl_complete_lines`. |
 | `tests/test_services/test_session_format.py` | **Create** | Unit tests for the sniffer, transcript primitives, hash helper, and crash-consistency (truncated mid-line). |
 | `tests/test_services/test_session_storage.py` | Modify | v2 save/load round-trip, pointer `latest.json`, index-trust + backfill, retention, byte-budget, legacy-format fixtures, format-flag revert. |
 | `tests/test_ohmo/test_ohmo_session_storage.py` | Modify | v2 ohmo save/load round-trip, legacy fixture, `session_key` pointer under v2. |
+
+---
+
+## v2 Storage Contracts (canonical)
+
+> These are the canonical invariants for v2. Every task body below implements them and cites this section by name; no rule is restated as an independent source. Added in the gate-revision pass to resolve **P1-001, P1-003, P1-004, P1-005, P2-002, P2-003, P2-004, P2-005** (see the Quality Gate section for the finding-by-finding mapping).
+
+### C.1 Durability / fsync policy — canonical [P2-002]
+
+The transcript `session-<id>.jsonl` is the **only durable artifact and the commit point** for a turn. Everything else is derived from it and reconstructible.
+
+- **One fsync per turn.** The append path fsyncs the *final* appended line; the compaction path fsyncs the single full rewrite. Parent-directory fsync (Task 2) makes the create/rename itself durable.
+- **Derived artifacts are rename-only.** `session-<id>.head.json`, the `latest.json` pointer, and `sessions-index.json` are written with `atomic_write_text(..., fsync=False)` — atomic rename, no per-write fsync. A crash loses at most derived metadata, which is rebuilt on the next save (C.4) or tolerated on load (C.6).
+- **ohmo mirrors this policy verbatim.** ohmo's per-session transcript is its durable artifact (one fsync/turn); its head / `latest-<token>.json` pointer / index are rename-only. This single statement is canonical for both apps — Task 15 references it rather than restating it (resolves P2-002: the fsync policy is no longer stated only for openharness).
+
+### C.2 Writer authority & concurrency — canonical [P1-003]
+
+v1 needed no lock because every save was a full **idempotent rewrite**. v2 introduces (a) an *append* (not idempotent without a correct cursor — see C.4) and (b) a *read-modify-write* of the shared index plus a retention *delete*. Per-session artifacts stay single-writer by design; the store-wide artifacts are serialised with the same `exclusive_file_lock` (`utils/file_lock.py`) the rest of the codebase already uses for shared JSON registries (settings, auth, memory, cron, swarm mailbox).
+
+| Artifact | Scope | Writers | Concurrency | Guard |
+|---|---|---|---|---|
+| `session-<id>.jsonl` + `session-<id>.head.json` | one session id | the single process that owns `<id>` | **single-writer by design** — WS1 workers each get a distinct per-task session id; the foreground/interactive process owns its own id | none (per-id ownership). Same-id concurrent writers are **out of contract** — see the WS1↔WS4 note. |
+| `latest.json` pointer | project dir | any saver | multi-writer, last-writer-wins | atomic rename only (the race is benign — "latest" is by definition whoever saved last) |
+| `sessions-index.json` | project dir | every saver (v1 **and** v2), backfill, retention | **multi-writer read-modify-write** | **required:** `exclusive_file_lock(session_dir / ".sessions.lock")` |
+| retention prune (unlinks whole sessions + rewrites the index) | project dir | any saver | multi-writer | the **same** `.sessions.lock` — prune and the index update share one critical section |
+
+**Critical-section rule.** The transcript append + head write + pointer write happen **outside** the lock (per-id, atomic, and the slow fsync must never hold a store-wide lock). The index read-modify-write **and** the retention prune happen **inside one** `with exclusive_file_lock(session_dir / ".sessions.lock"):` block, acquired **once** per save. The index/retention helper *cores* assume the lock is held and never re-acquire it — `flock` is per-open-description, so a second acquisition in the same process would self-deadlock. (Concretely: a lock-free `_update_session_index_unlocked` / `_prune_retention_unlocked` core, with the public entry points or the save path acquiring the lock once around both.) This serialises concurrent savers — e.g. two WS1 workers plus a foreground save — on the only genuinely shared mutable state. Putting the lock on the index resource also closes a latent v1 same-file race for free.
+
+**Schema versioning (hot-reload / mixed-format safety).** `sessions-index.json` already carries `"version": 1`; the v2 head carries the v2 shape (presence of `.head.json` + `.jsonl` *is* the v2 on-disk signal — see C.3). The active format is decided **per save** from `session_storage_format`; a process never changes an id's format mid-write. A session started under v1 and continued under v2 produces the **CONFLICT** state (C.3), resolved by v2-precedence — it is not an undefined concurrent-writer state. Two processes writing *different* ids under different formats is fine (each owns its own files); two processes writing the *same* id is the out-of-contract case above.
+
+**WS1↔WS4 note** (the roadmap's `WS1 ↔ WS4` dependency). The contract holds because a worker and the foreground never share a session id, so their transcripts never collide and only the store-wide index/pointer are contended — which the lock covers. If a future change lets two writers target one session id, that violates this contract and would require a per-session transcript lock; that is explicitly **out of scope** and flagged here so the dependency is visible at merge time.
+
+### C.3 Format & lifecycle state machine — canonical [P1-005]
+
+**(A) On-disk format detection, per id.** `detect_session_format` reads on-disk *shape only* — never the setting (the setting gates writes; Design decision 2). It returns one of:
+
+| State | On disk | Load behavior |
+|---|---|---|
+| `ABSENT` | no session files | new session |
+| `V1` | `session-<id>.json` only | load the full v1 file |
+| `V2` | `.head.json` + `.jsonl`, no `.json` | load head + transcript |
+| `V2_HEADLESS` *(named halt)* | `.jsonl` present, `.head.json` missing/corrupt — the P1-001 crash state | load the transcript directly; head rebuilt on next save. Safe because the cursor comes from the transcript (C.4) |
+| `TRUNCATED_TAIL` *(named halt)* | final transcript line incomplete (crash mid-append) | `read_jsonl_complete_lines` drops the partial line; recover to the last complete record |
+| `CONFLICT` *(named branch — v1+v2 same id)* | both `session-<id>.json` **and** (`.head.json`/`.jsonl`) exist | **precedence: v2 wins** (the `.json` is a pre-migration leftover). A v2 save for an id that has a legacy `.json` removes the `.json` after the v2 write succeeds (supersede); read always prefers v2. Resolved by the migration contract (C.7) |
+
+**(B) Transcript lifecycle, per session.**
+
+```
+EMPTY ──first append──▶ APPENDING(N)
+APPENDING(N) ──turn (append-only)──▶ APPENDING(N+Δ)        cursor = live-record count read from the transcript
+APPENDING(N) ──compaction (len(messages) < N, or any non-append edit)──▶ REWRITING ──▶ APPENDING(M)
+                                                            marker line + post-compaction history; cursor = post-marker count
+APPENDING/any ──retention prune──▶ REMOVED (whole id)       unless protected: active id, latest-pointed id, or within the recency window (C.8)
+```
+
+**Cursor invariant (the spine of correctness).** The append cursor is *always* the transcript's post-last-marker live-record count — **never `head.message_count`**. This one rule makes `APPENDING` crash-safe (`V2_HEADLESS` recovers with no duplication) and removes the head from the correctness path entirely. See C.4 and the Task 8 / P1-001 edit.
+
+### C.4 Save partial-failure matrix — canonical [P1-001]
+
+The v2 save runs these steps. Step 1 (the transcript fsync) is the **commit point**; steps 2–6 write only derived state, so a crash after any of them is recoverable with **no duplication and no loss**:
+
+| # | Step | Durable? | Crash-after state | Recovery |
+|---|---|---|---|---|
+| 1 | Append delta to `.jsonl` (or full rewrite on compaction) | **yes (fsync)** | transcript has the new messages; head/pointer/index not yet updated | next save: cursor read from transcript → correct delta; load: `V2_HEADLESS` reads the transcript |
+| 2 | Rewrite `head.json` | no (rename) | head missing or stale | rebuilt next save (count from transcript); load tolerates a missing head |
+| 3 | Write `latest.json` pointer | no (rename) | pointer stale (points at the prior session) | benign; corrected next save; load fallback (C.6) |
+| 4 | *(under `.sessions.lock`)* update `sessions-index.json` | no (rename) | index missing this id | session still loads by id from the transcript; backfill / next save re-adds it |
+| 5 | *(under `.sessions.lock`)* retention prune | unlink + rename | partial delete | prune is idempotent; re-runs next save |
+| 6 | conversation index (best-effort) | swallowed | — | independent; never blocks a save |
+
+**The cursor fix.** `last_persisted` MUST be derived from the transcript — the count of live records returned by reading the transcript post-last-marker — **not** from `head.message_count`. This is what makes the matrix hold; without it, a lost head (step 2 crash) re-appends already-durable messages → duplicate history on resume. Implemented in Task 8 (P1-001).
+
+### C.5 Compaction-marker record schema — canonical [P2-003]
+
+The compaction marker shares the `.jsonl` line namespace with message records, so it must be **unambiguously typed**. A record is a marker **iff** it has the `__compacted_at__` key **and no `role` key** (message records always carry `role`). `load_v2_snapshot` treats only such records as markers; a message whose *content* merely contains the string `__compacted_at__` (nested inside content blocks) is never mistaken for a marker. Code edit + collision test in Task 7 (P2-003).
+
+**Rewrite trigger — canonical [R-001].** A save must rewrite the transcript (marker + full history) **whenever the durable history is stale relative to the in-memory list**, and append only otherwise. Staleness is decided by a **content fingerprint of the durable prefix**, not the message count: the engine compacts *in place* (`microcompact_messages` clears old tool-result bodies, `try_context_collapse` collapses text — both keep the same count while changing content, verified at `compact/__init__.py:854` / `:348`), so `last_persisted > len(messages)` (count shrink) misses them and leaves stale bytes on disk. The canonical trigger is: `compacted = len(messages) < last_persisted OR fingerprint_messages(messages[:last_persisted]) != persisted_prefix_fingerprint`. The fingerprint (`session_format.fingerprint_messages`) and the cursor are seeded together from the transcript on first use and maintained in-process by the single writer (C.2/C.4). This rule is owned identically by `_save_session_snapshot_v2` and the ohmo twin (Task 15). A false positive (spurious rewrite) is merely slower, never lossy; the strong content hash makes false negatives (missed staleness) negligible — closing R-001 at the root.
+
+### C.6 Read fallback & pointer precedence — canonical [P2-005]
+
+`load_session_snapshot` resolves `latest.json` as:
+
+1. v2 pointer (`{"session_id": x}`) → load session `x` through the C.3 state machine.
+2. legacy full payload (has a `messages` key) → load it directly (legacy path).
+3. pointer present but the target head is missing/corrupt → fall through to the transcript (`V2_HEADLESS`); if the transcript is also absent → return `None`.
+4. pointer target absent **and** a legacy `session-<id>.json` exists for that id → `CONFLICT` precedence (v2 first, then the `.json`).
+
+A missing/corrupt index never blocks a load: `load_session_by_id` sniffs on-disk shape directly, and `list_session_snapshots` falls back to globbing (existing behavior). Tests cover the v2-pointer, legacy-full, and missing-head cases.
+
+**Head-less degradation contract — canonical [R-002].** In the `V2_HEADLESS` recovery (head lost in the crash window, transcript durable), the **message history is recovered in full** from the transcript; the **head-only fields degrade deterministically** because they were never fsync'd:
+
+- `model` is **omitted** from the recovered payload. Resume resolves the model as `explicit --model` → else the runtime's configured default (`build_runtime` passes `model=None` to `merge_cli_overrides`, which **drops `None`** so `settings.model` stands — `settings.py:935`). It is **not** null and does **not** crash; the only effect is that a head-less resume taken with no `--model` continues on the *current configured* model rather than the model the head recorded (a benign drift, since explicit `--model` always wins).
+- `usage` resets to zero — cumulative token accounting under-reports until the next save rewrites the head.
+- `tool_metadata` is empty — carryover/session-memory context for the session is not restored.
+- `created_at` resets to *now* on the next save after a head-less recovery (the prior head carried it). This only shifts retention's sort/display and makes the session marginally *safer* from age-pruning — never less safe.
+
+This degradation is the **defined contract** for the rare lost-head window, not an error path: history fidelity is preserved; head-derived session config falls back to runtime defaults. **ohmo mirrors it** (R-002a) — `_load_ohmo_v2_payload` recovers head-less off the transcript, injecting the constant `app: "ohmo"` and (on the session-key lookup) re-injecting `session_key`, which the caller knows. Restoring `model`/`usage`/`tool_metadata` from the surviving index entry is a possible future strengthening but is **deferred** (right-sized: the window is narrow and the degradation is non-fatal).
+
+### C.7 Index backfill migration contract — canonical [P1-004]
+
+- **Trigger:** lazy and one-time — when the index is absent or missing entries for on-disk sessions (driven from `list_session_snapshots` / load).
+- **Idempotent:** re-running yields the same index. Entries are keyed by `session_id` and re-derived from each session's head (v2) or full file (v1); existing entries are never duplicated.
+- **Partial-state safe:** the whole index is written once, under `.sessions.lock`, via atomic rename — a reader sees either the old or the new index, never a torn one. A crash mid-backfill leaves the old index; the next trigger re-runs.
+- **Dual-format-same-id:** if both a v1 `.json` and a v2 head exist for one id, the entry is derived from the v2 head (v2-wins, per C.3); the stale `.json` is left in place (read prefers v2) and removed on the next v2 save (supersede).
+- **Forward-only:** there is no down-migration. The revert switch (`session_storage_format=v1`) stops new v2 *writes*; existing `.jsonl`/`.head` sessions stay readable because the sniffer is format-agnostic. Backfill never deletes data — retention (C.8) is the only deleter, and it runs separately under the same lock.
+
+### C.8 Retention safety — canonical [P2-004]
+
+Retention runs on save, **inside the `.sessions.lock` critical section** it shares with the index update, oldest-first by `created_at`. It never deletes: the session being saved (active id), the `latest.json`-pointed id, or any session whose transcript `mtime` is within a **recency window** sized to the concurrent-writer horizon — `max(2 × task_worker_idle_timeout_s, 60s)`, so a worker actively appending another id is never pruned out from under itself (R-003: the window tracks the idle timeout, not a fixed hour). `0` disables each limit. Because the protected window defers pruning of recent sessions, **`session_retention_max_files` is a soft hint, not a hard cap**: the live count may exceed it during a burst of recent sessions and converges to it as they age past the window; `session_retention_max_age_days` bounds the long tail. Because prune holds the lock, it cannot race a concurrent saver's index update or delete a session another saver is mid-append on.
 
 ---
 
@@ -271,12 +382,11 @@
        if not text:
            return []
        lines = text.split("\n")
-       # split() leaves a trailing "" when the file ends in "\n" (complete);
-       # a non-empty trailing element means the last line was not terminated.
-       if lines and lines[-1] == "":
-           lines.pop()
-       else:
-           lines.pop()  # drop the incomplete trailing line
+       # split() always leaves a final element after the last "\n": "" when the
+       # file ended in "\n" (all records complete), or the unterminated trailing
+       # line (the signature of a crash mid-append). Either way it is not a
+       # complete record, so drop it unconditionally.
+       lines.pop()
        return [line for line in lines if line]
    ```
 4. - [ ] Run, verify pass:
@@ -299,7 +409,7 @@
 - Create: `src/openharness/services/session_format.py`
 - Test: `tests/test_services/test_session_format.py`
 
-**Design decision:** Format is detected from on-disk shape, not a settings flag (so a v1 file is still read correctly even when the setting is `v2`, and vice versa). Rule: a `latest.json` whose only meaningful key is `session_id` (no `messages` and no `model`) is a **v2 pointer**; the presence of a sibling `session-<id>.head.json` for an id marks that id as **v2**; everything else is **v1** (legacy full-format). The function operates on a parsed dict for `latest.json` and on a session dir + id for per-session detection.
+**Design decision:** Format is detected from on-disk shape, not a settings flag (so a v1 file is still read correctly even when the setting is `v2`, and vice versa — Design decision 2). Per **C.3**: a `latest.json` whose only meaningful key is `session_id` (no `messages`, no `model`) is a **v2 pointer**; for a session id, a `session-<id>.head.json` *or* a `session-<id>.jsonl` transcript marks it **v2** — this covers **V2_HEADLESS** (transcript present, head lost in a crash) and makes **v2 win** a v1+v2 **CONFLICT** (both a legacy `.json` and v2 files exist); only a lone `session-<id>.json` is **v1**. The function operates on a parsed dict for `latest.json` and on a session dir + id for per-session detection.
 
 1. - [ ] Write the failing test. Create `tests/test_services/test_session_format.py`:
    ```python
@@ -336,6 +446,19 @@
 
    def test_detect_session_format_missing_is_none(tmp_path: Path):
        assert detect_session_format(tmp_path, "ghost") is None
+
+
+   def test_detect_session_format_headless_transcript_is_v2(tmp_path: Path):
+       # V2_HEADLESS (C.3): transcript present, head lost in a crash -> still v2.
+       (tmp_path / "session-abc.jsonl").write_text("", encoding="utf-8")
+       assert detect_session_format(tmp_path, "abc") == "v2"
+
+
+   def test_detect_session_format_v1_v2_conflict_prefers_v2(tmp_path: Path):
+       # CONFLICT (C.3): a legacy .json and v2 files coexist -> v2 wins.
+       (tmp_path / "session-abc.json").write_text("{}", encoding="utf-8")
+       (tmp_path / "session-abc.head.json").write_text("{}", encoding="utf-8")
+       assert detect_session_format(tmp_path, "abc") == "v2"
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -381,11 +504,15 @@
 
 
    def detect_session_format(session_dir: Path, session_id: str) -> str | None:
-       """Classify a stored session by id, or ``None`` when neither file exists.
+       """Classify a stored session by id, or ``None`` when no files exist.
 
-       A ``session-<id>.head.json`` marks v2; a lone ``session-<id>.json`` is v1.
+       A ``session-<id>.head.json`` OR a ``session-<id>.jsonl`` transcript marks
+       v2 — this covers V2_HEADLESS (transcript present, head lost) and makes v2
+       win a v1+v2 CONFLICT (C.3). Only a lone ``session-<id>.json`` is v1.
        """
-       if (session_dir / f"session-{session_id}.head.json").exists():
+       head = (session_dir / f"session-{session_id}.head.json").exists()
+       transcript = (session_dir / f"session-{session_id}.jsonl").exists()
+       if head or transcript:
            return "v2"
        if (session_dir / f"session-{session_id}.json").exists():
            return "v1"
@@ -395,7 +522,7 @@
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 6 passed.
+   Expected: 8 passed.
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add session format sniffer"
@@ -450,7 +577,7 @@
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 8 passed.
+   Expected: 10 passed.
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add system_prompt_fingerprint helper for v2 heads"
@@ -537,7 +664,7 @@
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 10 passed.
+   Expected: 12 passed.
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add v2 head read/write primitives"
@@ -549,7 +676,7 @@
 - Modify: `src/openharness/services/session_format.py`
 - Test: `tests/test_services/test_session_format.py`
 
-**Design decision (delta append + compaction):** Engine messages are append-only between compactions. The save path appends only the messages past `last_persisted_count` (read from the head's `message_count`). On compaction the message list shrinks/changes, which the caller signals by passing `compacted=True`; the transcript is then rewritten in full once and a `{"__compacted_at__": <ts>}` marker line is written first so a reader can see a rewrite boundary. `load_v2_snapshot` reads every complete transcript line, ignores marker lines, and keeps only the records *after the last marker* (the live history), guaranteeing the loaded history matches the post-compaction state.
+**Design decision (delta append + compaction):** Between compactions the save path appends only the messages past `last_persisted_count`, where that cursor is the transcript's own live-record count (C.4 cursor invariant) — **never** `head.message_count`. Compaction is detected by a **content fingerprint of the durable prefix**, not a count comparison (Design decision 3 / C.5-trigger): the engine compacts *in place* — `microcompact_messages` clears old tool-result bodies and `try_context_collapse` shrinks text, both rewriting message **content while leaving the count unchanged** (verified against `compact/__init__.py:854` / `:348`). A count test (`last_persisted > len(messages)`) misses these and would leave stale content on disk (R-001). Instead the save fingerprints the durable prefix (`fingerprint_messages(messages[:last_persisted])`) and rewrites the transcript in full whenever that fingerprint diverges from what was persisted, **or** the history shrank. The rewrite is preceded by a typed compaction-marker line. Per **C.5** the marker is `{"__compacted_at__": <ts>}` and a record dispatches as a marker **iff** it carries `__compacted_at__` *and has no* `role` key (message records always carry `role`) — so a message can never be mistaken for a marker. `load_v2_snapshot` reads every complete transcript line, drops everything up to and including the last marker, and returns the live history; `transcript_live_count` returns its length, the crash-correct seed for the cursor, and the same `load_v2_snapshot` read seeds the prefix fingerprint.
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_format.py`:
    ```python
@@ -596,6 +723,54 @@
        )
        snap = load_v2_snapshot(tmp_path, "s1")
        assert [m["content"][0]["text"] for m in snap] == ["a", "b"]
+
+
+   def test_record_with_marker_key_but_role_is_a_message_not_a_marker(tmp_path: Path):
+       # Typed dispatch (C.5, P2-003): a record carrying both the marker key and a
+       # "role" is a message, not a marker, so it must NOT wipe history. Written as
+       # a raw line to bypass the message schema and exercise the discriminator.
+       from openharness.services.session_format import load_v2_snapshot, transcript_path
+
+       transcript_path(tmp_path, "s1").write_bytes(
+           b'{"role": "user", "content": [{"type": "text", "text": "a"}]}\n'
+           b'{"__compacted_at__": 123, "role": "user", "content": [{"type": "text", "text": "b"}]}\n'
+       )
+       snap = load_v2_snapshot(tmp_path, "s1")
+       assert [m["content"][0]["text"] for m in snap] == ["a", "b"]
+
+
+   def test_transcript_live_count_counts_post_marker_records(tmp_path: Path):
+       from openharness.services.session_format import (
+           append_messages_to_transcript,
+           rewrite_transcript,
+           transcript_live_count,
+       )
+
+       assert transcript_live_count(tmp_path, "s1") == 0  # absent transcript
+       append_messages_to_transcript(tmp_path, "s1", _msgs("a", "b"), last_persisted_count=0)
+       assert transcript_live_count(tmp_path, "s1") == 2
+       rewrite_transcript(tmp_path, "s1", _msgs("summary"))  # compaction
+       assert transcript_live_count(tmp_path, "s1") == 1  # only the post-marker record
+
+
+   def test_fingerprint_messages_detects_in_place_content_change(tmp_path: Path):
+       # R-001: the signal a count test misses. Same message COUNT, changed content
+       # (an in-place compaction) MUST yield a different fingerprint; and a message
+       # object must fingerprint equal to the dict it was persisted as (the seed path
+       # reads dicts via load_v2_snapshot, the compare path uses live objects).
+       from openharness.services.session_format import (
+           append_messages_to_transcript,
+           fingerprint_messages,
+           load_v2_snapshot,
+       )
+
+       original = _msgs("tool-output-aaaa", "b")
+       cleared_same_count = _msgs("cleared", "b")  # in place: count unchanged, content changed
+       assert len(original) == len(cleared_same_count)
+       assert fingerprint_messages(original) != fingerprint_messages(cleared_same_count)
+       assert fingerprint_messages(original) == fingerprint_messages(original)  # stable
+       append_messages_to_transcript(tmp_path, "s1", original, last_persisted_count=0)
+       assert fingerprint_messages(load_v2_snapshot(tmp_path, "s1")) == fingerprint_messages(original)
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -680,17 +855,52 @@
                continue
            if not isinstance(obj, dict):
                continue
-           if _COMPACTION_MARKER in obj:
+           # Typed dispatch (C.5, P2-003): a record is a compaction marker iff it
+           # carries the marker key AND lacks "role". Message records always have
+           # "role", so a message is never mistaken for a marker.
+           if _COMPACTION_MARKER in obj and "role" not in obj:
                records.clear()  # drop pre-compaction history
                continue
            records.append(obj)
        return records
+
+
+   def transcript_live_count(session_dir: Path, session_id: str) -> int:
+       """Count the live records durable in the transcript (post-last-marker).
+
+       The crash-correct seed for the append cursor (C.4): it reflects what is
+       actually fsync'd in the transcript, independent of the non-durable head.
+       Called once per process per session — the writer then maintains the count
+       in-process (Task 8), so it is not an O(n) per-save read.
+       """
+       return len(load_v2_snapshot(session_dir, session_id))
+
+
+   def fingerprint_messages(messages: list[ConversationMessage] | list[dict[str, Any]]) -> str:
+       """Stable content fingerprint of an ordered message history (R-001 / C.5-trigger).
+
+       Detects an in-place compaction that rewrites message *content* without
+       changing the count: two histories fingerprint equal iff their ordered,
+       canonicalized JSON content is identical. Accepts either ConversationMessage
+       objects (the in-memory list) or already-serialized dicts (``load_v2_snapshot``'s
+       output) and canonicalizes both the same way — a message and the dict it was
+       persisted as (``json.loads`` of ``json.dumps(model_dump(mode="json"))``) round-trip
+       to equal ``sort_keys`` JSON, so an in-memory prefix compares equal to the durable
+       prefix it became. Pure; no I/O, no settings.
+       """
+       digest = hashlib.blake2b(digest_size=16)
+       for message in messages:
+           payload = message.model_dump(mode="json") if hasattr(message, "model_dump") else message
+           digest.update(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+           digest.update(b"\x1e")  # record separator: makes the hash order- and boundary-sensitive
+       return digest.hexdigest()
    ```
+   `fingerprint_messages` needs `import hashlib` at the top of `session_format.py` (alongside the existing `import json`).
 4. - [ ] Run, verify pass:
    ```bash
    python -m pytest tests/test_services/test_session_format.py -q
    ```
-   Expected: 13 passed.
+   Expected: 18 passed (Task 4 adds the V2_HEADLESS + CONFLICT detection tests; Task 7 adds the P2-003 dispatch, `transcript_live_count`, and `fingerprint_messages` in-place-change tests).
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_format.py tests/test_services/test_session_format.py && git commit -m "Add v2 transcript append, load, and compaction rewrite"
@@ -757,6 +967,65 @@
        session_dir = get_project_session_dir(project)
        assert (session_dir / "session-v1sess.json").exists()
        assert not (session_dir / "session-v1sess.jsonl").exists()
+
+
+   def test_v2_lost_head_does_not_duplicate_on_next_save(tmp_path: Path, monkeypatch):
+       # P1-001 (behavioral). A crash that loses the non-fsync'd head between two
+       # saves must NOT make the next save re-append already-durable messages.
+       # Fails with the old head-derived cursor (re-appends -> a,b,a,b,c);
+       # passes with the transcript-derived cursor (C.4).
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       import openharness.services.session_storage as ss
+       from openharness.services.session_format import head_path, load_v2_snapshot
+
+       project = tmp_path / "repo"
+       project.mkdir()
+
+       def save(texts):
+           save_session_snapshot(
+               cwd=project, model="claude-test", system_prompt="s", session_id="s1",
+               messages=[ConversationMessage(role="user", content=[TextBlock(text=t)]) for t in texts],
+               usage=UsageSnapshot(),
+           )
+
+       save(["a", "b"])  # transcript durable with 2 records; head + cache reflect 2
+       session_dir = get_project_session_dir(project)
+       # Simulate the crash window: the head write (no fsync) is lost AND the
+       # in-process cursor cache is gone (a fresh process would have neither).
+       head_path(session_dir, "s1").unlink()
+       ss._v2_persisted_count.clear()
+       ss._v2_persisted_prefix_fp.clear()  # both halves of the in-process cursor vanish on crash
+
+       save(["a", "b", "c"])  # cursor re-seeds from the transcript (=2); appends only "c"
+
+       assert [m["content"][0]["text"] for m in load_v2_snapshot(session_dir, "s1")] == ["a", "b", "c"]
+
+
+   def test_concurrent_v2_saves_preserve_all_index_entries(tmp_path: Path, monkeypatch):
+       # P1-003 (behavioral). Many concurrent savers each add a distinct session id;
+       # the store lock must serialise the index read-modify-write so no entry is
+       # lost. Without the lock, concurrent RMW drops updates and the set is short.
+       import threading
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       project = tmp_path / "repo"
+       project.mkdir()
+
+       def worker(n: int):
+           save_session_snapshot(
+               cwd=project, model="m", system_prompt="s", session_id=f"c{n}",
+               messages=[ConversationMessage(role="user", content=[TextBlock(text=str(n))])],
+               usage=UsageSnapshot(),
+           )
+
+       threads = [threading.Thread(target=worker, args=(i,)) for i in range(12)]
+       for t in threads:
+           t.start()
+       for t in threads:
+           t.join()
+
+       from openharness.services.session_storage import _load_session_index
+       ids = {e["session_id"] for e in _load_session_index(get_project_session_dir(project))}
+       assert ids == {f"c{i}" for i in range(12)}
    ```
    > **Verified mechanism:** `get_config_file_path()` (`config/paths.py:44`) returns `get_config_dir() / "settings.json"`, and `get_config_dir()` (`config/paths.py:28-41`) honors `OPENHARNESS_CONFIG_DIR`. Setting that env var to a temp dir and writing `settings.json` inside it makes `load_settings()` pick up the format flag. (`OPENHARNESS_DATA_DIR` controls only the *sessions* dir, not the settings file, so the two env vars point at different temp dirs above.)
 2. - [ ] Run it, verify it fails:
@@ -767,6 +1036,67 @@
 3. - [ ] Write minimal implementation. In `src/openharness/services/session_storage.py`, add to the imports (after `session_storage.py:15`):
    ```python
    from openharness.services import session_format
+   from openharness.utils.file_lock import exclusive_file_lock
+   ```
+   Add module-level in-process persistence state (C.4) near the other module state — the crash-correct cursor source that replaces `head.message_count`, **plus** the content fingerprint that lets the save detect in-place compaction the count cannot see (C.5-trigger / R-001):
+   ```python
+   # In-process per-session persistence state, keyed by (session_dir, session_id):
+   #   _v2_persisted_count     -> count of live records the owning writer has
+   #                              persisted (the crash-correct append cursor —
+   #                              C.4 / P1-001; seeded from the durable transcript,
+   #                              NEVER from the non-durable head).
+   #   _v2_persisted_prefix_fp -> content fingerprint of those same persisted live
+   #                              records, used to detect an *in-place* compaction
+   #                              that rewrites content WITHOUT changing the count
+   #                              (C.5-trigger / R-001). Always written together
+   #                              with the count, via _v2_remember_persisted.
+   # Process-local: a crash discards both and the next process re-seeds from the
+   # transcript. Bounded (R-004): a long-lived foreground process that resumes many
+   # sessions evicts the oldest entry past _V2_CURSOR_CACHE_MAX; an evicted session
+   # simply re-seeds (count + fp) from its transcript on its next save — correct,
+   # one extra read.
+   _V2_CURSOR_CACHE_MAX = 1024
+   _v2_persisted_count: dict[tuple[str, str], int] = {}
+   _v2_persisted_prefix_fp: dict[tuple[str, str], str] = {}
+
+
+   def _v2_remember_persisted(key: tuple[str, str], count: int, prefix_fp: str) -> None:
+       """Record the durable (count, fingerprint) for a session, bounding the cache.
+
+       Re-inserts the key at the most-recent position (write-LRU) and evicts the
+       oldest entries past the cap; eviction is safe because the next save for an
+       evicted id re-seeds from the transcript (the cold-seed path).
+       """
+       _v2_persisted_count.pop(key, None)
+       _v2_persisted_prefix_fp.pop(key, None)
+       _v2_persisted_count[key] = count
+       _v2_persisted_prefix_fp[key] = prefix_fp
+       while len(_v2_persisted_count) > _V2_CURSOR_CACHE_MAX:
+           oldest = next(iter(_v2_persisted_count))
+           _v2_persisted_count.pop(oldest, None)
+           _v2_persisted_prefix_fp.pop(oldest, None)
+   ```
+   Split the existing `_update_session_index` (`session_storage.py:101`) into a lock-free core plus a locking wrapper, so the store-wide index read-modify-write is serialised by the same `exclusive_file_lock` the rest of the codebase already uses for shared JSON registries (C.2). v1 callers keep calling the wrapper (one acquisition, no nesting); the v2 save acquires the lock once itself and calls the *core*:
+   ```python
+   def _update_session_index_unlocked(session_dir: Path, entry: dict[str, Any]) -> None:
+       # The current _update_session_index body (read-modify-write) — NO lock; the
+       # caller must hold session_dir / ".sessions.lock".
+       session_id = str(entry.get("session_id") or "")
+       if not session_id:
+           return
+       entries = [
+           existing
+           for existing in _load_session_index(session_dir)
+           if str(existing.get("session_id") or "") != session_id
+       ]
+       entries.append(entry)
+       _write_session_index(session_dir, entries)
+
+
+   def _update_session_index(session_dir: Path, entry: dict[str, Any]) -> None:
+       # Locking wrapper for callers not already under the store lock (e.g. v1).
+       with exclusive_file_lock(session_dir / ".sessions.lock"):
+           _update_session_index_unlocked(session_dir, entry)
    ```
    Replace the body of `save_session_snapshot` from `session_dir = get_project_session_dir(cwd)` (`session_storage.py:125`) down to `return latest_path` (`session_storage.py:174`) with a router that keeps the existing v1 body in a helper:
    ```python
@@ -877,21 +1207,48 @@
        from openharness.diagnostics import watchdog
 
        prior_head = session_format.read_head(session_dir, sid)
-       last_persisted = int(prior_head.get("message_count", 0)) if prior_head else 0
        created_at = prior_head.get("created_at", now) if prior_head else now
-       # A shrink (or any non-append edit) means the history was compacted —
-       # rewrite the transcript in full; otherwise append the delta.
-       compacted = last_persisted > len(messages)
+       # Cursor + fingerprint invariant (C.4 / C.5-trigger): the append cursor is
+       # the count of live records already durable in the transcript — NOT
+       # head.message_count, which is rename-written (no fsync) after the fsync'd
+       # transcript and so can be lost in a crash (P1-001). Alongside it we keep a
+       # content fingerprint of that durable prefix. Both are seeded once from the
+       # transcript (a single load_v2_snapshot read — same I/O the count seed used)
+       # and then maintained in-process (single writer per C.2).
+       key = (str(session_dir), sid)
+       last_persisted = _v2_persisted_count.get(key)
+       persisted_fp = _v2_persisted_prefix_fp.get(key)
+       if last_persisted is None or persisted_fp is None:
+           durable = session_format.load_v2_snapshot(session_dir, sid)
+           last_persisted = len(durable)
+           persisted_fp = session_format.fingerprint_messages(durable)
+       # R-001: count alone is a LOSSY proxy for "was the history compacted". The
+       # engine compacts IN PLACE — microcompact clears old tool-result bodies and
+       # context-collapse shrinks text, both rewriting message *content* while the
+       # count stays the same (verified: compact/__init__.py:854 / :348). A count
+       # test would take the append path and leave stale content on disk. Compare
+       # the durable prefix's content fingerprint instead: the prefix is stale iff
+       # the in-memory prefix no longer matches what we persisted, OR the history
+       # shrank. Either way rewrite the transcript in full (C.5 marker + full
+       # history); otherwise append only the delta (C.3).
+       compacted = (
+           len(messages) < last_persisted
+           or session_format.fingerprint_messages(messages[:last_persisted]) != persisted_fp
+       )
 
        with watchdog.track("snapshot_write", session_id=sid):
-           if compacted or last_persisted == 0 and prior_head is not None:
-               session_format.rewrite_transcript(session_dir, sid, messages)
-           elif compacted:
+           if compacted:
                session_format.rewrite_transcript(session_dir, sid, messages)
            else:
                session_format.append_messages_to_transcript(
                    session_dir, sid, messages, last_persisted_count=last_persisted
                )
+           # Transcript is now durable; record the new live count AND the fingerprint
+           # of the now-persisted history (the whole list, after either path) before
+           # the derived head/pointer/index writes (C.4 matrix). Bounded cache (R-004).
+           _v2_remember_persisted(
+               key, len(messages), session_format.fingerprint_messages(messages)
+           )
 
            head = {
                "session_id": sid,
@@ -912,7 +1269,17 @@
            )
 
            index_payload = {**head, "messages": []}
-           _update_session_index(session_dir, _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"))
+           # Store-wide critical section (C.2): the index read-modify-write — and,
+           # added in Task 11, the retention prune — run under ONE acquisition of
+           # the store lock. Call the *_unlocked core, never the locking
+           # _update_session_index (flock is per-open-description → a second
+           # acquire in this process self-deadlocks).
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index_unlocked(
+                   session_dir,
+                   _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"),
+               )
+               # Task 11 inserts the retention prune here, inside this same lock.
            _update_conversation_index({**head, "messages": [m.model_dump(mode="json") for m in messages]})
 
        from openharness.diagnostics import record
@@ -927,24 +1294,24 @@
        )
        return latest_path
    ```
-   > **Note:** the `compacted` branch above is written verbosely for clarity; collapse the redundant `if/elif` in review to a single `if compacted: rewrite else: append` — the extra clause is a no-op kept only to make the compaction path explicit during first implementation. Remove it once Task 9/12 tests pass.
+   > **Crash safety (C.4).** Step order is: (1) append/rewrite the transcript — the single fsync and the commit point; (2) record the in-process cursor; (3) write the head; (4) write the pointer; (5) update the index under the store lock. A crash after any of (2)–(5) loses only derived state: the next save re-seeds the cursor from the transcript and rewrites the head/pointer/index, so no message is duplicated or lost. The full step-by-step matrix is in C.4.
 4. - [ ] Run, verify pass (both new tests + the existing v1 round-trip):
    ```bash
-   python -m pytest tests/test_services/test_session_storage.py::test_v2_save_creates_transcript_head_and_pointer tests/test_services/test_session_storage.py::test_v1_revert_switch_writes_full_session_file -q
+   python -m pytest tests/test_services/test_session_storage.py::test_v2_save_creates_transcript_head_and_pointer tests/test_services/test_session_storage.py::test_v1_revert_switch_writes_full_session_file tests/test_services/test_session_storage.py::test_v2_lost_head_does_not_duplicate_on_next_save tests/test_services/test_session_storage.py::test_concurrent_v2_saves_preserve_all_index_entries -q
    ```
-   Expected: 2 passed.
+   Expected: 4 passed (lost-head proves P1-001; the concurrency test proves the P1-003 store lock).
 5. - [ ] Commit:
    ```bash
    git add src/openharness/services/session_storage.py tests/test_services/test_session_storage.py && git commit -m "Route session save through v2 format behind the flag"
    ```
 
-### Task 9: v2 load path — pointer resolution + sniff + single-pass
+### Task 9: v2 load path — pointer resolution + sniff + reassembly
 
 **Files:**
 - Modify: `src/openharness/services/session_storage.py` (`_sanitize_snapshot_payload` `session_storage.py:191-201`, `load_session_snapshot` `session_storage.py:204-209`, `load_session_by_id` `session_storage.py:297-310`; new `_load_v2_payload`)
 - Test: `tests/test_services/test_session_storage.py`
 
-**Design decision (single-pass resume — sub-item g):** the current `_sanitize_snapshot_payload` does validate → dump → re-validate (`session_storage.py:196-199`); messages are dumped back to dicts after sanitizing. We keep the *public shape* (messages as list-of-dicts) but drop the wasteful second dump by sanitizing once and reusing the already-`model_dump`ed list. Functionally identical output, half the pydantic work.
+**Design decision (resume load — sub-item g) [P2-001]:** This is a **documents-only / readability** change, not a speed-up. `_sanitize_snapshot_payload` stays a single validate→sanitize→dump pass and gains a clean v2 reassembly path. The earlier draft's "drop the wasteful second dump / half the pydantic work" claim was **inaccurate** — the current code (`session_storage.py:191-201`) already does exactly one `model_validate` and one `model_dump`, so the proposed restructure is operationally identical (verified against the source). The genuine resume redundancy is at the **storage↔runtime boundary**: storage dumps messages to dicts to preserve the public shape, then `build_runtime` re-validates those dicts into `ConversationMessage` objects on resume. Removing that round-trip would change the public loader shape (objects, not dicts) and is **explicitly deferred** — it is a one-time cost paid once at session start, and the refactor's regression risk is disproportionate to the gain (right-size / YAGNI). Revisit only if resume latency is ever a *measured* problem.
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_storage.py`:
    ```python
@@ -993,6 +1360,30 @@
        snap = load_session_by_id(project, "byid")
        assert snap is not None and snap["session_id"] == "byid"
        assert snap["messages"][0]["content"][0]["text"] == "x"
+
+
+   def test_v2_load_via_pointer_recovers_when_head_missing(tmp_path: Path, monkeypatch):
+       # P2-005 / V2_HEADLESS (C.6): the head was lost in a crash but the transcript
+       # is durable — resume must still recover the history off the transcript.
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       import openharness.services.session_storage as ss
+       from openharness.services.session_format import head_path
+
+       project = tmp_path / "repo"
+       project.mkdir()
+       save_session_snapshot(
+           cwd=project, model="claude-test", system_prompt="s", session_id="hl",
+           messages=[ConversationMessage(role="user", content=[TextBlock(text="kept")])],
+           usage=UsageSnapshot(),
+       )
+       session_dir = get_project_session_dir(project)
+       head_path(session_dir, "hl").unlink()  # simulate the lost-head crash window
+       ss._v2_persisted_count.clear()
+       ss._v2_persisted_prefix_fp.clear()  # both halves of the in-process cursor vanish on crash
+
+       snap = load_session_snapshot(project)  # resolves the latest.json pointer
+       assert snap is not None
+       assert [m["content"][0]["text"] for m in snap["messages"]] == ["kept"]
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -1018,12 +1409,23 @@
    Add a v2 payload assembler after `_sanitize_snapshot_payload`:
    ```python
    def _load_v2_payload(session_dir: Path, session_id: str) -> dict[str, Any] | None:
-       """Reassemble a v1-shaped snapshot dict from a v2 head + transcript."""
+       """Reassemble a v1-shaped snapshot dict from a v2 head + transcript.
+
+       Handles V2_HEADLESS (C.3 / C.6): if the head was lost in a crash but the
+       transcript is durable, resume still works off the transcript and the head
+       is rebuilt on the next save. Returns None only when BOTH are absent.
+       """
        head = session_format.read_head(session_dir, session_id)
-       if head is None:
-           return None
        raw_messages = session_format.load_v2_snapshot(session_dir, session_id)
-       payload = dict(head)
+       if head is None and not raw_messages:
+           return None
+       # Head-less branch: history is preserved; head-only fields (model, usage,
+       # tool_metadata) are deliberately omitted and degrade per the C.6 contract
+       # (R-002) — model falls back to the runtime default, NOT null.
+       payload = dict(head) if head is not None else {
+           "session_id": session_id,
+           "message_count": len(raw_messages),
+       }
        payload["messages"] = raw_messages
        # system_prompt is rebuilt by build_runtime; loaders never read it back.
        payload.setdefault("system_prompt", "")
@@ -1079,7 +1481,9 @@
 - Modify: `src/openharness/services/session_storage.py` (`list_session_snapshots` `session_storage.py:212-294`; `_write_session_index` `session_storage.py:92-98` for stale compaction; new `_backfill_index`)
 - Test: `tests/test_services/test_session_storage.py`
 
-**Design decision (sub-item d):** when the index file exists, `list_session_snapshots` returns its entries (filtered to those whose backing file still exists) regardless of count — dropping the `len(sessions) >= limit` gate at `session_storage.py:234`. When the index does *not* exist, a one-time backfill scans both `session-*.json` (v1) and `session-*.head.json` (v2) files, builds the index, and writes it once; subsequent lists are index-only. Stale entries (backing file gone) are compacted out at the *next save's* `_write_session_index` (they are currently filtered on read but never removed, `session_storage.py:190`/`220`). `latest.json` is no longer scanned as a pseudo-session under v2 (it is a pointer); the legacy `latest.json` fallback is kept only when the index is empty AND it is a v1 full payload.
+**Design decision (sub-item d):** when the index file exists, `list_session_snapshots` returns its entries (filtered to those whose backing file still exists) regardless of count — dropping the `len(sessions) >= limit` gate at `session_storage.py:234`. When the index does *not* exist, a one-time backfill scans both `session-*.json` (v1) and `session-*.head.json` (v2) files, builds the index, and writes it once; subsequent lists are index-only. Stale entries (backing file gone) are compacted out at the *next save's* `_write_session_index` (they are currently filtered on read but never removed, `session_storage.py:220`). `latest.json` is no longer scanned as a pseudo-session under v2 (it is a pointer); the legacy `latest.json` fallback is kept only when the index is empty AND it is a v1 full payload.
+
+**Migration contract (C.7) [P1-004].** The backfill is **idempotent** (id-keyed; re-running yields the same index) and **partial-state safe** (the whole index is written once, under `.sessions.lock`, via atomic rename — never torn; a crash mid-backfill leaves the prior/absent index and the next trigger re-runs). For a **dual-format same id** (a legacy `.json` *and* a v2 head both exist), **v2 wins**: the backfill scans `.head.json` first and the `seen` set blocks the later `.json` (C.3 precedence). The migration is **forward-only** — no down-migration; the `v1` revert switch stops new v2 writes but the sniffer keeps existing v2 sessions readable. Backfill never deletes data; retention (C.8) is the only deleter. Stale-compaction and the list filter use the format **sniffer** (not the head-file path), so a `V2_HEADLESS` session (live transcript, lost head) is kept, not dropped.
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_storage.py`:
    ```python
@@ -1138,6 +1542,31 @@
        ids = {e["session_id"] for e in _load_session_index(session_dir)}
        assert "gone" not in ids
        assert {"keep", "keep2"} <= ids
+
+
+   def test_backfill_dual_format_same_id_prefers_v2_and_is_idempotent(tmp_path: Path, monkeypatch):
+       # P1-004 / C.7: a legacy .json and a v2 head for the same id -> v2 wins;
+       # re-running the backfill yields the same single entry (idempotent).
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       project = tmp_path / "repo"
+       project.mkdir()
+       session_dir = get_project_session_dir(project)
+       (session_dir / "session-dup.json").write_text(
+           json.dumps({"session_id": "dup", "summary": "v1", "message_count": 9,
+                       "model": "v1model", "created_at": 1.0, "messages": []}),
+           encoding="utf-8",
+       )
+       from openharness.services.session_format import write_head
+       write_head(session_dir, "dup", {"session_id": "dup", "summary": "v2",
+                  "message_count": 2, "model": "v2model", "created_at": 2.0})
+
+       from openharness.services.session_storage import _backfill_index, _load_session_index
+       first = _backfill_index(session_dir)
+       dup = [e for e in first if e["session_id"] == "dup"]
+       assert len(dup) == 1 and dup[0]["model"] == "v2model"  # v2 won the conflict
+       second = _backfill_index(session_dir)  # idempotent
+       assert {e["session_id"] for e in second} == {e["session_id"] for e in first}
+       assert len(_load_session_index(session_dir)) == len(first)
    ```
 2. - [ ] Run it, verify it fails:
    ```bash
@@ -1148,10 +1577,14 @@
    Make `_write_session_index` drop stale entries — replace its body (`session_storage.py:92-98`):
    ```python
    def _write_session_index(session_dir: Path, entries: list[dict[str, Any]]) -> None:
+       # Stale-compaction: keep an entry only if its session still exists. Use the
+       # sniffer, not the head-file path, so a V2_HEADLESS session (head lost in a
+       # crash, transcript still present — C.3) is NOT dropped. Caller holds the
+       # store lock (this is part of a read-modify-write).
        live = [
            entry
            for entry in entries
-           if (session_dir / str(entry.get("path") or "")).exists()
+           if session_format.detect_session_format(session_dir, str(entry.get("session_id") or "")) is not None
        ]
        live = sorted(live, key=lambda item: item.get("created_at", 0), reverse=True)
        atomic_write_text(
@@ -1177,7 +1610,7 @@
            if json_file.name.endswith(".head.json"):
                continue
            sid = json_file.stem.replace("session-", "")
-           if sid in seen:
+           if sid in seen:  # a v2 head already claimed this id — v2 wins (C.3 / C.7)
                continue
            try:
                data = json.loads(json_file.read_text(encoding="utf-8"))
@@ -1186,7 +1619,11 @@
            seen.add(sid)
            entries.append(_session_index_entry(data, json_file))
        if entries:
-           _write_session_index(session_dir, entries)
+           # Write the whole index once under the store lock (C.7): atomic rename
+           # means a reader sees the old or the new index, never a torn one; a
+           # crash mid-backfill leaves the prior state and the next trigger re-runs.
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _write_session_index(session_dir, entries)
        return entries
    ```
    Replace `list_session_snapshots` (`session_storage.py:212-294`) with the index-trusting version:
@@ -1203,8 +1640,8 @@
            indexed = _backfill_index(session_dir)
        sessions: list[dict[str, Any]] = []
        for item in indexed:
-           if not (session_dir / str(item.get("path") or "")).exists():
-               continue
+           if session_format.detect_session_format(session_dir, str(item.get("session_id") or "")) is None:
+               continue  # session truly gone (V2_HEADLESS counts as live — C.3)
            sessions.append(
                {
                    "session_id": item.get("session_id", ""),
@@ -1233,7 +1670,7 @@
 - Modify: `src/openharness/services/session_storage.py` (new `_prune_sessions`; call it from both save helpers)
 - Test: `tests/test_services/test_session_storage.py`
 
-**Design decision (sub-item e):** after a successful save, prune oldest-first by `created_at` from the index down to `session_retention_max_files`, and drop anything older than `session_retention_max_age_days`. **Never** prune the session just saved (the active one) or the id `latest.json` currently points at. Pruning deletes the backing files (v2: `.jsonl` + `.head.json`; v1: `.json`) and rewrites the index. `0` for either limit disables that rule. Pruning is wrapped so a failure never breaks the save (best-effort, like the conversation index).
+**Design decision (sub-item e) [P2-004]:** after a successful save, prune oldest-first by `created_at` from the index down to `session_retention_max_files`, and drop anything older than `session_retention_max_age_days`. Per **C.8**, the prune runs **inside the same `.sessions.lock` critical section as the index update** (a lock-free `_prune_sessions_unlocked` core, single acquisition — C.2), so it can never race a concurrent saver's index write. It **never** deletes: the session just saved (active id), the id `latest.json` points at, **or any session whose files were modified within the recency window** (`mtime` newer than `max(2 × task_worker_idle_timeout_s, 60s)`) — so a *concurrent* worker actively appending another id (its transcript append happens outside the lock) is never pruned out from under itself. The window is sized to the concurrent-writer horizon (the idle timeout, with margin), **not** a fixed hour (R-003). Consequence: count/age limits only reclaim sessions *older* than the recency window — so **`session_retention_max_files` is a soft hint, not a hard cap**: the live session count can exceed `max_files` while many sessions are within the window (e.g. a burst of short sessions in a few minutes), and converges to `max_files` as they age past it. Age-pruning (`max_age_days`) bounds the long tail regardless. This is the safe semantics (never prune an in-use session); the cap is best-effort by design. Pruning deletes the backing files (v2: `.jsonl` + `.head.json`; v1: `.json`) and rewrites the index. `0` for either limit disables that rule. Pruning is wrapped so a failure never breaks the save (best-effort).
 
 1. - [ ] Write the failing test. Add to `tests/test_services/test_session_storage.py`:
    ```python
@@ -1249,13 +1686,27 @@
        (config_dir / "settings.json").write_text('{"session_retention_max_files": 2, "session_retention_max_age_days": 0}', encoding="utf-8")
        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
 
-       for i in range(4):
+       import os
+       for i in range(3):  # s0, s1, s2 — the older sessions
            save_session_snapshot(
                cwd=project, model="m", system_prompt="s", session_id=f"s{i}",
                messages=[ConversationMessage(role="user", content=[TextBlock(text=f"m{i}")])],
                usage=UsageSnapshot(),
            )
            _time.sleep(0.01)  # distinct created_at ordering
+       # Age them past the recency window so count-pruning can reclaim them (C.8);
+       # without this they would be recency-protected as possibly-active.
+       session_dir = get_project_session_dir(project)
+       old = _time.time() - 7 * 86400
+       for i in range(3):
+           for suffix in (".jsonl", ".head.json"):
+               os.utime(session_dir / f"session-s{i}{suffix}", (old, old))
+       # The active save (s3) triggers the prune; max_files=2 keeps s3 + the newest aged.
+       save_session_snapshot(
+           cwd=project, model="m", system_prompt="s", session_id="s3",
+           messages=[ConversationMessage(role="user", content=[TextBlock(text="m3")])],
+           usage=UsageSnapshot(),
+       )
 
        ids = {s["session_id"] for s in list_session_snapshots(project, limit=50)}
        # max_files=2 keeps the two newest; the active save (s3) is always kept.
@@ -1273,6 +1724,7 @@
        (config_dir / "settings.json").write_text('{"session_retention_max_files": 0, "session_retention_max_age_days": 1}', encoding="utf-8")
        monkeypatch.setenv("OPENHARNESS_CONFIG_DIR", str(config_dir))
 
+       import os
        session_dir = get_project_session_dir(project)
        # Inject an ancient v1 session directly into the index.
        (session_dir / "session-ancient.json").write_text(
@@ -1280,6 +1732,10 @@
                        "model": "m", "created_at": 1.0, "messages": []}),
            encoding="utf-8",
        )
+       # Age its mtime too, so it falls outside the recency window (C.8) and the
+       # age limit can reclaim it (a fresh file would be recency-protected).
+       old = _time.time() - 5 * 86400
+       os.utime(session_dir / "session-ancient.json", (old, old))
        from openharness.services.session_storage import _update_session_index, _session_index_entry
        _update_session_index(session_dir, _session_index_entry(
            {"session_id": "ancient", "summary": "old", "message_count": 1, "model": "m", "created_at": 1.0},
@@ -1311,8 +1767,21 @@
                pass
 
 
-   def _prune_sessions(session_dir: Path, *, active_id: str, settings: Any) -> None:
-       """Prune oldest/aged-out sessions, never the active or latest-pointed one."""
+   def _transcript_mtime(session_dir: Path, session_id: str) -> float:
+       """Newest mtime across a session's files (0.0 if none exist)."""
+       newest = 0.0
+       for suffix in (".jsonl", ".head.json", ".json"):
+           try:
+               newest = max(newest, (session_dir / f"session-{session_id}{suffix}").stat().st_mtime)
+           except OSError:
+               pass
+       return newest
+
+
+   def _prune_sessions_unlocked(session_dir: Path, *, active_id: str, settings: Any) -> None:
+       """Prune oldest/aged-out sessions. Lock-free core — the caller holds
+       ``session_dir / ".sessions.lock"`` (C.2). Never deletes the active id, the
+       latest-pointed id, or a session modified within the recency window (C.8)."""
        max_files = int(getattr(settings, "session_retention_max_files", 0) or 0)
        max_age_days = int(getattr(settings, "session_retention_max_age_days", 0) or 0)
        if max_files <= 0 and max_age_days <= 0:
@@ -1336,10 +1805,20 @@
        )
        to_delete: list[str] = []
        cutoff = time.time() - max_age_days * 86400 if max_age_days > 0 else None
+       idle = float(getattr(settings, "task_worker_idle_timeout_s", 600) or 600)
+       # R-003: the window only needs to cover the *concurrent-writer* horizon — a
+       # worker idle longer than its timeout is reaped and won't append again — so
+       # base it on the idle timeout (2x margin for an append near the boundary, 60s
+       # absolute minimum), NOT a fixed hour. The old `max(3600s, idle)` floor meant
+       # max_files could not bound count for any session touched in the last hour.
+       recency_window = max(idle * 2.0, 60.0)
+       recency_floor = time.time() - recency_window
        kept = 0
        for entry in entries:
            sid = str(entry.get("session_id") or "")
-           if sid in protected:
+           # C.8: never prune the active/latest id, nor a session whose files were
+           # touched within the recency window (a concurrent worker may be appending).
+           if sid in protected or _transcript_mtime(session_dir, sid) > recency_floor:
                kept += 1
                continue
            created = float(entry.get("created_at", 0) or 0)
@@ -1360,14 +1839,30 @@
        ]
        _write_session_index(session_dir, remaining)
    ```
-   Then call it (best-effort) at the end of **both** save helpers, just before each `return latest_path`:
+   Wire it **inside** each save's store-lock critical section (C.2 — the index update and the prune share one acquisition), calling the lock-free core. In `_save_session_snapshot_v2`, replace the `# Task 11 inserts the retention prune here` placeholder so the lock block reads:
    ```python
-       try:
-           from openharness.config import load_settings
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index_unlocked(
+                   session_dir,
+                   _session_index_entry(index_payload, session_dir / f"session-{sid}.head.json"),
+               )
+               try:  # retention is best-effort and must never break a save
+                   from openharness.config import load_settings
 
-           _prune_sessions(session_dir, active_id=sid, settings=load_settings())
-       except Exception:
-           pass
+                   _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+               except Exception:
+                   pass
+   ```
+   In `_save_session_snapshot_v1`, replace the lone `_update_session_index(session_dir, _session_index_entry(payload, session_path))` line with the same locked block, so v1 also serialises the index update + prune under one acquisition:
+   ```python
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index_unlocked(session_dir, _session_index_entry(payload, session_path))
+               try:
+                   from openharness.config import load_settings
+
+                   _prune_sessions_unlocked(session_dir, active_id=sid, settings=load_settings())
+               except Exception:
+                   pass
        return latest_path
    ```
 4. - [ ] Run, verify pass:
@@ -1431,12 +1926,52 @@
        snap = load_session_by_id(project, "c")
        assert snap is not None
        assert [m["content"][0]["text"] for m in snap["messages"]] == ["summary"]
+
+
+   def test_v2_in_place_compaction_same_count_rewrites_not_stale(tmp_path: Path, monkeypatch):
+       # R-001 regression: the engine compacts IN PLACE — message *content* is
+       # rewritten while the message COUNT stays the same (microcompact clears old
+       # tool-result bodies). A count-shrink trigger (`last_persisted > len(messages)`)
+       # would take the append path, write nothing, and leave the stale bloated
+       # content on disk. The fingerprint trigger must detect the divergence and
+       # rewrite the transcript.
+       monkeypatch.setenv("OPENHARNESS_DATA_DIR", str(tmp_path / "data"))
+       project = tmp_path / "repo"
+       project.mkdir()
+       from openharness.services.session_storage import load_session_by_id
+       from openharness.services.session_format import transcript_path
+
+       bloated = [
+           ConversationMessage(role="user", content=[TextBlock(text="BIG-OUTPUT-" + "x" * 4000)]),
+           ConversationMessage(role="assistant", content=[TextBlock(text="b")]),
+       ]
+       save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="ip",
+                             messages=bloated, usage=UsageSnapshot())
+       transcript = transcript_path(get_project_session_dir(project), "ip")
+       size_before = transcript.stat().st_size
+
+       # In-place compaction: SAME count, the first message's content cleared.
+       compacted = [
+           ConversationMessage(role="user", content=[TextBlock(text="[cleared]")]),
+           ConversationMessage(role="assistant", content=[TextBlock(text="b")]),
+       ]
+       assert len(compacted) == len(bloated)  # count did NOT shrink — the R-001 trap
+       save_session_snapshot(cwd=project, model="m", system_prompt="s", session_id="ip",
+                             messages=compacted, usage=UsageSnapshot())
+
+       snap = load_session_by_id(project, "ip")
+       assert snap is not None
+       # Durable history is the COMPACTED content, not the stale bloated text...
+       assert [m["content"][0]["text"] for m in snap["messages"]] == ["[cleared]", "b"]
+       # ...and the transcript was actually rewritten smaller (a buggy no-op append
+       # would leave it unchanged at size_before).
+       assert transcript.stat().st_size < size_before
    ```
-2. - [ ] Run it, verify it passes (v2 is already wired from Tasks 8–9; these lock the behavior). If `test_v2_append_delta_is_bounded` fails because the whole history was rewritten, the `compacted` logic in `_save_session_snapshot_v2` is wrong — fix it so a pure append (no shrink) takes the append branch:
+2. - [ ] Run it, verify it passes (v2 is already wired from Tasks 8–9; these lock the behavior). If `test_v2_append_delta_is_bounded` fails because the whole history was rewritten, the `compacted` logic in `_save_session_snapshot_v2` is wrong — fix it so a pure append (no content divergence) takes the append branch:
    ```bash
-   python -m pytest tests/test_services/test_session_storage.py::test_v2_append_delta_is_bounded tests/test_services/test_session_storage.py::test_v2_compaction_shrink_round_trip -q
+   python -m pytest tests/test_services/test_session_storage.py::test_v2_append_delta_is_bounded tests/test_services/test_session_storage.py::test_v2_compaction_shrink_round_trip tests/test_services/test_session_storage.py::test_v2_in_place_compaction_same_count_rewrites_not_stale -q
    ```
-   Expected: 2 passed.
+   Expected: 3 passed.
 3. - [ ] (If green on first run, no implementation change needed.) Simplify the redundant `if/elif` left in `_save_session_snapshot_v2` from Task 8 down to:
    ```python
            if compacted:
@@ -1602,6 +2137,8 @@
 
 **Design decision:** ohmo reuses `session_format` for the transcript/head/pointer primitives but keeps its extra surface: the `app: "ohmo"` and `session_key` fields go into the head; `latest.json` AND `latest-<token>.json` become pointers `{"session_id": ...}`; `load_latest_for_session_key` resolves the token pointer then loads the v2 payload. Gated by the same `session_storage_format` setting (ohmo reads it via `openharness.config.load_settings`, the same source). Legacy ohmo files remain readable via the sniffer. We add an `_load_ohmo_v2_payload` mirroring `_load_v2_payload` but injecting `app`/`session_key` from the head.
 
+**fsync + cursor (mirrors openharness) [P2-002, P1-001]:** ohmo follows **C.1** verbatim — the `.jsonl` transcript is the only durable artifact (one fsync/turn, via the shared `append_messages_to_transcript` / `rewrite_transcript` primitives); the head, the `latest.json` / `latest-<token>.json` pointers, and the index are rename-only (`fsync=False`). This is what resolves P2-002 (the policy is C.1, not restated or silently dropped here). The append cursor comes from the transcript (C.4), **not** `head.message_count`. ohmo's index read-modify-write is serialised by `exclusive_file_lock` like openharness (C.2); ohmo runs no retention sweep, so the index is its only locked store-wide write.
+
 1. - [ ] Write the failing test. Add to `tests/test_ohmo/test_ohmo_session_storage.py`:
    ```python
    def test_ohmo_v2_save_and_load_round_trip(tmp_path: Path):
@@ -1663,6 +2200,25 @@
 3. - [ ] Write minimal implementation. In `ohmo/session_storage.py`, add to the imports (after `ohmo/session_storage.py:19`):
    ```python
    from openharness.services import session_format
+   from openharness.utils.file_lock import exclusive_file_lock
+   ```
+   Add module-level in-process persistence state (C.4 / C.5-trigger), mirroring openharness — the crash-correct cursor source that replaces `head.message_count`, plus the durable-prefix content fingerprint that detects in-place compaction (R-001):
+   ```python
+   _V2_CURSOR_CACHE_MAX = 1024
+   _v2_persisted_count: dict[tuple[str, str], int] = {}
+   _v2_persisted_prefix_fp: dict[tuple[str, str], str] = {}
+
+
+   def _v2_remember_persisted(key: tuple[str, str], count: int, prefix_fp: str) -> None:
+       """Record the durable (count, fingerprint) for a session, bounding the cache (R-004)."""
+       _v2_persisted_count.pop(key, None)
+       _v2_persisted_prefix_fp.pop(key, None)
+       _v2_persisted_count[key] = count
+       _v2_persisted_prefix_fp[key] = prefix_fp
+       while len(_v2_persisted_count) > _V2_CURSOR_CACHE_MAX:
+           oldest = next(iter(_v2_persisted_count))
+           _v2_persisted_count.pop(oldest, None)
+           _v2_persisted_prefix_fp.pop(oldest, None)
    ```
    Replace the body of `save_session_snapshot` from `payload = {` (`ohmo/session_storage.py:115`) through `return latest_path` (`ohmo/session_storage.py:137`) with a v1/v2 router:
    ```python
@@ -1670,16 +2226,34 @@
 
        fmt = load_settings().session_storage_format
        if fmt == "v2":
+           # Cursor + fingerprint from the durable transcript, not the non-fsync'd
+           # head (C.4 / C.5-trigger / P1-001); seeded once, maintained in-process
+           # (single writer per id — C.2). Mirrors openharness exactly (R-001).
            prior_head = session_format.read_head(session_dir, sid)
-           last_persisted = int(prior_head.get("message_count", 0)) if prior_head else 0
            created_at = prior_head.get("created_at", now) if prior_head else now
-           compacted = last_persisted > len(messages)
+           key = (str(session_dir), sid)
+           last_persisted = _v2_persisted_count.get(key)
+           persisted_fp = _v2_persisted_prefix_fp.get(key)
+           if last_persisted is None or persisted_fp is None:
+               durable = session_format.load_v2_snapshot(session_dir, sid)
+               last_persisted = len(durable)
+               persisted_fp = session_format.fingerprint_messages(durable)
+           # In-place compaction keeps the count but rewrites content (R-001) — detect
+           # via the durable-prefix content fingerprint, not a count shrink.
+           compacted = (
+               len(messages) < last_persisted
+               or session_format.fingerprint_messages(messages[:last_persisted]) != persisted_fp
+           )
            if compacted:
                session_format.rewrite_transcript(session_dir, sid, messages)
            else:
                session_format.append_messages_to_transcript(
                    session_dir, sid, messages, last_persisted_count=last_persisted
                )
+           # transcript durable; maintain cursor + fingerprint (C.4), bounded (R-004)
+           _v2_remember_persisted(
+               key, len(messages), session_format.fingerprint_messages(messages)
+           )
            head = {
                "app": "ohmo",
                "session_id": sid,
@@ -1694,15 +2268,20 @@
                "message_count": len(messages),
            }
            session_format.write_head(session_dir, sid, head)
+           # Pointer is derived/rename-only per C.1 (the transcript, fsynced once by
+           # the append/rewrite primitives above, is the durable artifact).
            pointer = json.dumps({"session_id": sid}) + "\n"
            latest_path = session_dir / "latest.json"
-           atomic_write_text(latest_path, pointer)
+           atomic_write_text(latest_path, pointer, fsync=False)
            if session_key:
-               atomic_write_text(_session_key_latest_path(workspace, session_key), pointer)
-           _update_session_index(
-               session_dir,
-               _session_index_entry({**head, "messages": []}, session_dir / f"session-{sid}.head.json"),
-           )
+               atomic_write_text(_session_key_latest_path(workspace, session_key), pointer, fsync=False)
+           # Store-wide index read-modify-write under the same lock as openharness
+           # (C.2); ohmo has no retention, so the index is its only locked store write.
+           with exclusive_file_lock(session_dir / ".sessions.lock"):
+               _update_session_index(
+                   session_dir,
+                   _session_index_entry({**head, "messages": []}, session_dir / f"session-{sid}.head.json"),
+               )
            return latest_path
 
        payload = {
@@ -1726,19 +2305,38 @@
            atomic_write_text(_session_key_latest_path(workspace, session_key), data)
        session_path = session_dir / f"session-{sid}.json"
        atomic_write_text(session_path, data)
-       _update_session_index(session_dir, _session_index_entry(payload, session_path))
+       # ohmo's index is multi-writer too (many chat channels); serialise its RMW
+       # under the same store lock (C.2). ohmo has no retention, so a direct
+       # call-site lock is sufficient (no core/wrapper split needed).
+       with exclusive_file_lock(session_dir / ".sessions.lock"):
+           _update_session_index(session_dir, _session_index_entry(payload, session_path))
        return latest_path
    ```
    Add the v2 payload assembler after `_update_session_index` (`ohmo/session_storage.py:89`):
    ```python
-   def _load_ohmo_v2_payload(session_dir: Path, session_id: str) -> dict[str, Any] | None:
+   def _load_ohmo_v2_payload(
+       session_dir: Path, session_id: str, *, session_key: str | None = None
+   ) -> dict[str, Any] | None:
+       # Mirror openharness V2_HEADLESS recovery (C.6 / R-002a): if the head was lost
+       # in a crash but the transcript is durable, resume STILL recovers history off
+       # the transcript (the original code returned None here, losing the whole ohmo
+       # session — the "twin in lockstep" gap). Returns None only when BOTH are absent.
        head = session_format.read_head(session_dir, session_id)
-       if head is None:
-           return None
        raw_messages = session_format.load_v2_snapshot(session_dir, session_id)
-       payload = dict(head)
+       if head is None and not raw_messages:
+           return None
+       if head is not None:
+           payload = dict(head)
+       else:
+           # Head-less degradation contract (C.6): history is preserved; head-only
+           # fields fall back to runtime defaults. `app` is the constant "ohmo";
+           # `session_key` was head-only, so it is re-injected by the session-key
+           # lookup path (it knows the key) and is otherwise absent.
+           payload = {"app": "ohmo", "session_id": session_id, "message_count": len(raw_messages)}
        payload["messages"] = raw_messages
        payload.setdefault("system_prompt", "")
+       if session_key and not payload.get("session_key"):
+           payload["session_key"] = session_key
        return _sanitize_snapshot_payload(payload)
    ```
    Replace `load_latest` (`ohmo/session_storage.py:140-144`):
@@ -1769,7 +2367,9 @@
            return None
        if session_format.detect_latest_format(raw) == "v2":
            sid = str(raw.get("session_id") or "")
-           return _load_ohmo_v2_payload(get_session_dir(workspace), sid) if sid else None
+           # Pass session_key so a head-less recovery (R-002a) still carries it — the
+           # lookup knows the key even when the crashed-away head did not survive.
+           return _load_ohmo_v2_payload(get_session_dir(workspace), sid, session_key=session_key) if sid else None
        return _sanitize_snapshot_payload(raw)
    ```
    Replace `load_by_id` (`ohmo/session_storage.py:202-209`):
@@ -1827,6 +2427,40 @@
        snap = load_by_id(workspace, "oc")
        assert snap is not None
        assert [m["content"][0]["text"] for m in snap["messages"]] == ["a", "b"]
+
+
+   def test_ohmo_v2_recovers_when_head_lost(tmp_path: Path):
+       # R-002a: a lost-head crash must NOT lose the whole ohmo session — the
+       # V2_HEADLESS recovery is now mirrored from openharness. History recovers off
+       # the durable transcript; the session-key lookup re-injects the key.
+       from ohmo.session_storage import (
+           get_session_dir, load_by_id, load_latest_for_session_key, save_session_snapshot,
+       )
+       from ohmo.workspace import initialize_workspace
+       from openharness.engine.messages import ConversationMessage, TextBlock
+       from openharness.api.usage import UsageSnapshot
+       from openharness.services.session_format import head_path
+
+       workspace = tmp_path / ".ohmo-home"
+       initialize_workspace(workspace)
+       save_session_snapshot(
+           cwd=tmp_path, workspace=workspace, model="gpt-5.4", system_prompt="s",
+           session_id="oh", session_key="feishu:chat-3",
+           messages=[ConversationMessage(role="user", content=[TextBlock(text="kept")])],
+           usage=UsageSnapshot(),
+       )
+       # Lost-head crash window: the head (rename, no fsync) is gone; transcript durable.
+       head_path(get_session_dir(workspace), "oh").unlink()
+
+       by_id = load_by_id(workspace, "oh")
+       assert by_id is not None  # was None before R-002a — the whole session was lost
+       assert by_id["app"] == "ohmo"
+       assert [m["content"][0]["text"] for m in by_id["messages"]] == ["kept"]
+
+       by_key = load_latest_for_session_key(workspace, "feishu:chat-3")
+       assert by_key is not None
+       assert by_key["session_key"] == "feishu:chat-3"  # re-injected on head-less recovery
+       assert [m["content"][0]["text"] for m in by_key["messages"]] == ["kept"]
 
 
    def test_ohmo_legacy_v1_latest_still_loads(tmp_path: Path):
@@ -1898,7 +2532,7 @@
 
 1. **Parent-dir fsync: fixed, not just documented.** Proposal said "fix or document" (`performance-hardening-roadmap.md:260`); this plan adds a best-effort directory fsync on durable writes (Task 2).
 2. **Format detection from on-disk shape, not the setting.** Loaders sniff (Task 4) so a v1 file loads correctly even when the active format is `v2`; the setting gates *writes* only.
-3. **Compaction signaled by message-count shrink.** v2 detects compaction as `last_persisted_count > len(messages)` and rewrites once with a marker line (Tasks 7–8). The proposal described a `compacted_at` marker but not the trigger; a shrink is the simplest robust signal given engine messages are append-only otherwise.
+3. **Compaction detected by a durable-prefix content fingerprint, not a count shrink (R-001).** The proposal described a `compacted_at` marker but not the trigger. The first revision used a count shrink (`last_persisted > len(messages)`); the independent re-review (R-001) showed that misses the engine's **in-place** compactions — `microcompact_messages` (`compact/__init__.py:854`) clears old tool-result bodies and `try_context_collapse` (`:348`) shrinks text, both rewriting content at the **same count** — leaving stale content on disk. v2 now keeps a content fingerprint of the durable prefix (`fingerprint_messages`, seeded once from the transcript alongside the cursor) and rewrites (with the marker line) whenever the in-memory prefix's fingerprint diverges, or the count shrank. **Alternative considered and rejected — an explicit `compacted` signal threaded from the conversation runtime** (the reviewer's suggestion: `auto_compact_if_needed` already returns a correct `was_compacted` bool — note `AutoCompactState.compacted` does *not* flip on the in-place paths, so it would be a trap). Rejected because (a) it is a *distributed* invariant: the flag must be plumbed correctly through every save call site — `save_runtime_snapshot` and the manual `/session tag` save (`registry.py:900`) — and any future one, the exact "trust an unverified assumption across components" failure that produced R-001; (b) the storage-owned fingerprint is a *local* invariant verifiable in `_save_session_snapshot_v2` alone, robust to all callers, and keeps the fix inside storage (no runtime reach); (c) it costs nothing extra in practice — the save is already O(n) per call (the conversation-index `model_dump`), so an O(prefix) hash is dwarfed by it and by turn latency. If save-path CPU is ever a *measured* concern, `fingerprint_messages` can be made incremental (rolling hash, fold the appended delta) — deferred (YAGNI). Tasks 7–8, mirrored to ohmo in Task 15.
 4. **System prompt: store sha256 + rely on rebuild inputs already in the head.** No new "rebuild inputs" field is added because `model` + `tool_metadata` (already persisted) are the inputs `build_runtime` uses; the full text is dropped (Task 5). Verified safe: no loader reads `system_prompt` back into a runtime.
 5. **Retention runs on save, best-effort, oldest-first by `created_at`, protecting the active id and the `latest.json`-pointed id.** `0` disables each limit (Task 11).
 6. **`latest.json` fallback narrowed.** The old `list_session_snapshots` treated `latest.json` as a pseudo-session; under v2 it is a pointer, so it is no longer listed separately (the pointed session is already in the index). The legacy full `latest.json` is still loaded by `load_session_snapshot` (Task 9).
@@ -1932,70 +2566,104 @@ No other open assumptions: the settings-override mechanism (`OPENHARNESS_CONFIG_
 
 ## Quality Gate (design-quality-gate v3 — Tier T2)
 
-> Ran 2026-06-13. **Tier T2** (storage-format migration · persisted-state shape change · multi-step save lifecycle · one-time backfill · retention deletion · format flag). **Status: NOT CLEARED — 5 open P1, 6 open P2.** Per AGENTS.md §7 this plan must not move DRAFT → APPROVED or be executed until every P1 is resolved and every P2 is resolved or explicitly owner-accepted.
+> **Tier T2** (storage-format migration · persisted-state shape change · multi-step save lifecycle · one-time backfill · retention deletion · format flag).
+> First run 2026-06-13 — NOT CLEARED (5 P1, 6 P2). Revision pass + author self-re-run resolved all 14 original findings (C.1–C.8 contracts + task-body fixes). **1st independent adversarial re-review 2026-06-13 (fresh agent): NOT CLEARED** — the original 14 were genuinely resolved, but it found a load-bearing **P1 (R-001)** the count-shrink compaction trigger misses, an ohmo crash-recovery **P2 (R-002)**, and two **P3s (R-003/R-004)** — see Q.4.1. **Fix pass 2026-06-13 (fresh session): all four resolved** — R-001 by a storage-local durable-prefix content fingerprint (explicit-signal alternative considered and rejected; mirrored to ohmo), R-002 by mirroring V2_HEADLESS recovery to ohmo + a defined head-less degradation contract, R-003/R-004 as recorded. **2nd independent adversarial re-review 2026-06-13: CLEARED** — verified every fix against the real source (incl. empirically confirming the fingerprint-equality assumption) and could not break them. **Owner promoted DRAFT → APPROVED 2026-06-13** (gate cleared was the prerequisite); merged to `main`. Implementation not yet started. This is a *design* gate: the tests below are *specified* as TDD steps and are executed when the plan is implemented, not as part of the gate.
 
 ### Q.1 Canonical contract surfaces
 
-| Surface | Canonical? | Mirrors / references | Checked |
+| Surface | Canonical? | Resolved by | Checked |
 |---|---|---|---|
-| `services/session_format.py` (new: sniffer, transcript primitives, head r/w, hash) | yes | the v2 format authority | [x] |
-| `services/session_storage.py` (save / load / list / retention routing) | yes | obeys `session_format` | [ ] (P1-003 writer authority; P1-005 states) |
-| `utils/fs.py` (atomic write + append + crash-safe read) | yes | — | [x] |
-| `ohmo/session_storage.py` (v2 twin) | no, mirrors `session_format` + §f | P2-002 fsync policy not mirrored | [ ] |
+| `services/session_format.py` (sniffer, transcript primitives, head r/w, hash, `transcript_live_count`) | yes | the v2 format authority; sniffer now covers V2_HEADLESS / CONFLICT (C.3) | [x] |
+| `services/session_storage.py` (save / load / list / retention) | yes | writer authority C.2; states C.3; cursor C.4 | [x] |
+| `utils/fs.py` (atomic write + append + crash-safe read) | yes | C.1 | [x] |
+| `ohmo/session_storage.py` (v2 twin) | mirrors `session_format` + C.1 | P2-002 resolved (cites C.1); cursor + index lock mirrored | [x] |
 | `config/settings.py` (format + retention settings) | yes | — | [x] |
-| `latest.json` / `latest-<token>.json` (pointer) | yes | P2-005 conflict / missing-head fallback unspecified | [ ] |
-| `sessions-index.json` (trusted + backfill) | yes | P1-004 migration contract missing | [ ] |
-| Tests (`test_session_format` / `test_session_storage` / `test_ohmo` / `test_fs`) | no, mirror | structural + behavioral; P2-006 proof types unclassified, P1 risks untested | [ ] |
+| `latest.json` / `latest-<token>.json` (pointer) | yes | P2-005 — precedence + missing-head fallback (C.6) | [x] |
+| `sessions-index.json` (trusted + backfill + lock) | yes | P1-004 migration contract (C.7); store lock (C.2) | [x] |
+| Tests (`test_session_format` / `test_session_storage` / `test_ohmo` / `test_fs`) | mirror | P2-006 — proof types classified (Q.3.1); P1-001 + P1-003 behavioral tests added | [x] |
 
 ### Q.2 State / Handoff Invariants
 
-- [ ] Every entry shape has one parser + one dispatch behavior — **P2-003** (compaction marker shares the message namespace; a message containing `__compacted_at__` wipes history).
-- [ ] Every writer has an explicit allowlist — **P1-003** (no writer-authority / concurrency contract for the now-non-idempotent v2 writes; interacts with WS1 persistent workers).
-- [ ] Every multi-step handoff defines partial-failure behavior — **P1-001** (5-step save has no partial-failure matrix; lost-head crash → duplicate messages).
-- [ ] Every durable artifact has ownership, collision, recovery, deletion/supersede semantics — **P2-004** (retention can delete a session a concurrent process is appending).
-- [ ] Every repeated rule names its canonical source — **F-001 / P2** (v2 save algorithm duplicated across Task 8 and Task 15; compaction trigger restated 3×).
+- [x] Every entry shape has one parser + one dispatch behavior — **P2-003 resolved** (typed marker dispatch: marker iff `__compacted_at__` and no `role`, C.5; collision test).
+- [x] Every writer has an explicit allowlist — **P1-003 resolved** (writer-authority table C.2; store-wide writes under `exclusive_file_lock`; WS1↔WS4 noted).
+- [x] Every multi-step handoff defines partial-failure behavior — **P1-001 resolved** (save partial-failure matrix C.4; cursor from transcript; lost-head test).
+- [x] Every durable artifact has ownership, collision, recovery, deletion/supersede semantics — **P2-004 resolved** (retention under lock + recency protection C.8; C.2 ownership; C.3 supersede).
+- [x] Every repeated rule names its canonical source — **F-001 resolved** (the v2 save / fsync / cursor / compaction rules live once in C.1–C.8; Task 8 and Task 15 cite them; the two save *bodies* differ only by module-specific head fields).
 
 ### Q.3 Quality Checklist
 
-- [x] Touched surfaces listed (File Structure table) — *add read/write + conditional columns*
-- [ ] Canonical source for each rule declared — duplication across Task 8 / 15
-- [ ] Change type classified (additive / breaking / migration) — implicit only
-- [ ] Copyable prescriptions contain no known-bad text — **P3-002** (Task 8 known-wrong temporary clause)
-- [ ] Claim-to-evidence traceability table — mapping table exists but lacks required-behavior / proof-type / coverage columns
-- [ ] Proof type classified for every test — **P2-006**
-- [ ] Writer authority table — **P1-003** (missing)
-- [ ] Read/write fallback defined — **P2-005** (pointer conflict / missing-head unspecified)
-- [ ] Tests map to all P1/P2 risks — **P2-006** (P1-001, P1-003 untested)
+- [x] Touched surfaces listed (File Structure table)
+- [x] Canonical source for each rule declared — C.1–C.8; tasks cite by section
+- [x] Change type classified — additive + **migration** (C.7) + format flag; forward-only
+- [x] Copyable prescriptions contain no known-bad text — **P3-002 resolved** (clean `if compacted: rewrite else: append`)
+- [x] Claim-to-evidence traceability — Q.3.1 (required-behavior / proof-type / coverage)
+- [x] Proof type classified for every test — **P2-006** (Q.3.1)
+- [x] Writer authority table — **P1-003** (C.2)
+- [x] Read/write fallback defined — **P2-005** (C.6)
+- [x] Tests map to all P1/P2 risks — **P2-006** (Q.3.1; P1-001 lost-head + P1-003 concurrency added)
 - [N/A — plan adds no CI job, workflow, or merge gate] CI classified signal-only vs merge-blocking
-- [ ] Hot-reload safety proven or schema bump declared — **P1-003** (no format-version field; concurrent v1/v2 writers undefined)
-- [ ] State machine included — **P1-005** (no enumeration; conflicting v1+v2 state unnamed)
-- [ ] Partial-failure matrix included — **P1-001** (absent)
-- [ ] Migration contract included — **P1-004** (backfill has no idempotency / partial-state / rollback)
+- [x] Hot-reload safety / schema bump declared — **P1-003** (format decided per-save; CONFLICT branch C.3; index `version`; head shape is the v2 signal — C.2)
+- [x] State machine included — **P1-005** (C.3: format-detection states + named halt/conflict branches + lifecycle)
+- [x] Partial-failure matrix included — **P1-001** (C.4)
+- [x] Migration contract included — **P1-004** (C.7: idempotency / partial-state / dual-format precedence / forward-only)
+
+### Q.3.1 Proof-type classification & coverage (P2-006)
+
+| Risk / behavior | Proof type | Test(s) (specified — run at implementation) |
+|---|---|---|
+| P1-001 lost-head → no duplicate history | behavioral | `test_v2_lost_head_does_not_duplicate_on_next_save` |
+| P1-003 concurrent index writes → no lost entry | behavioral | `test_concurrent_v2_saves_preserve_all_index_entries` |
+| P2-003 marker vs message dispatch | behavioral | `test_record_with_marker_key_but_role_is_a_message_not_a_marker` |
+| P2-005 missing-head recovery (V2_HEADLESS) | behavioral | `test_v2_load_via_pointer_recovers_when_head_missing` |
+| R-001 in-place compaction → fingerprint differs | behavioral | `test_fingerprint_messages_detects_in_place_content_change` |
+| R-001 same-count in-place compaction → rewrite, not stale-append | behavioral | `test_v2_in_place_compaction_same_count_rewrites_not_stale` |
+| R-002a ohmo lost-head → recovers off transcript | behavioral | `test_ohmo_v2_recovers_when_head_lost` |
+| P1-004 dual-format precedence + idempotency | behavioral | `test_backfill_dual_format_same_id_prefers_v2_and_is_idempotent` |
+| P1-005 format detection (V2_HEADLESS / CONFLICT) | behavioral | `test_detect_session_format_headless_transcript_is_v2`, `…_v1_v2_conflict_prefers_v2` |
+| P2-004 retention (count + age, protect active/latest/recent) | behavioral | `test_retention_prunes_oldest_keeps_active_and_latest`, `test_retention_age_prunes_old_sessions` |
+| cursor seed / live-count | behavioral | `test_transcript_live_count_counts_post_marker_records` |
+| crash-truncated transcript recovery | behavioral | `test_load_v2_recovers_from_truncated_final_line` |
+| C.1 parent-dir fsync policy | behavioral | `test_atomic_write_fsyncs_parent_dir`, `test_atomic_write_no_dir_fsync_when_fsync_false` |
+| public shapes unchanged / legacy readable | structural + behavioral | v2 round-trips, legacy fixtures (Task 14), no-interface-break test |
 
 ### Q.4 Review Findings
 
-| ID | Severity | Location | Finding | Status | Resolution / Evidence |
-|---|---|---|---|---|---|
-| P1-001 | P1 | Task 8 / Task 6 | Lost-head crash window → duplicate messages on resume (append cursor read from the non-fsync'd head, written after the fsync'd transcript) | open | Derive the cursor from the transcript itself (count post-marker complete lines), not `head.message_count`; add a behavioral lost-head test |
-| P1-002 | P1 | whole doc | No embedded gate section at T2 | **resolved** | This Quality Gate section |
-| P1-003 | P1 | Q.2 / writer authority | No writer-authority / concurrency contract for non-idempotent v2 writes (interacts with WS1) | open | Add a writer-authority table + single-writer lock (`exclusive_file_lock`) or cite the runtime guarantee |
-| P1-004 | P1 | Task 10 backfill | No migration contract (idempotency / partial-state / dual-format-same-id conflict / rollback) | open | Add the migration-contract block + dual-format precedence + tests |
-| P1-005 | P1 | decision 3 / Task 7 | No state machine (format detection incl. conflicting v1+v2; transcript append/compaction/prune lifecycle) | open | Add a state enumeration with named halt / conflict branches |
-| P2-001 | P2 | Task 9 / sub-item g | "Single-pass resume" claim is a no-op vs current code; the real double round-trip is the storage↔runtime boundary | open | Reword to `documents only`, or actually remove the cross-boundary re-validation |
-| P2-002 | P2 | ohmo Task 15 | ohmo v2 silently drops v1's fsync; policy stated only for openharness | open | State the fsync policy canonically; ohmo mirrors it |
-| P2-003 | P2 | Task 7 `load_v2_snapshot` | Compaction marker shares the record namespace → a message with `__compacted_at__` wipes history | open | Reserved sentinel or sidecar marker; add a collision test |
-| P2-004 | P2 | Task 11 prune | Retention can delete a session a concurrent process is appending | open | Gate behind the writer lock; protect recently-active sessions |
-| P2-005 | P2 | Task 9 / decision 6 | Pointer conflict (v2 pointer + legacy full file) and missing-head fallback unspecified | open | Specify precedence + missing-head behavior; test both |
-| P2-006 | P2 | test plan | No proof-type classification; the two P1 risks have no test | open | Classify every proof; add behavioral tests for P1-001 and P1-003 |
-| P3-001 | P3 | line ~1082 | Stale citation `session_storage.py:190` (blank line) — real read-filter is `:220` | open | Correct to `:220` |
-| P3-002 | P3 | Task 8 note | Known-wrong temporary clause in a copyable block (latent `or`/`and` precedence bug) | open | Ship the final `if compacted: rewrite else: append`; move rationale to prose |
-| P3-003 | P3 | Task 3 | Confusing duplicated `lines.pop()` in both branches | open | Collapse to one unconditional pop |
+| ID | Severity | Status | Resolution / Evidence |
+|---|---|---|---|
+| P1-001 | P1 | **resolved** | Cursor from the durable transcript (in-process count seeded by `transcript_live_count`), never `head.message_count`; partial-failure matrix C.4; clean branch; lost-head behavioral test; mirrored in ohmo (Task 15). |
+| P1-002 | P1 | **resolved** | This gate section (re-run). |
+| P1-003 | P1 | **resolved** | Writer-authority table C.2; store-wide index/pointer/retention under `exclusive_file_lock` (single acquisition, lock-free cores, no nesting); v1, v2 and ohmo covered; concurrency behavioral test; WS1↔WS4 noted. |
+| P1-004 | P1 | **resolved** | Migration contract C.7 + Task 10: idempotent, partial-state-safe under lock, dual-format v2-wins (code + test), forward-only; sniffer-based stale-compaction keeps V2_HEADLESS. |
+| P1-005 | P1 | **resolved** | State machine C.3: format-detection states (incl. V2_HEADLESS, TRUNCATED_TAIL, CONFLICT/v2-wins) + append→compaction→prune lifecycle; sniffer implements them (Task 4). |
+| P2-001 | P2 | **resolved** | Reworded to documents-only (the claim was a no-op vs the code); the real storage↔runtime round-trip removal is explicitly deferred (YAGNI / one-time cost). |
+| P2-002 | P2 | **resolved** | fsync policy stated once canonically (C.1); ohmo cites it and writes pointers rename-only (`fsync=False`). |
+| P2-003 | P2 | **resolved** | Typed dispatch C.5 (marker iff key present and no `role`); raw-line collision test. |
+| P2-004 | P2 | **resolved** | Retention runs inside the store lock (C.2) and protects active/latest/recently-modified sessions (recency window, C.8); count + age tests age fixtures past the window. |
+| P2-005 | P2 | **resolved** | C.6 precedence + missing-head fallback; `_load_v2_payload` recovers from the transcript when the head is gone; sniffer keeps V2_HEADLESS; pointer-recovery test. |
+| P2-006 | P2 | **resolved** | Proof-type classification (Q.3.1); behavioral tests for P1-001 and P1-003 added. |
+| P3-001 | P3 | **resolved** | Citation corrected to `session_storage.py:220`. |
+| P3-002 | P3 | **resolved** | Ships the clean `if compacted: rewrite else: append`; rationale moved to C.4 prose. |
+| P3-003 | P3 | **resolved** | Single unconditional `lines.pop()`. |
+| P3-004 | P3 | **resolved** | The in-process persistence caches (`_v2_persisted_count` + `_v2_persisted_prefix_fp`) are now **bounded** (R-004): `_v2_remember_persisted` enforces an LRU cap (`_V2_CURSOR_CACHE_MAX`) on both, evicting the oldest entry; an evicted session re-seeds from its transcript on its next save. A long-lived foreground process that resumes many sessions can no longer grow them without limit. (Originally accepted as negligible; promoted to fixed when the fingerprint cache was added by R-001, which made the bound worth enforcing.) |
+
+### Q.4.1 Independent re-review findings (2026-06-13, fresh agent)
+
+| ID | Sev | Location | Finding | Status |
+|---|---|---|---|---|
+| R-001 | **P1** | C.5 / Design decision 3 / `_save_session_snapshot_v2` (+ ohmo) | The compaction trigger `compacted = last_persisted > len(messages)` only detects a count **shrink**. The engine's in-place compactions change message *content* without shrinking the count — `microcompact_messages` clears tool-result bodies in place (same count, `compact/__init__.py:854`) and `try_context_collapse` collapses content (same count). So the save takes the **append** path, `messages[last_persisted:]` is empty, nothing is written, and the durable transcript keeps **stale pre-compaction content** → resume shows stale history and the byte-budget is defeated. The plan's "engine messages are append-only otherwise" assumption is false (verified against the compaction code). **Must fix before APPROVED** — e.g. an explicit `compacted` signal from the runtime (the single writer knows when it compacted), or content-divergence detection; count-shrink alone is insufficient. | **resolved** — content-divergence chosen: durable-prefix fingerprint (`fingerprint_messages`, C.5-trigger) replaces the count test in `_save_session_snapshot_v2` and ohmo (Design decision 3 records the rejected explicit-signal alternative). Unit + integration regression tests (same-count in-place compaction must rewrite). 2nd independent re-review verified the fix and the fingerprint-equality assumption against the real `ConversationMessage` model. |
+| R-002 | P2 | `_load_ohmo_v2_payload`; `_load_v2_payload` V2_HEADLESS payload | (a) ohmo's load returns `None` when the head is missing even if the transcript is durable, so a lost-head crash loses the whole ohmo session — the openharness V2_HEADLESS recovery (C.6) was **not mirrored** to ohmo (contradicts the "twin in lockstep" claim). (b) Even in openharness, the V2_HEADLESS payload reconstructs only `{session_id, message_count, messages}` — no `model`/`usage`/`tool_metadata`, so resume hands `build_runtime` a null model: history recovers, runtime config does not. Mirror the recovery to ohmo and define the head-less config fallback. | **resolved** — (a) `_load_ohmo_v2_payload` now mirrors the V2_HEADLESS recovery (recovers off the transcript, injects `app`, re-injects `session_key` on the key path); test `test_ohmo_v2_recovers_when_head_lost`. (b) C.6 now defines the head-less degradation contract; the "null model" wording was **corrected** — `merge_cli_overrides` drops `None` (`settings.py:935`) so resume falls back to the configured model, not null (re-review confirmed). |
+| R-003 | P3 | C.8 / `_prune_sessions_unlocked` | The recency window `max(3600s, idle)` = 1h protects every session touched in the last hour from **both** count and age pruning, so `session_retention_max_files` does not bound count in the common "many short sessions within an hour" case (age-pruning still bounds long-term). Disclose that `max_files` is a soft hint sub-hour, and/or lower the floor toward the worker idle timeout. | **resolved** — both: recency window is now `max(2 × idle_timeout, 60s)` (the concurrent-writer horizon, ~20 min default) not a fixed hour, and C.8 / Task 11 disclose `max_files` as a soft hint (age-pruning bounds the tail). Re-review confirmed no P2-004 regression. |
+| R-004 | P3 | gate wording / P3-004 | The "0 unaccepted findings / none merely accepted" phrasing over-reads next to the accepted P3-004; and P3-004's "bounded per process" omits a long-lived foreground process that resumes many sessions (the cache never evicts). Tighten wording + add cache eviction or a bounded note. | **resolved** — both in-process caches are now LRU-bounded (`_v2_remember_persisted`, `_V2_CURSOR_CACHE_MAX`), so P3-004 is promoted from accepted to **fixed** (no merely-accepted finding remains); evicted sessions re-seed from the transcript. |
 
 ### Q.5 Approval Criteria
 
-- [ ] No open P1 findings. — **5 open** (P1-001, P1-003, P1-004, P1-005; P1-002 resolved)
-- [ ] No open P2 findings unless explicitly accepted by owner. — **6 open**
-- [ ] Tests / verification cover every P1/P2 class found. — **no** (P2-006)
-- [x] Open questions resolved or explicitly deferred. — the plan has no open-questions section; the marked assumptions above are resolved/temporary
-- [ ] All "fully resolves / closes" claims have full source coverage, or reworded. — **partial** (P2-001 overclaim)
-- [ ] Conditional touched surfaces and merge-order deps resolved / deferred. — **note WS1 interaction** (P1-003)
+- [x] No open P1 findings. — original 5 + R-001 resolved; R-001's fix verified against the real compaction code and by a 2nd independent re-review.
+- [x] No open P2 findings unless explicitly accepted by owner. — original 6 + R-002 resolved; no merely-accepted finding remains (P3-004 promoted to fixed).
+- [x] Tests / verification cover every P1/P2 class found. — original 14 (Q.3.1) plus the three R-fix regression tests (`fingerprint_messages` in-place change, same-count in-place rewrite, ohmo lost-head recovery) now registered in Q.3.1.
+- [x] Open questions resolved or explicitly deferred. — the R-001 trigger design choice is **decided** (content-divergence fingerprint; explicit-signal alternative recorded as rejected in Design decision 3); incremental-fingerprint and index-sourced head-less recovery explicitly deferred (YAGNI).
+- [x] All "fully resolves / closes" claims have full source coverage. — the premature first "CLEARED" was corrected by the 1st re-review (R-001); this revision's claims were re-verified against source by a 2nd independent re-review.
+- [x] Conditional touched surfaces and merge-order deps resolved / deferred. — WS1↔WS4 documented (C.2); R-001's fix is **storage-local** (no new runtime touched surface — the storage-owned fingerprint was chosen precisely to avoid reaching into the conversation runtime).
+
+**Gate verdict: CLEARED.** All 14 original findings and all four re-review findings (R-001 P1, R-002 P2, R-003/R-004 P3) are resolved. The R-001 fix replaces the count-shrink trigger with a durable-prefix content fingerprint (storage-local, mirrored to ohmo); R-002 mirrors the V2_HEADLESS recovery to ohmo and defines the head-less degradation contract. A **second independent adversarial re-review** (fresh agent, blind to the author's reasoning) verified each fix against the actual source — including empirically confirming the load-bearing fingerprint-equality assumption against the real `ConversationMessage` model — and could not break them; its only blocker was this gate section being stale, now updated, plus two minor doc nits (Q.3.1 registration, the C.6 `created_at` note), now addressed. No open P1, no unaccepted P2.
+
+This remains a **design** gate: the tests above are *specified* as TDD steps to run at implementation, not executed as part of the gate. **Owner promoted DRAFT → APPROVED on 2026-06-13** (the cleared gate was the prerequisite) and this revision was merged to `main` as the canonical plan. Implementation is a separate, not-yet-started effort (execute the 17 tasks via TDD).
