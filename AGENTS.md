@@ -155,3 +155,28 @@ Once a session's context reaches **60% utilisation**, every subsequent message t
 - Format (last line of the message): `Context: NN% used`
 - Applies from the moment 60% is reached, for every message thereafter in that session.
 - **Source.** If your agent harness exposes session token usage, read the latest usage and divide by the context window. If no such source is available, say so and give a best estimate (e.g. `Context: ~65% used (estimate)`) rather than omit the line.
+
+## 15. Owner-facing progress reporting
+
+Progress reports to the owner must be feature/functionality focused, not broad
+subsystem or file/checker focused. Name the concrete capability or operating
+function, for example `Web UI - Agent report output`, `Web UI - Owner decision
+panel`, `Advisory router - Agent recommendation`, or `Active routing -
+Controlled pilot envelope`.
+
+Each row should include:
+
+- `Feature / function`
+- `Global progress`: `done/total - NN%` when the task set is known; otherwise
+  `unknown` plus the missing evidence.
+- `Lifecycle status`: one of `Planned`, `Proposal drafted`,
+  `Requires approval`, `Approved`, `Spec done`, `Dev started`, `In review`,
+  `Implemented`, `Verified`, `Shipped`, or `Parked`.
+- `Owner task`: one of `No action`, `Requires approval`, `Approved`,
+  `Deferred`, or `Blocked`.
+- `Owner meaning`: one short plain-language sentence explaining why it matters.
+
+Avoid command-by-command, file-by-file, or checker-by-checker progress reports
+unless a failure changes the owner's decision. Routine closeouts should report
+feature impact, verification summary, commit/SHA, pushed branch, and what
+remains.
